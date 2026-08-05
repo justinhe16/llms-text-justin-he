@@ -120,9 +120,11 @@ production database on a schema that no commit in this repo describes — is slo
 expensive to unwind. If you want an exception, talk to Justin first; do not take one
 unilaterally.
 
-This restates [`ARCHITECTURE.md` §7](./ARCHITECTURE.md#7-deploy-policy), which is the
-authoritative copy. If the two disagree, that one governs. Never add a deploy rule here
-without adding it there.
+This restates [`ARCHITECTURE.md` §7](./ARCHITECTURE.md#7-deploy-policy) — plus the migration
+prohibitions from [§6.3](./ARCHITECTURE.md#63-prohibitions), which reach production through
+the deploy and so belong in front of anyone reading this policy. `ARCHITECTURE.md` is the
+authoritative copy. If the two disagree, it governs. Never add a rule here without adding it
+there.
 
 - **Merging to `main` with green CI triggers the deploy. That is the only path to
   production.** There is no manual promotion step and no alternate route.
@@ -137,9 +139,9 @@ without adding it there.
   needs.
 - **Never apply a schema or data change to production by hand**, through any channel —
   `psql`, the Supabase SQL editor, a one-off script, a Python shell on a Fly machine. The
-  only way a schema change reaches production is a reviewed migration committed to this repo
-  and applied by `prisma migrate deploy` in CI. Read-only inspection (`SELECT`, reading logs
-  and config) is fine.
+  only way a change reaches the production database is a reviewed migration committed to this
+  repo and applied by `prisma migrate deploy` in CI. Read-only inspection (`SELECT`, reading
+  logs and config) is fine.
 - **Never run `prisma db push`.** Anywhere. It mutates a database without producing a
   migration, which desynchronizes the schema from its recorded history.
 - **Roll forward, not back.** To undo a bad deploy, revert the commit on `main` and let CI
