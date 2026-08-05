@@ -810,10 +810,15 @@ DELETE /websites/{id}
 GET    /websites/{id}/runs
 POST   /websites/{id}/runs
 GET    /runs/{id}
+GET    /websites/{id}/schedule
+PUT    /websites/{id}/schedule
 ```
 
 - Path parameters are `{id}`, not `{website_id}`, when the noun is already in the path.
 - No verbs in paths. `POST /websites/{id}/runs` starts a run; there is no `/start-crawl`.
+- `schedule` is the one exception to "plural nouns": it is a singleton sub-resource, at most
+  one per website and enforced as such by `schedules`' `UNIQUE (website_id)` index, so there
+  is never a collection of them to name in the plural.
 - No `/v1` prefix. When versioning is genuinely needed, it gets a ticket and a migration
   plan — it is not added preemptively.
 
