@@ -155,3 +155,16 @@ class WebsiteAlreadyExistsDetail(BaseModel):
     message: str
     website_id: UUID
     origin: str
+
+
+class WebsiteAlreadyExistsResponse(BaseModel):
+    """The **whole** `409` body, envelope included.
+
+    FastAPI serializes an `HTTPException`'s `detail` as `{"detail": <detail>}`, so this
+    wrapper — not `WebsiteAlreadyExistsDetail` on its own — is what a client actually
+    receives. Documenting the inner model directly in the route's `responses=` would put a
+    schema in the OpenAPI document that no response ever matches, and any client generated
+    from it would look for `website_id` one level too high.
+    """
+
+    detail: WebsiteAlreadyExistsDetail

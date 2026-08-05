@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, Query, status
 from app.api.deps import CurrentUserId, DbPool
 from app.features.websites.schemas import (
     CreateWebsiteRequest,
-    WebsiteAlreadyExistsDetail,
+    WebsiteAlreadyExistsResponse,
     WebsiteInclude,
     WebsiteListItemResponse,
     WebsiteResponse,
@@ -70,7 +70,7 @@ IncludeQuery = Annotated[
     status_code=status.HTTP_201_CREATED,
     responses={
         status.HTTP_409_CONFLICT: {
-            "model": WebsiteAlreadyExistsDetail,
+            "model": WebsiteAlreadyExistsResponse,
             "description": (
                 "You have already added a website with this origin. The response carries "
                 "the existing website's id so the client can navigate to it."
