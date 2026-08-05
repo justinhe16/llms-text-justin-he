@@ -98,7 +98,7 @@ document:
 llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
-│   └── app/core/auth/   JWKS cache + JWT verification dependencies
+│   └── app/core/auth/   JWKS cache, JWT verification dependencies, require_owner (§4.2)
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
 ├── supabase/            local Supabase stack config (config.toml, seed.sql)
 ├── scripts/             shell helpers used by the Makefile (dev.sh, local-env.sh)
@@ -141,8 +141,14 @@ backend/app/features/websites/
 ├── service.py              Business logic, transaction boundaries
 └── internals/
     ├── websites_reader.py  All SELECTs
-    └── websites_writer.py  All INSERT/UPDATE/DELETE
+    ├── websites_writer.py  All INSERT/UPDATE/DELETE
+    └── url_normalize.py    Feature-owned pure logic (no I/O)
 ```
+
+`internals/` may also hold a feature's own **pure** helpers, as `url_normalize.py` does
+above — logic that is neither a DTO nor a query, with no I/O and no state. It stays private
+to the feature like everything else in that directory; if a second feature needs it, promote
+it to a shared location rather than importing across the boundary or copying it.
 
 Route handlers live separately, in `backend/app/api/routers/{feature}.py`.
 
@@ -228,15 +234,19 @@ signed-in user can read all of it. There is no `tenant_id`, no tenant-scoped rea
 `X-Tenant-ID` header, and no tenant validation helper anywhere in this codebase. If you are
 porting a pattern from a multi-tenant project, leave that machinery behind.
 
-The contract has exactly two halves:
+The contract has exactly two halves, and it fits on one line:
+**reads never filter by user; writes always call `require_owner`.**
 
 **Reads — authenticated, unscoped.**
 Read endpoints require a valid Supabase JWT, and **do not** filter by `user_id`. Any
 signed-in user sees every website and every run, including `llms_txt` content.
 
 **Writes — authenticated and owned.**
-`POST`, `PATCH`, `PUT`, and `DELETE` require a valid JWT **and** ownership of the resource.
-A non-owner gets `403`, not `404`.
+`POST`, `PATCH`, `PUT`, and `DELETE` require a valid JWT **and** ownership of the resource,
+checked by `require_owner` (§4.2). A non-owner gets `403`, not `404`.
+
+The reference implementation of both halves is `backend/app/features/websites/` — its
+service, reader, and router were written to be copied by the features that follow.
 
 ### 4.1 Reads must not be scoped
 
@@ -270,11 +280,22 @@ assumed reads should be private.
 
 ### 4.2 Ownership is checked in one place
 
-Ownership is checked with a single shared helper:
+Ownership is checked with a single shared helper, which lives in
+**`backend/app/core/auth/ownership.py`** and is the only place in the codebase that compares
+an owner to a caller:
 
 ```python
+from app.core.auth.ownership import require_owner
+
 require_owner(resource, user_id)  # raises 403 if resource.user_id != user_id
 ```
+
+It takes the **resource**, not `resource.user_id`: a helper taking two bare UUIDs is one
+transposition away from comparing a value to itself and authorizing everything. `user_id` is
+the caller as a `UUID` — the `CurrentUserId` dependency from `app.api.deps`, which is
+`CurrentUser`'s `sub` claim parsed to the type every owner column in this schema decodes to.
+Comparing the raw `str` claim against a `uuid.UUID` from Postgres is never equal, which
+would return `403` to the resource's actual owner on every request.
 
 It is called **as soon as the resource is in hand, and before any other work** — before any
 mutation, before any transaction is opened, and before any external call. Fetching the

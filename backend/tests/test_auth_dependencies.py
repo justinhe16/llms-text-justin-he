@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.api import deps
-from app.api.deps import CurrentUser, OptionalUser
+from app.api.deps import CurrentUser, CurrentUserId, OptionalUser
 from app.core.auth import dependencies as auth_dependencies
 from app.core.auth.jwks import JwksCache, get_jwks_cache
 
@@ -99,6 +99,14 @@ def auth_app(jwks_cache: JwksCache) -> FastAPI:
     @api.get("/optional")
     async def optional(user_id: OptionalUser) -> dict[str, str | None]:
         return {"user_id": user_id}
+
+    @api.get("/protected-uuid")
+    async def protected_uuid(user_id: CurrentUserId) -> dict[str, str]:
+        # `CurrentUserId` is what feature routes actually depend on — it is `CurrentUser`'s
+        # `sub` parsed to the UUID type every owner column decodes to. Exercised here, on
+        # the same throwaway app, so its failure modes are covered by the same suite that
+        # covers the dependency it wraps.
+        return {"user_id": str(user_id)}
 
     # Keyed on the callable itself: JwksCacheDep is Annotated[JwksCache,
     # Depends(get_jwks_cache)], so overriding get_jwks_cache substitutes the cache for
@@ -531,7 +539,48 @@ def test_the_annotated_aliases_are_re_exported_from_app_api_deps() -> None:
     silently stop reaching routes that imported from `app.api.deps`.
     """
     assert deps.CurrentUser is auth_dependencies.CurrentUser
+    assert deps.CurrentUserId is auth_dependencies.CurrentUserId
     assert deps.OptionalUser is auth_dependencies.OptionalUser
+
+
+async def test_current_user_id_returns_the_sub_as_a_uuid(
+    auth_client: AsyncClient, es256_key: _SigningKey
+) -> None:
+    """A route depending on `CurrentUserId` receives the `sub` parsed to a UUID.
+
+    The type matters: `websites.user_id` is a `uuid` column and asyncpg decodes it to
+    `uuid.UUID`, so an ownership check against the raw string claim would compare `str` to
+    `UUID`, never match, and return 403 to the resource's actual owner.
+    """
+    claims = user_claims()
+    token = es256_key.sign(claims)
+
+    response = await auth_client.get(
+        "/protected-uuid", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"user_id": claims["sub"]}
+
+
+async def test_a_verified_token_whose_sub_is_not_a_uuid_is_rejected_with_the_same_401(
+    auth_client: AsyncClient, es256_key: _SigningKey
+) -> None:
+    """A signature can verify and the token still be unusable here.
+
+    Supabase issues UUID subjects; anything else cannot own or create a row in this schema.
+    It is refused with the byte-identical 401 every other authentication failure produces —
+    a distinct status or message would advertise that the signature checked out.
+    """
+    token = es256_key.sign(user_claims(sub="not-a-uuid"))
+
+    response = await auth_client.get(
+        "/protected-uuid", headers={"Authorization": f"Bearer {token}"}
+    )
+    unauthenticated = await auth_client.get("/protected-uuid")
+
+    assert response.status_code == 401
+    assert response.json() == unauthenticated.json()
 
 
 def test_the_bearer_scheme_is_advertised_in_the_openapi_document(auth_app: FastAPI) -> None:
