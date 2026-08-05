@@ -371,11 +371,78 @@ Three consequences worth knowing before your first merge:
 
 ## Deploy
 
-_Forthcoming — filled in by the deploy pipeline ticket. The CI workflows above already
-exist; what is missing is the workflow that migrates and then deploys on a push to `main`._
+Merging to `main` is the only thing that deploys. A commit that touches `backend/**` or
+`db/**` runs [`deploy-backend.yml`](./.github/workflows/deploy-backend.yml): three jobs,
+chained with `needs`, each one gated on the one before it.
 
-The mechanism is forthcoming. **The policy below is not** — it is written now, in full,
-because it constrains how that pipeline gets built.
+| Job | What it does | What it means when it fails |
+| --- | --- | --- |
+| `migrate` | `npm ci` in `db/`, logs `prisma migrate status`, applies `prisma migrate deploy`, logs the status again | **Nothing deployed.** Production is still old code on the old schema — a consistent state, and the safest place to fail. Fix the migration and merge again. |
+| `deploy` | `flyctl deploy --remote-only` from `backend/` | **The schema has already moved**, so production is old code on the new schema. That is survivable because migrations here are additive (below) — but it is not a resting place. Re-run from the Actions tab if the cause was infrastructure; otherwise fix forward and merge. |
+| `smoke` | `curl`s the deployed `/health` and asserts the body is `{"status":"ok","db":"ok"}` | The new code is live but not healthy. `fly logs --app llms-text-justin-he`. The usual causes are a Fly secret that was never set and a database the app cannot reach. |
+
+Migrations run on the GitHub Actions runner rather than in the container because Prisma
+needs Node and [the backend image is deliberately Python-only](./backend/Dockerfile). That
+keeps ~150MB out of the runtime and draws the failure boundary in the right place: if the
+migration fails, the deploy job never starts.
+
+`smoke` checks the response **body**, not just a 200. `/health` returns 200 for as long as
+the process is alive and reports database health in the body instead — see
+[`health.py`](./backend/app/api/routers/health.py) for why — so a status-code-only check
+would go green against an app that cannot reach Postgres, which is exactly what a deploy
+that just migrated is most likely to break.
+
+Deploys **queue and are never cancelled** (`concurrency: { group: deploy-backend,
+cancel-in-progress: false }`). Two `flyctl deploy` runs against one app produce an undefined
+result, and a run cancelled mid-migration leaves the database somewhere nobody wrote down.
+This is the one place where the CI workflows' `cancel-in-progress: true` would be actively
+harmful. `workflow_dispatch` re-runs a deploy that failed for an infrastructure reason
+without needing an empty commit.
+
+The frontend is not in this pipeline: Vercel builds and deploys `frontend/` from its own git
+integration on every push.
+
+### First deploy (once, and only once)
+
+The Fly app was created with `--no-deploy`, so it begins with no machines and its four
+secrets read `Staged`. The first successful `deploy` job creates the machine and applies
+them. If it somehow lands with nothing running:
+
+```bash
+fly scale count app=1 --app llms-text-justin-he
+```
+
+That is a control-plane operation — it sets a machine count and ships no code, the same
+category as `fly secrets set` — so it is not the laptop deploy the policy below prohibits.
+It is a one-time bootstrap. If you ever need it twice, something else is wrong.
+
+### Rolling back
+
+**Code rolls back. Migrations do not.** Nothing in this pipeline reverses a migration, and
+nothing should: a down-migration against live data is a second, worse outage.
+
+So the answer is to roll *forward* — revert the commit on `main` and let the pipeline deploy
+the revert. That is the policy ([§7](./ARCHITECTURE.md#7-deploy-policy)) and it is the
+normal answer.
+
+Redeploying the previous image is **break-glass**: it buys availability while you prepare
+that revert, and it is the only acknowledged exception to "never deploy by hand."
+
+```bash
+fly releases --app llms-text-justin-he                        # find the previous image
+fly deploy --image <previous-image> --app llms-text-justin-he
+```
+
+It works only because of the rule that makes it possible:
+
+> **Migrations must be forward-compatible: the release before this one has to keep working
+> against the new schema.** Add columns; never rename or drop one in the same release that
+> stops using it. Drop it a release later, once nothing that could reference it is still
+> running.
+
+Break that rule and the break-glass option is gone precisely when you need it, because the
+old image would be querying columns that no longer exist.
+[§6.3](./ARCHITECTURE.md#63-prohibitions) is the authoritative copy.
 
 ### Deploy Policy
 
@@ -398,9 +465,10 @@ there.
   to any other manual push of a build artifact.
 - **Never deploy from a feature branch.** Deploys come from `main`.
 - **Migrations run in a GitHub Actions job _before_ the Fly deploy.** The order is
-  `migrate → deploy web → deploy worker`, and every step is gated on the one before it. A
-  failed migration aborts the deploy, so application code never lands ahead of the schema it
-  needs.
+  `migrate → deploy → smoke`, and every job is gated on the one before it. A failed
+  migration aborts the deploy, so application code never lands ahead of the schema it
+  needs. One `fly deploy` rolls every process in the image, so the API and the worker ship
+  together rather than as separately gated steps.
 - **Never apply a schema or data change to production by hand**, through any channel —
   `psql`, the Supabase SQL editor, a one-off script, a Python shell on a Fly machine. The
   only way a change reaches the production database is a reviewed migration committed to this
@@ -408,10 +476,16 @@ there.
   logs and config) is fine.
 - **Never run `prisma db push`.** Anywhere. It mutates a database without producing a
   migration, which desynchronizes the schema from its recorded history.
+- **Never ship a migration the release before it cannot survive.** Additive changes only:
+  add a column, never rename or drop one in the same release that stops using it. There is
+  always a window where the old image runs against the new schema, and after a failed
+  deploy that window stays open. See "Rolling back" above.
 - **Roll forward, not back.** To undo a bad deploy, revert the commit on `main` and let CI
   deploy the revert. Do not re-run an old workflow to redeploy an old image — the schema has
   already moved, and an old image against a new schema is a second outage. A bad migration is
-  corrected by a new migration.
+  corrected by a new migration. Redeploying the previous image with `fly deploy --image` is
+  break-glass only, to restore availability while the revert is prepared — it is a decision,
+  not a shortcut, and it does not replace the revert.
 
 ---
 

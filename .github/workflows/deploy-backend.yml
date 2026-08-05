@@ -1,0 +1,220 @@
+name: Deploy Backend
+
+# The only path to production. Merging to `main` migrates the database, deploys the image
+# to Fly, and then verifies from outside that the app came back healthy — in that order,
+# each job gated on the one before it, so application code never reaches production ahead
+# of the schema it needs. README.md "Deploy" is the operator-facing version.
+#
+# Path filtering here IS a `paths:` trigger, unlike ci-backend.yml and ci-frontend.yml,
+# and that difference is deliberate. Those two filter inside a `changes` job because
+# `backend-ci` and `frontend-ci` are REQUIRED STATUS CHECKS on `main`: a workflow that
+# never triggers never reports one, which would leave every docs-only pull request
+# permanently unmergeable. This workflow is not a required check and reports on nothing —
+# a docs-only commit should simply not deploy. Do not "fix" this to match the CI
+# workflows; doing so would deploy on every README typo.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "db/**"
+      # A change to the pipeline itself should exercise the pipeline itself.
+      - ".github/workflows/deploy-backend.yml"
+  # Re-runs a deploy that failed for an infrastructure reason — a Fly builder that fell
+  # over, a transient network error — without needing an empty commit on `main`.
+  workflow_dispatch:
+
+# Deploys queue. They never overlap, and they are never cancelled.
+#
+# Two concurrent `flyctl deploy` runs against one app produce an undefined result, and a
+# run cancelled mid-migration leaves the database somewhere nobody recorded — which is the
+# single worst outcome this pipeline exists to prevent. This is therefore deliberately NOT
+# `cancel-in-progress: true`, unlike the CI workflows, where cancelling a superseded run
+# costs nothing.
+#
+# The group is a constant rather than keyed on `github.ref`: there is one production app,
+# so every run must serialize against every other, whether it came from a push or from a
+# manual dispatch.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+# Read-only, and narrower than the CI workflows — nothing here reads pull requests. The
+# deploy credentials arrive as repository secrets, not as GITHUB_TOKEN scope.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  # 1. Migrate. Runs on the runner, not in the container: Prisma needs Node and the backend
+  #    image is deliberately Python-only (backend/Dockerfile). That keeps ~150MB and a class
+  #    of version drift out of the runtime, and it draws a clean failure boundary — if this
+  #    job fails, `deploy` never starts and production keeps running the old code against
+  #    the old schema, which is a consistent state.
+  # ---------------------------------------------------------------------------------------
+  migrate:
+    name: migrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # The Supabase SESSION pooler string on port 5432. Despite the variable's name this
+      # is NOT Supabase's direct connection: that hostname is IPv6-only and GitHub-hosted
+      # runners are IPv4-only, so a direct URL here cannot reach the database at all. It
+      # is also not the 6543 transaction pooler, which breaks prepared statements. See
+      # README.md "Three things that will trip you up".
+      #
+      # NEVER ECHO THIS. No `echo "$DIRECT_DATABASE_URL"`, no bare `env`, no dumping the
+      # settings object. This repository is public and so are its Actions logs
+      # (ARCHITECTURE.md §9). Everything below prints migration names and a hostname,
+      # never a credential.
+      DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: db/package-lock.json
+
+      - name: Install the Prisma CLI
+        working-directory: db
+        run: npm ci
+
+      # `prisma migrate status` EXITS NON-ZERO WHEN MIGRATIONS ARE PENDING — which is the
+      # normal state of this step, since having something to apply is the reason the job
+      # ran. It also exits non-zero when it cannot reach the database at all, and gives no
+      # way to tell the two apart, so there is no exit code this step could usefully
+      # assert on. It records what is about to change; it does not gate anything.
+      #
+      # `continue-on-error` rather than `|| true`: a swallowed exit code is invisible,
+      # whereas this leaves the step's real result on the run. AN ORANGE MARKER HERE IS
+      # NORMAL on any deploy that ships a migration. If the database is genuinely
+      # unreachable, the apply below is unprotected and fails the job for real.
+      - name: Migration status before
+        working-directory: db
+        continue-on-error: true
+        run: npm run migrate:status
+
+      # `prisma migrate deploy`, never `prisma db push` (ARCHITECTURE.md §6.3). Applies
+      # only migrations already committed to db/migrations/ and reviewed on a pull request.
+      - name: Apply migrations
+        working-directory: db
+        run: npm run migrate:deploy
+
+      # No `continue-on-error` here, deliberately — this one IS a gate. Once the apply has
+      # succeeded there must be nothing left pending, so a non-zero exit means it silently
+      # did less than it reported, and the job must go red BEFORE the Fly deploy starts
+      # rather than after. Together with the step above, the run records the schema
+      # revision on both sides of the apply.
+      - name: Migration status after
+        working-directory: db
+        run: |
+          set -euo pipefail
+          {
+            echo '### Migration status after apply'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          # pipefail is what makes the tee transparent: a non-zero exit from Prisma still
+          # fails the step rather than being masked by tee's success.
+          npm run migrate:status | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >>"$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------
+  # 2. Deploy. Only reachable with the schema already migrated.
+  # ---------------------------------------------------------------------------------------
+  deploy:
+    name: deploy
+    needs: [migrate]
+    runs-on: ubuntu-latest
+    # Generous: this includes a remote image build, and a first deploy that has to create
+    # the machine takes longer than a rolling replacement of an existing one.
+    timeout-minutes: 20
+
+    env:
+      # Scoped to this one app, not to the whole Fly account. README.md "Where each
+      # credential lives"; rotate with `fly tokens revoke`.
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: superfly/flyctl-actions/setup-flyctl@1.5
+
+      # `--remote-only` builds on Fly's builder instead of on the runner: there is no
+      # Docker layer cache to warm here, and it keeps the image off the runner's network
+      # path entirely.
+      #
+      # Everything else — app name, region, the service on port 8000 — comes from
+      # backend/fly.toml, which is the single source of truth for it. `working-directory`
+      # is backend/ because that is where fly.toml lives, where backend/.dockerignore
+      # applies, and the build context the Dockerfile expects (`COPY requirements.txt ./`).
+      - name: flyctl deploy
+        working-directory: backend
+        run: flyctl deploy --remote-only
+
+      # A short, non-secret record of what is now running, so the Actions run alone can
+      # answer "which image is in production" during an incident — and can name the
+      # previous one to roll back to (README.md "Rolling back"). The app name comes from
+      # fly.toml, same as the deploy above.
+      #
+      # continue-on-error because this is a record, not a gate: the deploy has already
+      # succeeded by this point, and failing the job here would skip the smoke check and
+      # report a healthy release as a failed one.
+      - name: Record the release
+        working-directory: backend
+        continue-on-error: true
+        run: |
+          {
+            echo '### Fly releases'
+            echo '```'
+            flyctl releases | head -5
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------
+  # 3. Smoke. External verification that the deploy actually worked. Separate from the Fly
+  #    health checks in fly.toml, which are the platform's own view from inside.
+  # ---------------------------------------------------------------------------------------
+  smoke:
+    name: smoke
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No `env:` block: this job needs no credentials at all. `/health` is unauthenticated,
+    # and keeping the deploy token out of the job that runs a shell script against a
+    # network response is worth the line of explanation.
+
+    steps:
+      - name: GET /health
+        run: |
+          set -euo pipefail
+
+          # --retry-all-errors because plain --retry only retries curl's idea of a
+          # transient failure; a machine that is still coming up answers 502, and
+          # --retry-connrefused covers the window before it is listening at all.
+          body="$(curl --fail --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused \
+            --connect-timeout 10 \
+            https://llms-text-justin-he.fly.dev/health)"
+
+          echo "GET /health -> ${body}"
+          {
+            echo '### Smoke check'
+            echo '```'
+            echo "GET /health -> ${body}"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # THE WHOLE BODY, NOT JUST A 200. /health returns 200 for as long as the process
+          # is alive and reports database health in the body instead — deliberately, since
+          # a non-200 would make Fly restart perfectly healthy machines during a Postgres
+          # outage (backend/app/api/routers/health.py). A status-code-only check would
+          # therefore go green against an app that cannot reach its database, which is
+          # precisely the failure a deploy that just migrated is most likely to cause.
+          if [ "${body}" != '{"status":"ok","db":"ok"}' ]; then
+            echo "::error::/health did not return {\"status\":\"ok\",\"db\":\"ok\"} — the deploy is live but not healthy"
+            exit 1
+          fi

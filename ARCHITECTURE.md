@@ -393,6 +393,13 @@ These are prohibitions, not preferences. A PR that violates one does not get mer
   different schema than the one recorded in the repo.
 - **Never commit a schema change without its migration**, or a migration without its schema
   change. They land together or not at all.
+- **Never ship a migration that the release before it cannot survive.** Deploy is
+  `migrate → deploy` (§7), so there is always a window in which the old image runs against
+  the new schema — and if the deploy job fails, that window stays open until someone closes
+  it. Migrations are therefore additive: add a column; do not rename or drop one in the same
+  release that stops using it. Drop it one release later, once nothing that could reference
+  it is still running. This is also the rule that makes the emergency image rollback in §7
+  possible at all — **code can be rolled back; a migration cannot.**
 
 ### 6.4 The schema
 
@@ -517,9 +524,19 @@ These are prohibitions, not preferences.
   on `main`, let CI deploy the revert. Schema changes are not rolled back by redeploying an
   older image — an old image against a new schema is a second outage. A bad migration is
   corrected by a new migration.
+- **Redeploying a previous image is break-glass, and it is a decision, not a convenience.**
+  `fly deploy --image <previous>` restores availability while a revert is prepared; it is
+  not the revert, and it is the _only_ acknowledged exception to the prohibition on
+  deploying by hand. It is survivable solely because §6.3 requires every migration to be
+  survivable by the release before it — it rolls back code and nothing else, and it leaves
+  production running something that is not the head of `main`. Use it to stop the bleeding,
+  then revert on `main` and let the pipeline deploy that.
 
-The ordering is the point. Deploy is `migrate → deploy web → deploy worker`, and every step
-is gated on the one before it.
+The ordering is the point. Deploy is `migrate → deploy → smoke`, and every job is gated on
+the one before it: a failed migration means no deploy, and a deploy that leaves the app
+unhealthy fails the run rather than reporting success. One `fly deploy` rolls every process
+in the image — today the API, and the worker once it exists — so `web` and `worker` are not
+separately gated steps; they ship together because they are one artifact.
 
 This policy is restated in [`README.md`](./README.md#deploy-policy) so that it is visible to
 anyone who reads only the README. **This section is the authoritative copy.** If the two ever
