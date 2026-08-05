@@ -132,17 +132,21 @@ export DATABASE_URL DIRECT_DATABASE_URL SUPABASE_URL SUPABASE_SECRET_KEY REDIS_U
 run_prefixed api "$c_api" "$venv_dir/bin/python" -m uvicorn app.main:app \
   --app-dir backend --host "$api_host" --port "$api_port" --reload --reload-dir backend/app
 
-# --- worker (graceful skip until the ARQ ticket lands) -------------------------------
-# Both halves are checked (not just the executable) because `arq` could land as a
-# transitive dependency before backend/app/worker exists — reporting which half is
-# missing is cheap and saves a confused `ModuleNotFoundError` chase.
-if [ -x "$venv_dir/bin/arq" ] && [ -d backend/app/worker ]; then
-  run_prefixed worker "$c_worker" env PYTHONPATH=backend "$venv_dir/bin/arq" "$worker_module"
-elif [ -d backend/app/worker ]; then
-  echo "worker: skipped — arq not installed yet (lands with the ARQ ticket)"
-else
-  echo "worker: skipped — backend/app/worker does not exist yet (lands with the ARQ ticket)"
+# --- worker ---------------------------------------------------------------------------
+# No longer optional: the ARQ worker exists, so `make dev` runs it. It consumes from the
+# docker-compose Redis started above over plain `redis://`, because TLS is decided by the
+# URL scheme — the same WorkerSettings that reaches Upstash over `rediss://` in production
+# works here unchanged (backend/app/infrastructure/queue/pool.py).
+#
+# This FAILS rather than skipping when `arq` is missing. The graceful skip that used to
+# live here was right while the worker was unbuildable; keeping it now would let a stale
+# virtualenv produce a dev environment with no queue consumer, in which enqueued jobs sit
+# in Redis forever and the only symptom is that nothing happens.
+if [ ! -x "$venv_dir/bin/arq" ]; then
+  echo "dev: 'arq' is not installed in $venv_dir. Run 'make setup' to refresh it." >&2
+  exit 1
 fi
+run_prefixed worker "$c_worker" env PYTHONPATH=backend "$venv_dir/bin/arq" "$worker_module"
 
 # --- frontend (skipped when frontend/ is absent) --------------------------------------
 if [ -d frontend ]; then

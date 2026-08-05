@@ -84,7 +84,8 @@ backend/app/core/auth/          JWKS cache, JWT verification dependencies, requi
 backend/app/features/<name>/    schemas.py, service.py, internals/{<name>_reader,<name>_writer}.py
                                 websites/ is the reference implementation — read it first
 backend/app/infrastructure/db/  asyncpg pool factory, base Reader/Writer, transaction()
-backend/app/worker/             ARQ job functions — thin, they call services
+backend/app/infrastructure/queue/  ARQ Redis pool factory; the only place TLS is decided
+backend/app/worker/             settings.py (WorkerSettings) + jobs.py — thin, call services
 db/schema.prisma                the schema, and the only source of truth for it
 db/migrations/                  reviewed, committed SQL
 ```
@@ -112,9 +113,11 @@ make down          # stop the Supabase and Redis containers
 make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```
 
-Every target gracefully skips work that isn't buildable yet — the ARQ worker, until its own
-ticket lands, and anything under `frontend/` if that directory is absent — and says so instead
-of silently doing nothing. `make setup` first, once per checkout; see README.md "Run locally" for
+Every target gracefully skips work that isn't buildable yet — anything under `frontend/` if
+that directory is absent — and says so instead of silently doing nothing. **`make dev` no
+longer skips the ARQ worker**; it starts it, and fails loudly if `arq` is missing from the
+virtualenv, because a dev environment with no queue consumer looks exactly like one where
+nothing is happening. `make setup` first, once per checkout; see README.md "Run locally" for
 the full walkthrough, prerequisites, and troubleshooting. When you add a target to the
 `Makefile`, add it to this list in the same PR.
 
