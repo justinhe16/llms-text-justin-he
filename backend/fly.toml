@@ -1,0 +1,53 @@
+# Fly.io configuration for the backend image.
+#
+# SCOPE. This file is the minimum needed for `flyctl deploy` to produce an app that
+# actually serves HTTPS. It deliberately declares NO process groups and NO Fly health
+# checks: PER-157 (the multi-process worker ticket) owns those and will add a `[processes]`
+# block with `web` and `worker`, per-process checks, and a `processes = ["web"]` key on the
+# service below. Do not add them here.
+#
+# WHY IT EXISTS AT ALL. The app was created with `fly apps create --no-deploy`, so it has no
+# machines — and therefore no remote configuration for flyctl to fall back on when the
+# working directory has no fly.toml (`fly config show` answers "No machines configured for
+# this app"). Without this file a deploy would define no service, nothing would route to
+# llms-text-justin-he.fly.dev, and the deploy pipeline's smoke check would fail against an
+# app that had in fact deployed successfully.
+#
+# Fly's health checks are configured here rather than in the image on purpose: one image
+# serves both the API and the worker, and an HTTP check baked into the Dockerfile would
+# fail forever in a worker container that serves no HTTP. See backend/Dockerfile.
+
+app = "llms-text-justin-he"
+primary_region = "sjc"  # closest region to the Supabase project in AWS us-west-1
+
+[build]
+  # Relative to this file. The deploy job runs flyctl from backend/, so the build context
+  # is backend/ — which is what the Dockerfile assumes (`COPY requirements.txt ./`) and
+  # where backend/.dockerignore applies.
+  dockerfile = "Dockerfile"
+
+# NON-SECRET CONFIGURATION ONLY. Every credential is a Fly secret, set out of band and
+# listed in README.md "Where each credential lives". Never add one here: this repository is
+# public and its history is permanent (ARCHITECTURE.md §9).
+[env]
+  ENVIRONMENT = "production"
+  LOG_LEVEL = "INFO"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+
+  # The API must answer the deploy's smoke check the moment the deploy returns, so it does
+  # not scale to zero. `auto_start_machines` stays on as a safety net rather than as a
+  # scaling strategy. PER-157 revisits this per process — the worker has no HTTP service
+  # and must not inherit these.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+# Stated rather than left to the platform default, which is 256MB: FastAPI plus an asyncpg
+# pool sits close enough to that ceiling that the first deploy could OOM, and an OOM here
+# looks like a failing smoke check rather than like a memory problem.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
