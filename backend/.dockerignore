@@ -1,0 +1,19 @@
+# Keep the build context small and keep local secrets out of it entirely. The Dockerfile
+# copies only requirements.txt and app/, but anything listed here is never even sent to
+# the daemon — which matters most for .env.
+
+.env
+.env.*
+
+.venv/
+venv/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+tests/
+Dockerfile
+.dockerignore

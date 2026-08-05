@@ -1,0 +1,15 @@
+# Development and test dependencies. Never installed into the container image.
+#
+#     python3.12 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Testing
+pytest==9.1.1
+pytest-asyncio==1.4.0   # async tests; asyncio_mode = "auto" is set in pyproject.toml
+httpx==0.28.1           # ASGITransport client used by the test suite
+
+# Linting and type checking
+ruff==0.16.1
+mypy==2.3.0
