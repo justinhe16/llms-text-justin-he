@@ -49,6 +49,7 @@ pnpm-debug.log*
 .fly/
 supabase/.temp/
 supabase/.branches/
+supabase/snippets/
 
 # ---------------------------------------------------------------------------
 # OS / editor

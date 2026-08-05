@@ -1,0 +1,20 @@
+// Prisma is a schema and migration tool in this project, and nothing else. There is
+// deliberately no `generator client` block here, and `@prisma/client` is not a dependency
+// of this package: the backend reads and writes with asyncpg, using hand-written SQL in
+// each feature's reader and writer, and the frontend never touches the database at all.
+// See ARCHITECTURE.md §6.1 ("Prisma Client is not a runtime dependency").
+//
+// How to change the schema — ARCHITECTURE.md §6.2:
+//   1. Edit this file.
+//   2. `npm run migrate:dev` (prisma migrate dev --create-only) — generates the migration
+//      SQL without applying it.
+//   3. Read the generated SQL in db/migrations/. Check for destructive operations, missing
+//      indexes, and locks a large table would take.
+//   4. Commit the migration directory together with this file, in the same PR.
+//   5. CI applies it with `prisma migrate deploy` (`npm run migrate:deploy`), before the
+//      application deploy.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DIRECT_DATABASE_URL")
+}

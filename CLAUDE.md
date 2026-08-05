@@ -98,18 +98,25 @@ plural nouns with no version prefix: `/websites`, `/websites/{id}/runs`, `/runs/
 ## Commands
 
 ```bash
-make dev        # run frontend, API, and worker locally
-make migrate    # create a migration from schema.prisma (review the SQL, then commit it)
-make test       # backend and frontend test suites
-make lint       # ruff for backend, eslint + prettier for frontend
+make help          # list every target below, with its one-line purpose
+make setup         # create backend/.venv, install backend + db deps (frontend if present)
+make dev           # run Supabase, Redis, the API, worker, and frontend locally
+make migrate       # create a migration from schema.prisma (review the SQL, then commit it)
+make migrate-apply # apply pending migrations to the local database
+make test          # backend and frontend test suites
+make lint          # ruff + mypy for backend, eslint + tsc for frontend
+make down          # stop the Supabase and Redis containers
+make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```
 
-**The `Makefile` does not exist yet** — it lands with the local dev environment ticket, and
-these are the names it will use. Until then, run the underlying tools directly. When you add
-a target to the `Makefile`, add it to this list in the same PR.
+Every target gracefully skips work that isn't buildable yet — the ARQ worker (until its own
+ticket lands) and everything under `frontend/` (until PER-147 lands) — and says so instead of
+silently doing nothing. `make setup` first, once per checkout; see README.md "Run locally" for
+the full walkthrough, prerequisites, and troubleshooting. When you add a target to the
+`Makefile`, add it to this list in the same PR.
 
-There is no CI workflow yet either; it lands with the CI ticket. Once it exists, it runs the
-same commands, path-filtered by stack.
+There is no CI workflow yet; it lands with the CI ticket. Once it exists, it runs the same
+commands, path-filtered by stack.
 
 ---
 

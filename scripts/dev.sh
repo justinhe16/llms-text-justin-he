@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# scripts/dev.sh — process runner for `make dev`.
+#
+# ARCHITECTURE.md §2 forbids a root package manifest and monorepo tooling, so there is no
+# `concurrently` here (and `npx --yes concurrently` would need network access anyway).
+# This script starts local infra (Supabase, Redis), then the backend API, then the ARQ
+# worker and the Next.js frontend when they exist, each with a colored, named log prefix,
+# and tears the whole group of processes it started down cleanly on Ctrl-C.
+#
+# Run through `make dev`, not directly — the Makefile builds backend/.venv first.
+#
+# Env vars this script honors:
+#   VENV_DIR       Path to the backend virtualenv.       default: backend/.venv
+#   WORKER_MODULE  ARQ worker settings module path.       default: app.worker.settings.WorkerSettings
+#   API_HOST       Interface the API binds.               default: 127.0.0.1
+#   API_PORT       Port the API binds.                    default: 8000
+#   NO_COLOR       Any non-empty value disables prefix colors (https://no-color.org).
+
+set -eu
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+venv_dir="${VENV_DIR:-backend/.venv}"
+worker_module="${WORKER_MODULE:-app.worker.settings.WorkerSettings}"
+
+# Loopback by default, matching the deliberately loopback-only Redis binding in
+# docker-compose.yml: nothing in this project needs the dev API reachable from the LAN.
+# Both are overridable so a port already in use can be worked around without editing this
+# file (README.md > Run locally > Troubleshooting).
+api_host="${API_HOST:-127.0.0.1}"
+api_port="${API_PORT:-8000}"
+
+# --- color handling --------------------------------------------------------------
+# Disabled when stdout is not a TTY (e.g. piped to a file or CI) or when NO_COLOR is set.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_api=$'\033[36m'
+  c_worker=$'\033[35m'
+  c_frontend=$'\033[33m'
+  c_reset=$'\033[0m'
+else
+  c_api=""
+  c_worker=""
+  c_frontend=""
+  c_reset=""
+fi
+
+# Space-separated list of PIDs this script has started, for teardown. Not a bash array —
+# the default `env bash` on this platform is old enough (3.2) that empty-array expansion
+# under `set -u` is unreliable, and a plain word list needs no such guard.
+pids=""
+
+# Runs "$@" in the background with every line of its combined stdout/stderr prefixed by a
+# colored "[name] " tag, and records its PID for teardown().
+#
+# $! right after this backgrounds "$@" is the PID of "$@" itself, not of some wrapping
+# subshell: the prefixing lives in a `>( )` process substitution, which is a *separate*
+# process that reads until "$@" closes its output — it exits on its own once "$@" does,
+# so signaling the one PID we record is enough to leave nothing orphaned.
+run_prefixed() {
+  name="$1"
+  color="$2"
+  shift 2
+  "$@" > >(sed -u "s/^/${color}[${name}]${c_reset} /") 2>&1 &
+  pids="$pids $!"
+}
+
+teardown() {
+  trap - INT TERM EXIT
+  echo ""
+  echo "==> stopping dev processes"
+  for pid in $pids; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  echo "==> dev processes stopped"
+  echo "==> Supabase and Redis containers are still running — \`make down\` stops those"
+  # Ctrl-C is how this script is *meant* to end, so a clean teardown reports success.
+  # Without this the shell would exit 130 and make would print "*** [dev] Error 130",
+  # which reads like a failure for what is the documented way to stop `make dev`.
+  exit 0
+}
+trap teardown INT TERM
+
+# --- infra: Supabase --------------------------------------------------------------
+echo "==> starting Supabase (Postgres, Auth, Storage)"
+if ! supabase start >/dev/null; then
+  echo "dev: \`supabase start\` failed — see output above" >&2
+  exit 1
+fi
+
+# --- infra: Redis -------------------------------------------------------------------
+echo "==> starting Redis"
+docker compose up -d redis >/dev/null
+
+redis_container="$(docker compose ps -q redis)"
+redis_ready=0
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  status="$(docker inspect --format '{{.State.Health.Status}}' "$redis_container" 2>/dev/null || echo "")"
+  if [ "$status" = "healthy" ]; then
+    redis_ready=1
+    break
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
+if [ "$redis_ready" -ne 1 ]; then
+  echo "dev: redis did not report healthy in time" >&2
+  exit 1
+fi
+
+# Bridges `supabase status` into DATABASE_URL / SUPABASE_URL / SUPABASE_SECRET_KEY /
+# REDIS_URL for the API and worker below, without ever printing a value (see
+# scripts/local-env.sh and ARCHITECTURE.md §9.4).
+eval "$(bash scripts/local-env.sh export)"
+export DATABASE_URL DIRECT_DATABASE_URL SUPABASE_URL SUPABASE_SECRET_KEY REDIS_URL
+
+# --- API ------------------------------------------------------------------------------
+run_prefixed api "$c_api" "$venv_dir/bin/python" -m uvicorn app.main:app \
+  --app-dir backend --host "$api_host" --port "$api_port" --reload --reload-dir backend/app
+
+# --- worker (graceful skip until the ARQ ticket lands) -------------------------------
+# Both halves are checked (not just the executable) because `arq` could land as a
+# transitive dependency before backend/app/worker exists — reporting which half is
+# missing is cheap and saves a confused `ModuleNotFoundError` chase.
+if [ -x "$venv_dir/bin/arq" ] && [ -d backend/app/worker ]; then
+  run_prefixed worker "$c_worker" env PYTHONPATH=backend "$venv_dir/bin/arq" "$worker_module"
+elif [ -d backend/app/worker ]; then
+  echo "worker: skipped — arq not installed yet (lands with the ARQ ticket)"
+else
+  echo "worker: skipped — backend/app/worker does not exist yet (lands with the ARQ ticket)"
+fi
+
+# --- frontend (graceful skip until PER-147 lands) -------------------------------------
+if [ -d frontend ]; then
+  run_prefixed frontend "$c_frontend" npm --prefix frontend run dev
+else
+  echo "frontend: skipped — frontend/ does not exist yet (lands with PER-147)"
+fi
+
+cat <<EOF
+
+llms-text dev environment is up:
+  App              http://localhost:3000
+  API              http://$api_host:$api_port
+  API docs         http://$api_host:$api_port/docs
+  Supabase Studio  http://localhost:54323
+
+Press Ctrl-C to stop the processes above.
+Supabase and Redis containers keep running — \`make down\` stops those.
+EOF
+
+wait

@@ -52,6 +52,10 @@ llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
+├── supabase/            local Supabase stack config (config.toml, seed.sql)
+├── scripts/             shell helpers used by the Makefile (dev.sh, local-env.sh)
+├── docker-compose.yml   local Redis only — Supabase is managed by its own CLI
+├── Makefile             local dev commands — see "Run locally" below
 └── .github/workflows/   path-filtered CI + deploy
 ```
 
@@ -67,23 +71,93 @@ Full detail, including the authorization contract and the transaction rules, is 
 | Node | 20+ | `frontend/`, and the Prisma CLI in `db/` |
 | Python | 3.12+ | `backend/` API and worker |
 | Docker | current | local Postgres and Redis |
-| Supabase CLI | current | local Supabase stack, auth, storage |
+| Supabase CLI | **2.111.0, pinned** | local Supabase stack, auth, storage |
 | Fly CLI (`flyctl`) | current | inspecting deployments and setting secrets |
+
+The Supabase CLI is pinned, not just "current": `supabase/config.toml` was written and
+verified against 2.111.0, and config keys and defaults have moved between CLI releases.
+Install that exact version — Homebrew (`brew install supabase/tap/supabase`),
+`npm install -g supabase@2.111.0`, or any method from the CLI's own install docs — and
+confirm with `supabase --version` before running `supabase start` or `make dev`.
 
 ---
 
 ## Run locally
 
-_Forthcoming — filled in by the local dev environment ticket._
+### First run
 
-That ticket lands the `Makefile`. The command names are already fixed:
+1. Install the prerequisites above. In particular, pin the **Supabase CLI to 2.111.0** —
+   see the note under Prerequisites.
+2. `make setup` — creates `backend/.venv`, installs backend dependencies, installs the
+   Prisma CLI in `db/`, and installs `frontend/` dependencies once that directory exists
+   (PER-147). Run this once per checkout, and again after pulling a dependency change.
+3. `make dev` — starts the local Supabase stack (Postgres, Auth, Storage) and Redis in
+   Docker, then the FastAPI API with autoreload. It prints the table of URLs below once
+   everything is up. The ARQ worker and the frontend dev server are skipped with a note
+   until their own tickets land — that's expected, not a failure.
+4. `Ctrl-C` stops the API (and the worker and frontend, once they exist). Supabase and
+   Redis keep running in Docker after that — local Postgres data and the seeded test user
+   persist across `make dev` sessions. `make down` stops those containers too.
+
+Every target below is documented with `make help`.
 
 ```bash
-make dev        # run frontend, API, and worker locally
-make migrate    # create a migration from schema.prisma
-make test       # backend and frontend test suites
-make lint       # ruff for backend, eslint + prettier for frontend
+make help          # list every target, with its one-line purpose
+make setup         # create backend/.venv, install backend + db deps (frontend if present)
+make dev           # run Supabase, Redis, the API, worker, and frontend locally
+make migrate       # create a migration from schema.prisma (review the SQL, then commit it)
+make migrate-apply # apply pending migrations to the local database
+make test          # backend and frontend test suites
+make lint          # ruff + mypy for backend, eslint + tsc for frontend
+make down          # stop the Supabase and Redis containers
+make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```
+
+### URLs
+
+Printed by `make dev` once the stack is up:
+
+| Service | URL |
+| --- | --- |
+| App (Next.js) | http://localhost:3000 |
+| API (FastAPI) | http://localhost:8000 |
+| API docs (Swagger UI) | http://localhost:8000/docs |
+| Supabase Studio | http://localhost:54323 |
+
+### Local test user
+
+A fixed test user is seeded automatically the first time the local database initializes,
+and every time you run `make reset` (`supabase/seed.sql`):
+
+| Field | Value |
+| --- | --- |
+| Email | `dev@llms-text.test` |
+| Password | `devpassword123` |
+
+This password is not a secret worth protecting — it unlocks a Postgres container running
+on your own machine, nothing reachable from outside it. **Local sign-in is email/password
+only.** GitHub OAuth is configured and verified against the production Supabase project;
+it is deliberately left disabled in `supabase/config.toml` for local development.
+
+### Troubleshooting
+
+**A port this stack needs is already in use.** Local Supabase uses 54321 (API/Auth/
+Storage gateway), 54322 (Postgres), 54323 (Studio), and 54324 (local email testing);
+Redis uses 6379; the API uses 8000; the frontend, once it exists, uses 3000. Find what's
+holding a port with `lsof -nP -iTCP:<port> -sTCP:LISTEN`, and stop it — or see "stale
+Supabase containers" below if the culprit is a leftover container of your own. If whatever
+holds port 8000 isn't yours to stop, move the API for the session with
+`API_PORT=8001 make dev` (`API_HOST` overrides the same way). The Supabase ports are pinned
+in `supabase/config.toml` and should be changed there rather than on the command line.
+
+**Docker isn't running.** `make dev` and friends check for a live Docker daemon (not just
+the `docker` binary) before doing anything else, and fail with a message telling you to
+start Docker Desktop, rather than an opaque connection error partway through.
+
+**Stale Supabase containers from a previous run.** `make down` stops both the Supabase
+and Redis containers cleanly and is the normal way to shut the stack down between
+sessions. If a container is stuck anyway, `docker ps -a` to find it and `docker rm -f
+<name>`, then `make dev` again — `supabase start` recreates whatever it needs.
 
 ---
 

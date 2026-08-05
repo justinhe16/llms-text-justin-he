@@ -99,6 +99,10 @@ llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
+├── supabase/            local Supabase stack config (config.toml, seed.sql)
+├── scripts/             shell helpers used by the Makefile (dev.sh, local-env.sh)
+├── docker-compose.yml   local Redis only — Supabase is managed by its own CLI
+├── Makefile             local dev commands — see CLAUDE.md "Commands"
 ├── .github/workflows/   path-filtered CI + deploy
 ├── ARCHITECTURE.md      this file — the engineering contract
 ├── CLAUDE.md            pointer file for coding agents
@@ -112,7 +116,9 @@ Rules for the layout:
 - **Each top-level directory owns its own toolchain.** `frontend/` owns `package.json` and
   `tsconfig.json`; `backend/` owns `pyproject.toml`; `db/` owns the Prisma CLI dependency.
   There is no root-level package manifest and no monorepo tool (no workspaces, no Turborepo,
-  no Nx).
+  no Nx). The root `Makefile` and `docker-compose.yml` do not change this: they orchestrate
+  the toolchains that already exist in each directory (`pip` in `backend/`, `npm` in `db/`,
+  the Supabase CLI) rather than introducing one of their own.
 - **CI is path-filtered.** A frontend-only change must not run the backend test suite, and
   vice versa. Workflows live in `.github/workflows/` and land in the CI ticket.
 

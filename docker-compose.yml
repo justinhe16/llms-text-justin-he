@@ -1,0 +1,23 @@
+# Local Redis for the ARQ job queue. Supabase (Postgres, Auth, Storage) is managed
+# separately by the Supabase CLI (`supabase start`) — see supabase/config.toml.
+#
+# No top-level `version:` key: this targets Compose v2+ (Compose v5.0.1 here), which reads
+# it from the CLI, not the file.
+#
+# `name:` pins the Compose project name so it doesn't fall back to the checkout's
+# directory name (which varies across git worktrees), and Redis is bound to loopback only
+# — nothing in this project needs it reachable from the LAN.
+
+name: llms-text
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly no
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
