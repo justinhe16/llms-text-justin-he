@@ -35,7 +35,7 @@ migrations, and nothing else — at runtime the backend talks to Postgres over a
                        │  Fly.io — one image          │
                        │  ┌────────────┬────────────┐ │
                        │  │  FastAPI   │ ARQ worker │ │
-                       │  │  (web)     │ (worker)   │ │
+                       │  │  (app)     │ (worker)   │ │
                        │  └────────────┴────────────┘ │
                        └────────┬─────────────┬───────┘
                   asyncpg/HTTP  │             │  job queue
@@ -117,12 +117,14 @@ confirm with `supabase --version` before running `supabase start` or `make dev`.
    Prisma CLI in `db/`, and installs `frontend/` dependencies. Run this once per checkout,
    and again after pulling a dependency change.
 3. `make dev` — starts the local Supabase stack (Postgres, Auth, Storage) and Redis in
-   Docker, then the FastAPI API with autoreload and the Next.js dev server, each with its
-   own log prefix. It prints the table of URLs below once everything is up. The ARQ worker
-   is skipped with a note until its ticket lands — that's expected, not a failure.
-4. `Ctrl-C` stops the API and frontend (and the worker, once it exists). Supabase and
-   Redis keep running in Docker after that — local Postgres data and the seeded test user
-   persist across `make dev` sessions. `make down` stops those containers too.
+   Docker, then the FastAPI API with autoreload, the ARQ worker, and the Next.js dev
+   server, each with its own log prefix. It prints the table of URLs below once everything
+   is up. The worker consumes from the local Redis container over plain `redis://`; TLS is
+   derived from the URL scheme, so the same configuration reaches Upstash over `rediss://`
+   in production with no local special case.
+4. `Ctrl-C` stops the API, the worker, and the frontend. Supabase and Redis keep running in
+   Docker after that — local Postgres data and the seeded test user persist across
+   `make dev` sessions. `make down` stops those containers too.
 
 Every target below is documented with `make help`.
 
@@ -281,7 +283,7 @@ green laptop and a green pull request mean the same thing.
 
 | Workflow | Runs when a change touches | What it does |
 | --- | --- | --- |
-| `ci-backend.yml` | `backend/**`, `db/**`, the workflow, the path filter | **lint** — `ruff check`, `ruff format --check`, `mypy`<br>**test** — a real `postgres:16`, migrations applied with `prisma migrate deploy`, then `pytest`<br>**build-check** — boots the app under uvicorn and probes `/health` |
+| `ci-backend.yml` | `backend/**`, `db/**`, the workflow, the path filter | **lint** — `ruff check`, `ruff format --check`, `mypy`<br>**test** — a real `postgres:16` and a real `redis:7-alpine`, migrations applied with `prisma migrate deploy`, then `pytest`<br>**build-check** — boots the app under uvicorn against both containers and probes `/health` |
 | `ci-frontend.yml` | `frontend/**`, the workflow, the path filter | **verify** — `tsc --noEmit`, eslint, `next build`, then a rendered-output smoke test |
 
 `db/**` is on the backend list because a schema change must re-run the tests that depend on
@@ -379,7 +381,7 @@ chained with `needs`, each one gated on the one before it.
 | --- | --- | --- |
 | `migrate` | `npm ci` in `db/`, logs `prisma migrate status`, applies `prisma migrate deploy`, logs the status again | **Nothing deployed.** Production is still old code on the old schema — a consistent state, and the safest place to fail. Fix the migration and merge again. |
 | `deploy` | `flyctl deploy --remote-only` from `backend/` | **The schema has already moved**, so production is old code on the new schema. That is survivable because migrations here are additive (below) — but it is not a resting place. Re-run from the Actions tab if the cause was infrastructure; otherwise fix forward and merge. |
-| `smoke` | `curl`s the deployed `/health` and asserts the body is `{"status":"ok","db":"ok"}` | The new code is live but not healthy. `fly logs --app llms-text-justin-he`. The usual causes are a Fly secret that was never set and a database the app cannot reach. |
+| `smoke` | `curl`s the deployed `/health` and reads the body: `db` must be `"ok"`, and a `redis` that is not `"ok"` is a warning rather than a failure | The new code is live but cannot reach Postgres. `fly logs --app llms-text-justin-he`. The usual causes are a Fly secret that was never set and a database the app cannot reach. |
 
 Migrations run on the GitHub Actions runner rather than in the container because Prisma
 needs Node and [the backend image is deliberately Python-only](./backend/Dockerfile). That
@@ -387,10 +389,18 @@ keeps ~150MB out of the runtime and draws the failure boundary in the right plac
 migration fails, the deploy job never starts.
 
 `smoke` checks the response **body**, not just a 200. `/health` returns 200 for as long as
-the process is alive and reports database health in the body instead — see
+the process is alive and reports dependency health in the body instead — see
 [`health.py`](./backend/app/api/routers/health.py) for why — so a status-code-only check
 would go green against an app that cannot reach Postgres, which is exactly what a deploy
 that just migrated is most likely to break.
+
+The body carries `db` and `redis`, and **`smoke` treats them differently on purpose**: `db`
+fails the deploy, `redis` only warns. The API cannot serve a single read without Postgres,
+and serves every read without Redis, because it only ever enqueues — the worker is the
+consumer. That is why `app/main.py` boots without a queue and why `/health` stays 200
+during an Upstash outage, and a deploy gate that contradicted it would fail a release of a
+healthy API over a dependency it does not need in order to serve. A warning annotation
+still puts a broken queue on the run.
 
 Deploys **queue and are never cancelled** (`concurrency: { group: deploy-backend,
 cancel-in-progress: false }`). Two `flyctl deploy` runs against one app produce an undefined
@@ -402,19 +412,42 @@ without needing an empty commit.
 The frontend is not in this pipeline: Vercel builds and deploys `frontend/` from its own git
 integration on every push.
 
+### The two processes
+
+One image, two Fly process groups, declared in [`backend/fly.toml`](./backend/fly.toml) and
+scaled independently:
+
+| Process | Command | Serves HTTP | Health-checked |
+| --- | --- | --- | --- |
+| `app` | `uvicorn app.main:app` | yes, port 8000 | yes — `GET /health` every 10s |
+| `worker` | `arq app.worker.settings.WorkerSettings` | no | no, deliberately |
+
+The worker has **no** health check because it has no HTTP listener: a check against it
+could only ever fail, and it would restart-loop a machine that is working perfectly. The
+flip side is that a worker which dies on startup is quiet — nothing goes red — so after any
+change to its configuration, look:
+
+```bash
+fly logs --app llms-text-justin-he --process worker
+fly status --app llms-text-justin-he          # both groups, and their machine counts
+```
+
+Scaling is per group, and one `fly deploy` rolls both because they are one artifact:
+
+```bash
+fly scale count app=1 worker=1 --app llms-text-justin-he
+```
+
 ### First deploy (once, and only once)
 
 The Fly app was created with `--no-deploy`, so it begins with no machines and its four
-secrets read `Staged`. The first successful `deploy` job creates the machine and applies
-them. If it somehow lands with nothing running:
+secrets read `Staged`. The first successful `deploy` job creates the machines and applies
+them. If a deploy somehow lands with a group running nothing — which is also what to check
+the first time a *new* process group ships — the `fly scale count` above sets it right.
 
-```bash
-fly scale count app=1 --app llms-text-justin-he
-```
-
-That is a control-plane operation — it sets a machine count and ships no code, the same
-category as `fly secrets set` — so it is not the laptop deploy the policy below prohibits.
-It is a one-time bootstrap. If you ever need it twice, something else is wrong.
+That is a control-plane operation: it sets a machine count and ships no code, the same
+category as `fly secrets set`, so it is not the laptop deploy the policy below prohibits.
+It is a bootstrap. If you need it routinely, something else is wrong.
 
 ### Rolling back
 

@@ -24,13 +24,12 @@ Row cleanup is handled by the `websites_db` fixture (`conftest.py`), which delet
 websites owned by this suite's two fake users — `schedules` cascades from that delete, so
 nothing here needs its own teardown.
 
-**`_seed_website` and `_seed_schedule` are defined locally, deliberately.** They are close
-copies of the helpers in `test_websites_api.py`, extended here with `last_run_at` and
-`auto_publish` (which that file's version has no reason to set). They are NOT promoted to
-`conftest.py` in this change, even though the duplication is real: PER-155 is concurrently
-promoting shape like this into `conftest.py` for the runs feature, and editing that file here
-too would manufacture a merge conflict neither ticket needs. Fold the copies together the
-next time either file changes for an unrelated reason.
+Fixture rows are seeded with `seed_website` and `seed_schedule` from `conftest.py` rather than
+through the API, for the reason that file's "Seed helpers" section gives: a suite that builds
+its own fixtures by calling the endpoint under test cannot tell "the read is wrong" apart from
+"the write is wrong". `seed_schedule` grew `last_run_at` and `auto_publish` keyword arguments
+for this suite — they are exactly the two columns a `PUT` must never touch, so seeding them to
+known non-default values is what turns "untouched" into an assertion rather than an assumption.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -39,58 +38,13 @@ from uuid import UUID, uuid4
 
 import pytest
 from asyncpg import Pool
-from conftest import TEST_USER_A_ID
+from conftest import TEST_USER_A_ID, parse, seed_schedule, seed_website
 from httpx import AsyncClient
 
 
 # A time base for seeded schedules. Fixed relative to "now" rather than to a literal date so
 # seeded rows always sort and compare sensibly. Mirrors test_websites_api.py's `_NOW`.
 _NOW = datetime.now(UTC)
-
-
-async def _seed_website(pool: Pool, user_id: UUID, origin: str, url: str | None = None) -> UUID:
-    """Insert a website directly, bypassing the API. See test_websites_api.py's version —
-    this is the same helper, duplicated rather than imported; see the module docstring."""
-    website_id: UUID = await pool.fetchval(
-        "INSERT INTO websites (user_id, url, origin) VALUES ($1, $2, $3) RETURNING id",
-        user_id,
-        url or f"{origin}/",
-        origin,
-    )
-    return website_id
-
-
-async def _seed_schedule(
-    pool: Pool,
-    website_id: UUID,
-    *,
-    active: bool = True,
-    interval_minutes: int = 360,
-    next_run_at: datetime | None = None,
-    last_run_at: datetime | None = None,
-    auto_publish: bool = False,
-) -> UUID:
-    """Insert a schedule directly, bypassing the API.
-
-    Extended beyond test_websites_api.py's version with `last_run_at` and `auto_publish` —
-    both of which this suite has to seed and later assert are untouched by a `PUT`, and
-    neither of which that file's tests have any reason to set.
-    """
-    schedule_id: UUID = await pool.fetchval(
-        """
-        INSERT INTO schedules
-            (website_id, active, interval_minutes, next_run_at, last_run_at, auto_publish)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id
-        """,
-        website_id,
-        active,
-        interval_minutes,
-        next_run_at,
-        last_run_at,
-        auto_publish,
-    )
-    return schedule_id
 
 
 async def _fetch_schedule_row(pool: Pool, website_id: UUID) -> dict[str, Any] | None:
@@ -107,20 +61,14 @@ async def _fetch_schedule_row(pool: Pool, website_id: UUID) -> dict[str, Any] | 
     return dict(record) if record is not None else None
 
 
-def _parse(timestamp: str) -> datetime:
-    """Parse a timestamp out of a JSON response. See test_websites_api.py's version: every
-    column involved is `timestamptz` with microsecond precision, so seeded values round-trip
-    exactly and can be compared with `==`."""
-    return datetime.fromisoformat(timestamp)
-
-
 def _assert_close(actual: datetime, expected: datetime, *, tolerance_seconds: float = 5.0) -> None:
     """Assert `actual` is within a few seconds of `expected`.
 
     Used only for values this suite did not seed itself — `next_run_at` computed by the
     service from its own `datetime.now(UTC)`, which a test cannot know exactly without
     duplicating the service's clock read. Every value the test itself seeded is instead
-    compared with plain `==` (see `_parse`), because that comparison can and should be exact.
+    compared with plain `==` (via `conftest.parse`), because that comparison can and should
+    be exact.
     """
     assert abs((actual - expected).total_seconds()) <= tolerance_seconds
 
@@ -134,7 +82,7 @@ async def test_get_with_no_schedule_returns_200_with_a_null_body(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     """A website with no schedule yet is a normal `200`, never a `404`."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://no-schedule.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://no-schedule.example")
 
     response = await user_client.get(f"/websites/{website_id}/schedule")
 
@@ -146,10 +94,10 @@ async def test_get_with_a_schedule_returns_every_field_and_never_auto_publish(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     """Every response field the schema declares, and the one field it deliberately omits."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://has-schedule.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://has-schedule.example")
     next_run_at = _NOW + timedelta(hours=6)
     last_run_at = _NOW - timedelta(hours=1)
-    schedule_id = await _seed_schedule(
+    schedule_id = await seed_schedule(
         websites_db,
         website_id,
         active=True,
@@ -167,8 +115,8 @@ async def test_get_with_a_schedule_returns_every_field_and_never_auto_publish(
     assert body["website_id"] == str(website_id)
     assert body["active"] is True
     assert body["interval_minutes"] == 360
-    assert _parse(body["next_run_at"]) == next_run_at
-    assert _parse(body["last_run_at"]) == last_run_at
+    assert parse(body["next_run_at"]) == next_run_at
+    assert parse(body["last_run_at"]) == last_run_at
     assert "auto_publish" not in body
 
 
@@ -185,10 +133,10 @@ async def test_get_by_a_non_owner_returns_the_same_body(
     safety" has nothing to filter by (there is no `user_id` on `schedules`), so the only way
     such a filter could exist is a join back to `websites` — which this test would catch.
     """
-    website_id = await _seed_website(
+    website_id = await seed_website(
         websites_db, TEST_USER_A_ID, "https://readable-schedule.example"
     )
-    await _seed_schedule(websites_db, website_id, active=True, interval_minutes=60)
+    await seed_schedule(websites_db, website_id, active=True, interval_minutes=60)
 
     owner_response = await user_client.get(f"/websites/{website_id}/schedule")
     stranger_response = await second_user_client.get(f"/websites/{website_id}/schedule")
@@ -211,7 +159,7 @@ async def test_put_creating_a_schedule_schedules_from_now(
 ) -> None:
     """The first `PUT` for a website with no schedule creates one, active, due one interval
     from now — and exactly one row lands in `schedules`."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://create-schedule.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://create-schedule.example")
 
     request_time = datetime.now(UTC)
     response = await user_client.put(
@@ -222,7 +170,7 @@ async def test_put_creating_a_schedule_schedules_from_now(
     body = response.json()
     assert body["active"] is True
     assert body["interval_minutes"] == 360
-    _assert_close(_parse(body["next_run_at"]), request_time + timedelta(minutes=360))
+    _assert_close(parse(body["next_run_at"]), request_time + timedelta(minutes=360))
     assert (
         await websites_db.fetchval(
             "SELECT count(*) FROM schedules WHERE website_id = $1", website_id
@@ -236,9 +184,9 @@ async def test_put_changing_the_interval_while_active_does_not_cause_an_immediat
 ) -> None:
     """The weekly -> hourly acceptance criterion: recomputed from now, not from the stale
     weekly `next_run_at`, and strictly in the future — never an immediate fire."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://reschedule.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://reschedule.example")
     old_next_run_at = _NOW + timedelta(days=6)
-    await _seed_schedule(
+    await seed_schedule(
         websites_db, website_id, active=True, interval_minutes=10080, next_run_at=old_next_run_at
     )
 
@@ -248,7 +196,7 @@ async def test_put_changing_the_interval_while_active_does_not_cause_an_immediat
     )
 
     assert response.status_code == 200
-    next_run_at = _parse(response.json()["next_run_at"])
+    next_run_at = parse(response.json()["next_run_at"])
     assert next_run_at > request_time
     assert next_run_at != old_next_run_at
     _assert_close(next_run_at, request_time + timedelta(minutes=60))
@@ -257,8 +205,8 @@ async def test_put_changing_the_interval_while_active_does_not_cause_an_immediat
 async def test_put_deactivating_clears_next_run_at(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://deactivate.example")
-    await _seed_schedule(
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://deactivate.example")
+    await seed_schedule(
         websites_db,
         website_id,
         active=True,
@@ -284,8 +232,8 @@ async def test_put_deactivating_clears_next_run_at(
 async def test_put_reactivating_schedules_from_now(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://reactivate.example")
-    await _seed_schedule(
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://reactivate.example")
+    await seed_schedule(
         websites_db, website_id, active=False, interval_minutes=360, next_run_at=None
     )
 
@@ -297,7 +245,7 @@ async def test_put_reactivating_schedules_from_now(
     assert response.status_code == 200
     body = response.json()
     assert body["active"] is True
-    _assert_close(_parse(body["next_run_at"]), request_time + timedelta(minutes=360))
+    _assert_close(parse(body["next_run_at"]), request_time + timedelta(minutes=360))
 
 
 async def test_put_a_no_op_does_not_push_next_run_at_out(
@@ -305,9 +253,9 @@ async def test_put_a_no_op_does_not_push_next_run_at_out(
 ) -> None:
     """The starvation guard: the same `active` + the same `interval_minutes` must return the
     seeded `next_run_at` byte-identical, not a value recomputed from a later `now()`."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://no-op.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://no-op.example")
     seeded_next_run_at = _NOW + timedelta(hours=2, minutes=13, seconds=7)
-    await _seed_schedule(
+    await seed_schedule(
         websites_db,
         website_id,
         active=True,
@@ -320,7 +268,7 @@ async def test_put_a_no_op_does_not_push_next_run_at_out(
     )
 
     assert response.status_code == 200
-    assert _parse(response.json()["next_run_at"]) == seeded_next_run_at
+    assert parse(response.json()["next_run_at"]) == seeded_next_run_at
 
 
 async def test_put_by_a_non_owner_is_403_and_the_row_is_unchanged(
@@ -328,10 +276,10 @@ async def test_put_by_a_non_owner_is_403_and_the_row_is_unchanged(
 ) -> None:
     """Every column, not just the status code — a refused write must not have written
     anything, including into columns the request did not even mention."""
-    website_id = await _seed_website(
+    website_id = await seed_website(
         websites_db, TEST_USER_A_ID, "https://protected-schedule.example"
     )
-    await _seed_schedule(
+    await seed_schedule(
         websites_db,
         website_id,
         active=True,
@@ -365,7 +313,7 @@ async def test_put_by_a_non_owner_is_403_and_the_row_is_unchanged(
 async def test_put_an_invalid_interval_is_422(
     user_client: AsyncClient, websites_db: Pool, interval_minutes: Any
 ) -> None:
-    website_id = await _seed_website(
+    website_id = await seed_website(
         websites_db, TEST_USER_A_ID, f"https://invalid-interval-{interval_minutes}.example"
     )
 
@@ -382,7 +330,7 @@ async def test_put_an_invalid_interval_names_every_allowed_value(
 ) -> None:
     """Pydantic's own `Literal` message already names every allowed preset — nothing in this
     feature has to hand-write that text."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://named-presets.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://named-presets.example")
 
     response = await user_client.put(
         f"/websites/{website_id}/schedule", json={"active": True, "interval_minutes": 1}
@@ -397,7 +345,7 @@ async def test_put_an_invalid_interval_names_every_allowed_value(
 async def test_put_twice_never_creates_a_second_row(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://put-twice.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://put-twice.example")
 
     first = await user_client.put(
         f"/websites/{website_id}/schedule", json={"active": True, "interval_minutes": 60}
@@ -419,9 +367,9 @@ async def test_put_twice_never_creates_a_second_row(
 async def test_put_never_modifies_last_run_at(user_client: AsyncClient, websites_db: Pool) -> None:
     """`last_run_at` belongs to the cron tick and the run pipeline, neither of which exists
     yet — a `PUT` through every kind of transition must leave it exactly as seeded."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://last-run-at.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://last-run-at.example")
     known_last_run_at = _NOW - timedelta(days=3)
-    await _seed_schedule(
+    await seed_schedule(
         websites_db,
         website_id,
         active=False,
@@ -439,7 +387,7 @@ async def test_put_never_modifies_last_run_at(user_client: AsyncClient, websites
     for body in bodies:
         response = await user_client.put(f"/websites/{website_id}/schedule", json=body)
         assert response.status_code == 200
-        assert _parse(response.json()["last_run_at"]) == known_last_run_at
+        assert parse(response.json()["last_run_at"]) == known_last_run_at
 
     row = await _fetch_schedule_row(websites_db, website_id)
     assert row is not None
@@ -450,8 +398,8 @@ async def test_put_cannot_write_auto_publish(user_client: AsyncClient, websites_
     """`auto_publish` is reserved (db/schema.prisma). A body that carries it is not rejected
     — `UpsertScheduleRequest` has no `extra="forbid"` — but it must be silently ignored, not
     silently honored."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://auto-publish.example")
-    await _seed_schedule(websites_db, website_id, active=False, auto_publish=True)
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://auto-publish.example")
+    await seed_schedule(websites_db, website_id, active=False, auto_publish=True)
 
     response = await user_client.put(
         f"/websites/{website_id}/schedule",
@@ -477,7 +425,7 @@ async def test_put_on_another_users_website_with_no_existing_schedule_is_403_and
 ) -> None:
     """The 403 must fire before any row is created — `require_owner` runs before the
     transaction opens, so a non-owner's first-ever `PUT` for a website leaves nothing behind."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://no-schedule-yet.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://no-schedule-yet.example")
 
     response = await second_user_client.put(
         f"/websites/{website_id}/schedule", json={"active": True, "interval_minutes": 60}
@@ -497,7 +445,7 @@ async def test_enabling_a_daily_schedule_persists_active_and_schedules_a_day_out
 ) -> None:
     """The ticket's acceptance criterion, spelled out literally: enabling a daily (1440)
     schedule persists `active=true` and a `next_run_at` roughly 24 hours out."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://daily.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://daily.example")
 
     request_time = datetime.now(UTC)
     response = await user_client.put(
@@ -507,7 +455,7 @@ async def test_enabling_a_daily_schedule_persists_active_and_schedules_a_day_out
     assert response.status_code == 200
     body = response.json()
     assert body["active"] is True
-    _assert_close(_parse(body["next_run_at"]), request_time + timedelta(hours=24))
+    _assert_close(parse(body["next_run_at"]), request_time + timedelta(hours=24))
 
     row = await _fetch_schedule_row(websites_db, website_id)
     assert row is not None

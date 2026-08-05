@@ -11,10 +11,12 @@ against the real application.
 """
 
 import asyncio
+import json
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final, NoReturn
 from uuid import UUID
 
@@ -22,11 +24,14 @@ import asyncpg
 import httpx
 import jwt
 import pytest
+from arq import create_pool
+from arq.connections import ArqRedis
 from asyncpg import Connection, Pool
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+from redis.exceptions import RedisError
 
 
 # `app.core.settings` validates its configuration at import time (by design — see that
@@ -51,6 +56,7 @@ os.environ["SUPABASE_SECRET_KEY"] = "not-a-real-key"
 
 from app.api.deps import get_db_pool  # noqa: E402  — must follow the assignments above
 from app.core.auth.jwks import JwksCache, get_jwks_cache  # noqa: E402  — as above
+from app.infrastructure.queue.pool import redis_settings_from_url  # noqa: E402  — as above
 from app.main import app  # noqa: E402  — must follow the assignments above
 
 
@@ -80,6 +86,23 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or (
 # An obviously test-only name for the scratch table tests/test_transaction.py reads and
 # writes. Created and dropped by the db_pool fixture below.
 _SCRATCH_TABLE = "per_145_transaction_scratch_test"
+
+# Which real Redis the queue-backed fixtures below connect to, and which logical database
+# on it. **Database 15, not 0, and the fixture FLUSHES it** — the same "create a scratch
+# space and destroy it afterwards" contract `db_pool` has with `_SCRATCH_TABLE`, except
+# Redis has no tables to scope the damage to. Index 0 is where docker-compose.yml's local
+# container keeps a developer's actual `make dev` queue, and this must never be pointed at
+# it. Override only with another throwaway.
+#
+# Unlike TEST_DATABASE_URL there is no CI special case, because there is nothing to
+# discover: docker-compose.yml and the `redis:7-alpine` service in ci-backend.yml both
+# publish 6379 on localhost, so one default is correct in both places.
+TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
+
+# The queue the enqueue tests read and write. Named, rather than left as arq's default
+# `arq:queue`, so that a misconfigured TEST_REDIS_URL pointing at a real instance is
+# visible in `redis-cli KEYS *` instead of quietly interleaving with production job ids.
+TEST_QUEUE_NAME = "per_157_test_queue"
 
 
 @pytest.fixture
@@ -169,6 +192,47 @@ async def db_pool() -> AsyncIterator[Pool]:
 
     await pool.execute(f"DROP TABLE IF EXISTS {_SCRATCH_TABLE}")
     await pool.close()
+
+
+@pytest.fixture(scope="session")
+async def queue_pool() -> AsyncIterator[ArqRedis]:
+    """A real ARQ Redis pool against TEST_REDIS_URL, shared for the whole test session.
+
+    Skips loudly rather than failing when there is nothing to connect to, exactly like
+    `db_pool` above, so `make test` still works offline (CLAUDE.md "Commands"). A real
+    Redis and not `fakeredis` for the same reason ci-backend.yml stands up a real
+    `postgres:16`: what these tests are verifying is that arq's own serialization,
+    sorted-set queue, and job keys behave as expected, and a reimplementation of Redis
+    cannot answer that question about arq.
+
+    `conn_retries = 0` overrides arq's default of five one-second retries. Those are right
+    in production, where Redis may be a moment behind a deploy, and wrong here, where they
+    would add five seconds of dead time to every offline test run before the skip.
+
+    **The database is flushed on the way in and on the way out.** See TEST_REDIS_URL for
+    why that is safe and what it must never be pointed at. Flushing on entry as well as
+    exit means a previous run killed with Ctrl-C cannot leave keys that make this one pass
+    or fail for the wrong reason.
+    """
+    redis_settings = redis_settings_from_url(TEST_REDIS_URL)
+    redis_settings.conn_retries = 0
+
+    try:
+        pool = await create_pool(redis_settings, default_queue_name=TEST_QUEUE_NAME)
+    except (OSError, RedisError) as exc:
+        pytest.skip(
+            f"TEST_REDIS_URL is set but Redis is unreachable ({type(exc).__name__}). "
+            "Start it with `docker compose up -d redis` (or `make dev`) and re-run "
+            "`make test`."
+        )
+        return  # pytest.skip() always raises; this line only satisfies static analysis.
+
+    await pool.flushdb()
+
+    yield pool
+
+    await pool.flushdb()
+    await pool.aclose(close_connection_pool=True)
 
 
 @pytest.fixture
@@ -545,3 +609,119 @@ async def second_user_client(
     """
     async with _api_client(api_app, _bearer_headers(es256_key, TEST_USER_B_ID)) as ac:
         yield ac
+
+
+# -----------------------------------------------------------------------------------------
+# Seed helpers, shared by every feature suite that writes fixture rows directly against the
+# test database rather than through the API (see `tests/test_websites_api.py`'s module
+# docstring for why: a test that builds its own fixtures by calling `POST /websites` cannot
+# tell "the list query is wrong" apart from "the create endpoint is wrong").
+#
+# Promoted out of `tests/test_websites_api.py` (PER-155) once a second suite,
+# `tests/test_runs_api.py`, needed the same fixtures. Deliberately NOT promoted alongside
+# them: each suite's own `_NOW` time base, which every seeded timestamp below is relative
+# to — sharing one `_NOW` across suites would make a run seeded by one suite sort relative
+# to a website seeded by the other in a way neither test file controls.
+# -----------------------------------------------------------------------------------------
+
+
+async def seed_website(pool: Pool, user_id: UUID, origin: str, url: str | None = None) -> UUID:
+    """Insert a website directly, bypassing the API. See the section docstring above."""
+    website_id: UUID = await pool.fetchval(
+        "INSERT INTO websites (user_id, url, origin) VALUES ($1, $2, $3) RETURNING id",
+        user_id,
+        url or f"{origin}/",
+        origin,
+    )
+    return website_id
+
+
+async def seed_run(
+    pool: Pool,
+    website_id: UUID,
+    *,
+    started_at: datetime,
+    status: str = "completed",
+    trigger: str = "manual",
+    completed_at: datetime | None = None,
+    stats: dict[str, Any] | str | None = None,
+    llms_txt: str | None = None,
+    storage_path: str | None = None,
+    error: str | None = None,
+) -> UUID:
+    """Insert a run directly.
+
+    `stats` is passed as a JSON *string* cast to jsonb: asyncpg encodes and decodes
+    `json`/`jsonb` as `str` and will not accept a Python dict for a jsonb parameter without a
+    custom type codec. It also accepts a raw string, so a test can seed deliberately
+    malformed stats.
+
+    `"trigger"` is quoted because it is a SQL keyword, matching the generated migration.
+    `llms_txt`, `storage_path`, and `error` default to `None`, matching a run that has not
+    (yet, or ever) recorded them; `tests/test_runs_api.py` passes them explicitly to
+    exercise `RunDetailResponse`.
+    """
+    encoded = json.dumps(stats) if isinstance(stats, dict) else stats
+    run_id: UUID = await pool.fetchval(
+        """
+        INSERT INTO runs
+            (website_id, "trigger", status, started_at, completed_at, stats,
+             llms_txt, storage_path, error)
+        VALUES ($1, $2::run_trigger, $3::run_status, $4, $5, $6::jsonb, $7, $8, $9)
+        RETURNING id
+        """,
+        website_id,
+        trigger,
+        status,
+        started_at,
+        completed_at,
+        encoded,
+        llms_txt,
+        storage_path,
+        error,
+    )
+    return run_id
+
+
+async def seed_schedule(
+    pool: Pool,
+    website_id: UUID,
+    *,
+    active: bool = True,
+    interval_minutes: int = 360,
+    next_run_at: datetime | None = None,
+    last_run_at: datetime | None = None,
+    auto_publish: bool = False,
+) -> UUID:
+    """Insert a schedule directly.
+
+    `last_run_at` and `auto_publish` are the two columns `PUT /websites/{id}/schedule`
+    deliberately never writes. Both default to what a freshly created row would hold, and
+    `tests/test_schedules_api.py` sets them explicitly so it can assert afterwards that a
+    write left them exactly as it found them — a helper unable to seed them would make "this
+    API never touches these columns" untestable.
+    """
+    schedule_id: UUID = await pool.fetchval(
+        """
+        INSERT INTO schedules
+            (website_id, active, interval_minutes, next_run_at, last_run_at, auto_publish)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id
+        """,
+        website_id,
+        active,
+        interval_minutes,
+        next_run_at,
+        last_run_at,
+        auto_publish,
+    )
+    return schedule_id
+
+
+def parse(timestamp: str) -> datetime:
+    """Parse a timestamp out of a JSON response, for comparison against what was seeded.
+
+    Every column involved is `timestamptz` with microsecond precision, so this round trip is
+    exact — an assertion may compare for equality rather than for approximate closeness.
+    """
+    return datetime.fromisoformat(timestamp)

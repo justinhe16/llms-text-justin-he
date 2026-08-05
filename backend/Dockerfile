@@ -1,10 +1,11 @@
 # Backend image for Fly.io.
 #
-# One image serves both processes: the FastAPI API (web) and the ARQ worker. The worker
-# overrides CMD in fly.toml, so nothing below may assume this container is the web
-# process. In particular there is deliberately no HEALTHCHECK here — an HTTP health check
-# baked into the image would fail forever in a worker container, which serves no HTTP.
-# Fly's health checks are configured per process in fly.toml.
+# One image serves both processes: the FastAPI API (the `app` process) and the ARQ worker
+# (the `worker` process). Both commands are declared in fly.toml's `[processes]` block and
+# each replaces the CMD below, so nothing here may assume this container is the API. In
+# particular there is deliberately no HEALTHCHECK — an HTTP check baked into the image
+# would fail forever in a worker container, which serves no HTTP. Fly's health checks are
+# scoped to the `app` process in fly.toml.
 #
 # There is no Node in this image. Prisma runs migrations on the GitHub Actions runner,
 # not here, which keeps ~150MB and a whole class of version drift out of the runtime.
@@ -34,4 +35,6 @@ USER appuser
 
 EXPOSE 8000
 
+# Kept identical to fly.toml's `app` process command, so running this image locally and
+# running it on Fly start the same way. A machine in the `worker` group replaces it.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

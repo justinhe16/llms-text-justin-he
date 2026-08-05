@@ -56,7 +56,7 @@ Four moving parts, three deploy targets:
                        │  Fly.io — one image          │
                        │  ┌────────────┬────────────┐ │
                        │  │  FastAPI   │ ARQ worker │ │
-                       │  │  (web)     │ (worker)   │ │
+                       │  │  (app)     │ (worker)   │ │
                        │  └────────────┴────────────┘ │
                        └────────┬─────────────┬───────┘
                   asyncpg/HTTP  │             │  job queue
@@ -75,10 +75,19 @@ therefore happens outside any transaction.
 | Piece | Runtime | Deployed to | Notes |
 | --- | --- | --- | --- |
 | `frontend/` | Next.js (App Router) | Vercel | Vercel project root directory is `frontend/` |
-| `backend/` | FastAPI + ARQ | Fly.io | One image, two processes (`web`, `worker`) |
+| `backend/` | FastAPI + ARQ | Fly.io | One image, two processes (`app`, `worker`) |
 | `db/` | Prisma CLI | — | Schema and migration tooling only; never runs in production |
 | Postgres / Auth / Storage | Supabase | — | Backend talks to Postgres over **asyncpg** |
-| Job queue | Redis | — | Required by ARQ; provisioning is handled by the infra ticket |
+| Job queue | Redis (Upstash) | — | Required by ARQ; `rediss://` in production, plain `redis://` locally |
+
+**On the name `app`.** The two Fly process groups are `app` and `worker`, declared in
+[`backend/fly.toml`](./backend/fly.toml). Earlier revisions of this document called the
+first one `web`, which read better but was never what production ran: a fly.toml with no
+`[processes]` block puts every machine in Fly's implicit group, and that group is called
+`app`. By the time process groups were declared explicitly, machines had been running under
+that name since the deploy pipeline landed, and flyctl destroys machines whose group is no
+longer declared — so `web` would have cost a teardown and rebuild of the running fleet to
+buy a nicer word. `app` is therefore the name, everywhere, permanently.
 
 Two consequences fall out of this shape and are load-bearing everywhere else in the
 document:
@@ -201,6 +210,34 @@ different trigger, not a parallel implementation. Job functions live in
 `backend/app/worker/`, stay thin for exactly the reasons routers do, and enqueue with typed
 arguments only (ids and primitives, never ORM objects or Pydantic models).
 
+```
+backend/app/worker/
+├── settings.py   WorkerSettings — what `arq app.worker.settings.WorkerSettings` loads
+└── jobs.py       the job functions themselves
+```
+
+**The API enqueues; the worker consumes. Neither does the other.** The API opens an
+`ArqRedis` pool in its lifespan and exposes it as a dependency; the worker gets its own
+connection from arq. Nothing in `app/api/` or `app/features/` imports `app/worker/` — the
+dependency runs the other way, so the queue never enters a request path.
+
+Three properties of `WorkerSettings` are load-bearing enough to state here, because each
+fails silently rather than loudly:
+
+- **`poll_delay = 5`, not arq's 0.5.** An idle worker issues one Redis command per poll, and
+  Upstash bills per command: 0.5s is 172,800 commands a day to do nothing. This is a cost
+  decision, not a tuning preference, and it is asserted in a test.
+- **`functions` is never empty.** arq refuses to construct a `Worker` with no registered
+  functions, so an "empty until the crawl task lands" worker does not idle — it crash-loops
+  on Fly with no HTTP listener to fail a health check. A no-op job holds the place.
+- **`job_completion_wait` is non-zero.** It is the only thing that makes SIGTERM drain
+  rather than cancel, and it has to nest inside `fly.toml`'s `kill_timeout`.
+
+Startup and shutdown hooks (`on_startup`/`on_shutdown`) open and close the asyncpg pool with
+**the same factory the API's lifespan uses**, and publish shared resources on arq's context
+dict so jobs build them once per process rather than once per job. That is where the crawl
+task's `httpx.AsyncClient` goes.
+
 ### 3.4 The crawler seam
 
 Real crawling and extraction logic is **out of scope for this milestone** and has not been
@@ -224,6 +261,20 @@ convert `asyncpg.Record` to `dict[str, Any]` so a `Record` never escapes a repos
 and `transaction.py` (the `transaction()` context manager services use to open a unit of
 work — §5). It has no feature-specific logic and no schema knowledge; a feature's reader
 and writer subclass `Reader`/`Writer`, and its service calls `transaction()`.
+
+### 3.6 The queue infrastructure layer
+
+`backend/app/infrastructure/queue/pool.py` is the Redis counterpart, and is deliberately the
+same shape as `db/pool.py`: a pure factory plus an `open`/`get`/`close` process-wide
+singleton, so there is one pattern to learn for both backing services. It holds no job
+logic and knows nothing about crawls.
+
+It owns one decision that must not be made anywhere else: **whether a connection is TLS is
+derived from the URL scheme, never hardcoded.** Production is Upstash over `rediss://` and
+local development is a container over plain `redis://`, so a hardcoded `ssl=True` breaks
+`make dev` and a hardcoded `ssl=False` puts the Upstash password on the wire in cleartext.
+The same function also turns on the hostname verification arq leaves off by default, so
+there is no route to an unverified TLS connection from this codebase.
 
 ---
 
@@ -556,8 +607,15 @@ These are prohibitions, not preferences.
 The ordering is the point. Deploy is `migrate → deploy → smoke`, and every job is gated on
 the one before it: a failed migration means no deploy, and a deploy that leaves the app
 unhealthy fails the run rather than reporting success. One `fly deploy` rolls every process
-in the image — today the API, and the worker once it exists — so `web` and `worker` are not
-separately gated steps; they ship together because they are one artifact.
+in the image, so `app` and `worker` are not separately gated steps; they ship together
+because they are one artifact.
+
+`smoke` reads the `/health` body, and treats its two dependencies differently on purpose:
+an unhealthy `db` fails the deploy, an unhealthy `redis` only warns. That is the same split
+the endpoint itself encodes — the API cannot serve a single read without Postgres, and
+serves every read without Redis, because it only ever enqueues. A deploy gate that
+contradicted that would fail a release of a perfectly healthy API over a queue the API does
+not need in order to serve.
 
 This policy is restated in [`README.md`](./README.md#deploy-policy) so that it is visible to
 anyone who reads only the README. **This section is the authoritative copy.** If the two ever
