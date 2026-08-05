@@ -98,6 +98,7 @@ document:
 llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
+│   └── app/core/auth/   JWKS cache + JWT verification dependencies
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
 ├── supabase/            local Supabase stack config (config.toml, seed.sql)
 ├── scripts/             shell helpers used by the Makefile (dev.sh, local-env.sh)
@@ -392,6 +393,105 @@ These are prohibitions, not preferences. A PR that violates one does not get mer
   different schema than the one recorded in the repo.
 - **Never commit a schema change without its migration**, or a migration without its schema
   change. They land together or not at all.
+
+### 6.4 The schema
+
+Three tables, and they are the whole application state:
+
+```
+             ┌───────────────────────────────┐
+             │ websites                      │
+             │ ───────────────────────────── │
+             │ id            uuid  PK        │
+             │ user_id       uuid  NOT NULL  │──▶ auth.users(id), by convention only
+             │ url           text            │    (no FK — see below)
+             │ origin        text            │
+             │ title         text NULL       │
+             │ created_at    timestamptz     │
+             │ UNIQUE (user_id, origin)      │
+             └───────────────────────────────┘
+                    │ 1                │ 1
+       ON DELETE    │                  │    ON DELETE CASCADE
+        CASCADE     │ 0..1             │ 0..n
+                    ▼                  ▼
+   ┌────────────────────────────┐   ┌──────────────────────────────┐
+   │ schedules                  │   │ runs                         │
+   │ ────────────────────────── │   │ ──────────────────────────── │
+   │ id           uuid  PK      │   │ id           uuid  PK        │
+   │ website_id   uuid  UNIQUE  │   │ website_id   uuid  NOT NULL  │
+   │ active       bool          │   │ schedule_id  uuid  NULL      │
+   │ interval_minutes  int      │◀──│ trigger      run_trigger     │
+   │ next_run_at  timestamptz?  │ 0..n  status     run_status      │
+   │ last_run_at  timestamptz?  │   │ started_at   timestamptz     │
+   │ auto_publish bool          │   │ completed_at timestamptz?    │
+   │              (reserved)    │   │ llms_txt     text?           │
+   └────────────────────────────┘   │ stats        jsonb?          │
+        ON DELETE SET NULL ─────────│ error        text?           │
+        (run history outlives       │ storage_path text?           │
+         the schedule)              └──────────────────────────────┘
+```
+
+**`websites`** — a site a user added. `url` is what they typed; `origin` is the normalized
+scheme + host and is the dedupe key. `UNIQUE (user_id, origin)` stops one user adding the
+same site twice while letting two users each add it — it is a dedupe key, not a tenancy
+boundary (§4).
+
+**`schedules`** — the recurring-run configuration, at most one per website, enforced by a
+`UNIQUE` on `website_id` rather than by convention. `(active, next_run_at)` is indexed
+because the cron tick reads exactly that pair on every wake-up. `auto_publish` is
+**reserved and unused in this milestone**: no code reads or writes it, and it exists so
+that enabling publish-on-success later is a behaviour change rather than a migration on a
+table the tick is actively scanning.
+
+**`runs`** — one generation attempt and its outcome. `(website_id, started_at DESC)` serves
+both the history list and the latest-run lookup. A second, **partial** index covers
+`status` where it is `pending` or `processing`: both the duplicate-run guard on a manual
+trigger and the stuck-run reaper scan for exactly those two, while completed and failed
+rows are the ones that accumulate forever. That index is hand-written in the migration —
+Prisma has no syntax for a partial index, and its introspection cannot see one, so it is
+deliberately **not** declared in `schema.prisma` (declaring it makes every later
+`migrate dev` emit a duplicate `CREATE INDEX`).
+
+Both `trigger` and `status` are real Postgres enums rather than text with a `CHECK`. The
+worker writes status transitions directly, and a typo should fail at the database instead
+of persisting a value no reader knows how to interpret. Adding a value later means
+`ALTER TYPE ... ADD VALUE`, which deserves its own migration: below Postgres 12 it cannot
+run inside a transaction at all, and from 12 on the new value cannot be *used* until the
+adding transaction commits.
+
+Every timestamp is `timestamptz`. In a system whose entire purpose is scheduling, a naive
+timestamp is a bug waiting for the next DST transition.
+
+#### Why `interval_minutes` and not cron
+
+Schedules store an integer number of minutes. The UI presets — hourly, 6-hourly, daily,
+weekly — are a presentation concern that maps to 60 / 360 / 1440 / 10080.
+
+Cron would buy expressiveness nobody has asked for, and charge for it three times: a cron
+parser to depend on and keep correct, timezone semantics to define for every stored
+expression, and a materially harder "when does this next run?" computation. With an
+interval, that computation is `last_run_at + interval`, the cron tick is one indexed
+range scan over `(active, next_run_at)`, and "every 90 minutes" — which cron cannot say
+without enumerating — is just `90`. If a user ever genuinely needs "weekdays at 09:00",
+that is a ticket, not a field nobody planned for.
+
+#### Why there is no foreign key to `auth.users`
+
+`websites.user_id` holds an `auth.users(id)` value and there is no database constraint
+saying so. That is deliberate, and it is not a shortcut:
+
+- `auth` is **Supabase's** schema, not ours. Prisma cannot model it without `multiSchema`,
+  and pointing Prisma at `auth` invites it to generate `DROP`s for objects Supabase owns.
+- The same migration has to apply, unchanged, everywhere. CI's test database is a bare
+  `postgres:16` container with no `auth` schema, migrated with the same
+  `prisma migrate deploy` production runs, so a cross-schema FK fails there outright. It
+  also fails *locally*: Prisma's shadow database is a blank database that never inherits
+  Supabase's schemas, which would break every subsequent `make migrate` too.
+
+The consequence, stated here rather than discovered later: **Supabase Auth is the system of
+record for users**, and Postgres will not stop a `websites` row from referencing a deleted
+one. Deleting a user does not cascade to their websites. Nothing in this milestone deletes
+users; whatever does, owns the cleanup.
 
 ---
 

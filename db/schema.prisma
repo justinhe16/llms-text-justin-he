@@ -18,3 +18,190 @@ datasource db {
   provider = "postgresql"
   url      = env("DIRECT_DATABASE_URL")
 }
+
+// ---------------------------------------------------------------------------------------
+// Conventions used below — ARCHITECTURE.md §10.4:
+//
+//   * Tables are plural snake_case, so every model carries `@@map`. Columns are
+//     snake_case, so every camelCase field carries `@map`. The physical name is the one
+//     that matters here: readers and writers address these columns in hand-written SQL,
+//     never through a generated client.
+//   * Every primary key defaults to `gen_random_uuid()` via `dbgenerated`, not Prisma's
+//     `@default(uuid())`. `@default(uuid())` generates the value in Prisma Client, which
+//     this project does not run — it would emit a column with no database default and
+//     every asyncpg INSERT would have to supply an id.  `gen_random_uuid()` is core
+//     Postgres from 13 onward, so no extension is required.
+//   * Every timestamp is `timestamptz`. This system's whole purpose is scheduling;
+//     a naive timestamp is a bug waiting for the next DST transition.
+//     `@default(now())` renders as `DEFAULT CURRENT_TIMESTAMP`, which is Postgres's
+//     spelling of `now()` — the same function, evaluated at transaction start.
+//
+// On the absence of a foreign key to `auth.users` — see `Website.userId` below.
+// ---------------------------------------------------------------------------------------
+
+/// A site a user has added, identified for dedupe purposes by its normalized origin.
+model Website {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// The owner, holding an `auth.users(id)` value from Supabase Auth.
+  ///
+  /// There is deliberately NO foreign key to `auth.users` here, and none is added by
+  /// hand in the migration either. Two reasons, in order of weight:
+  ///
+  ///   1. `auth` is Supabase's schema, not ours. Prisma cannot model it without
+  ///      `multiSchema`, and pointing Prisma at `auth` invites it to generate DROPs for
+  ///      objects Supabase owns. The ticket that created this table calls that out.
+  ///   2. The migration has to apply, unchanged, to every database the project targets.
+  ///      CI's test database is a bare `postgres:16` service container with no `auth`
+  ///      schema at all (.github/workflows/ci-backend.yml), and it is migrated with the
+  ///      same `prisma migrate deploy` production runs. A constraint that only exists in
+  ///      one of those environments is a migration that fails in the other.
+  ///
+  /// Consequence, stated plainly rather than discovered later: Supabase Auth is the
+  /// system of record for users, and Postgres will not stop a row here from referencing
+  /// a deleted user. Deleting a user does not cascade to their websites. Nothing in this
+  /// milestone deletes users; when something does, it owns the cleanup.
+  userId String @map("user_id") @db.Uuid
+
+  /// The URL exactly as the user submitted it — kept for display and for debugging what
+  /// normalization did.
+  url String
+
+  /// Normalized scheme + host (e.g. `https://example.com`). The dedupe key.
+  origin String
+
+  /// Populated by a crawl; null until one has run.
+  title String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  schedule Schedule?
+  runs     Run[]
+
+  /// One user cannot add the same site twice; two users each adding it is fine. This
+  /// project is not multi-tenant (ARCHITECTURE.md §4) — the pair is a dedupe key, not a
+  /// tenancy boundary.
+  @@unique([userId, origin])
+  @@index([userId])
+  @@map("websites")
+}
+
+/// The recurring-run configuration for a website. At most one per website.
+model Schedule {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Unique, which is what makes this a one-to-one: a website has at most one schedule.
+  websiteId String  @unique @map("website_id") @db.Uuid
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  active Boolean @default(false)
+
+  /// Minutes between runs, not a cron expression. The UI presets (hourly / 6-hourly /
+  /// daily / weekly) map to 60 / 360 / 1440 / 10080. See ARCHITECTURE.md §6.4 for why.
+  intervalMinutes Int @map("interval_minutes")
+
+  /// Null while the schedule is inactive. The cron tick reads `(active, next_run_at)`.
+  nextRunAt DateTime? @map("next_run_at") @db.Timestamptz(6)
+  lastRunAt DateTime? @map("last_run_at") @db.Timestamptz(6)
+
+  /// RESERVED, UNUSED IN THIS MILESTONE. No code reads or writes this column yet; it is
+  /// here so that turning on publish-on-success later is a behaviour change rather than
+  /// a migration on a table the cron tick is actively scanning. Do not build against it.
+  autoPublish Boolean @default(false) @map("auto_publish")
+
+  runs Run[]
+
+  /// The cron tick's hot path: "which active schedules are due?".
+  @@index([active, nextRunAt])
+  @@map("schedules")
+}
+
+/// One generation attempt for a website — manual or scheduled — and its result.
+model Run {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  websiteId String  @map("website_id") @db.Uuid
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  /// Null for a manual run, and nulled out if the schedule that started this run is
+  /// later deleted — run history outlives the schedule that produced it.
+  scheduleId String?   @map("schedule_id") @db.Uuid
+  schedule   Schedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+
+  trigger RunTrigger
+  status  RunStatus  @default(pending)
+
+  startedAt   DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  /// The generated artifact. Null until the run completes.
+  llmsTxt String? @map("llms_txt")
+
+  /// `pages_crawled`, `links_emitted`, `tokens`, `duration_ms`. Jsonb rather than
+  /// columns because this shape belongs to the crawler milestone, which is not designed
+  /// yet (ARCHITECTURE.md §3.4).
+  stats Json? @db.JsonB
+
+  /// Set when `status` is `failed`.
+  error String?
+
+  /// Where the raw `.jsonl` payload landed in Supabase Storage.
+  storagePath String? @map("storage_path")
+
+  // THERE IS A SEVENTH INDEX ON THIS TABLE THAT IS NOT DECLARED HERE:
+  //
+  //     CREATE INDEX "runs_status_active_idx" ON "runs"("status")
+  //         WHERE "status" IN ('pending', 'processing');
+  //
+  // It lives only in db/migrations/20260805092204_init/migration.sql, hand-written,
+  // because Prisma has no syntax for a partial index. Do not "fix" that by adding an
+  // `@@index([status])` line here — that was tried, and it is actively wrong:
+  // Prisma's introspection cannot see a partial index at all, so it reads the database
+  // as not having one and every subsequent `make migrate` would emit another
+  // `CREATE INDEX "runs_status_active_idx"`, which fails against a database that
+  // already has it. Verified with `prisma migrate diff` against the applied schema:
+  // declared, the diff is a spurious CREATE; undeclared, the diff is empty.
+  //
+  // The trade-off accepted here is that this one index is invisible to Prisma. It is
+  // therefore also invisible to Prisma's drift detection, and the comment above is the
+  // only thing keeping it from being forgotten.
+  //
+  // It is partial because both of its scanners — the duplicate-run guard on a manual
+  // trigger and the stuck-run reaper — look for exactly these two statuses, while the
+  // rows that accumulate forever are the completed and failed ones.
+
+  /// History queries and the latest-run lookup, which both read newest-first.
+  @@index([websiteId, startedAt(sort: Desc)])
+  @@map("runs")
+}
+
+// Real Postgres enums, not text with a CHECK: the worker writes status transitions
+// directly, and a typo should fail loudly at the database rather than persist a value no
+// reader knows how to interpret.
+//
+// Adding a value to either of these later means `ALTER TYPE ... ADD VALUE`, which Prisma
+// generates but which has two constraints worth knowing before you need it: on Postgres
+// below 12 it cannot run inside a transaction block at all (and Prisma wraps a migration
+// in one), and on 12 and above the new value can be added transactionally but not *used*
+// until that transaction commits. Give such a change its own migration, and expect to
+// mark it `-- prisma-migrate: no-transaction` or split it in two. Both the local stack
+// and CI run Postgres 16+, so this is a note for the future, not a problem today.
+
+/// What started a run.
+enum RunTrigger {
+  manual
+  scheduled
+
+  @@map("run_trigger")
+}
+
+/// Where a run is in its lifecycle. `pending` and `processing` are the in-flight pair the
+/// partial index on `runs.status` covers.
+enum RunStatus {
+  pending
+  processing
+  completed
+  failed
+
+  @@map("run_status")
+}
