@@ -33,10 +33,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} bg-app-gradient min-h-screen antialiased`}
-      >
+    // The font variables are declared on <html>, not <body>. Custom properties
+    // inherit downward only, and app/globals.css resolves `font-sans` in its
+    // base layer on the html element — declaring them any lower would leave
+    // that rule pointing at an undefined variable, and every page would
+    // silently fall back to the browser's default serif.
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
+      <body className="bg-app-gradient min-h-screen antialiased">
         <TooltipProvider>{children}</TooltipProvider>
         <Toaster />
       </body>
