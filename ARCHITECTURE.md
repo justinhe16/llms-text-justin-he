@@ -646,6 +646,46 @@ be regenerated.
 If a dark theme is ever wanted, it is a designed feature with its own ticket — not something
 that accumulates one `dark:` class at a time.
 
+### 8.6 Data fetching
+
+**The generated client is the contract.** `frontend/lib/api/openapi.json` is a checked-in
+snapshot of `app.openapi()` — the same document FastAPI builds from the Pydantic models and
+routes already described in §3 — and `frontend/lib/api/schema.d.ts` is generated from that
+snapshot by `openapi-typescript` (`npm run gen:api`, or `make openapi` for both halves at
+once). No frontend code hand-writes a request or response shape: `frontend/lib/api/fetcher.ts`
+exports a small typed client (`api.get`/`api.post`/`api.delete`) generic over the generated
+`paths` type, and every feature-level helper (`frontend/lib/api/websites.ts`,
+`health.ts`) calls through it and re-exports readable aliases of `components["schemas"][...]`.
+Calling a path that does not exist, or getting a parameter or a body wrong, is a `tsc` error,
+not a runtime one.
+
+**The drift check has two halves, enforced separately.** `scripts/export-openapi.sh --check`
+(run in `ci-backend.yml`'s `lint` job, and by `make lint`) re-exports the live schema from
+`app.openapi()` and diffs it against the committed `openapi.json` — this is what catches a
+Pydantic model changing without the snapshot being regenerated. `ci-frontend.yml` separately
+regenerates `schema.d.ts` from the committed `openapi.json` and diffs *that* — this is what
+catches a hand-edit of the generated TypeScript, and it needs no Python and no running
+backend, because it only ever reads the JSON already in the repo. Both checks fail with the
+`make` target that fixes them (`make openapi`) named in the error.
+
+**The query key factory.** `frontend/lib/query/query-keys.ts` is the only place a React
+Query cache key is constructed — `queryKeys.websites.all`, `.list(include?)`,
+`.detail(id)` — so that invalidating "every website" or "this one website" is a call to a
+function here rather than an array literal a caller has to get byte-for-byte right at every
+call site.
+
+**Polling.** A query polls only while something in its data is still in progress, at
+`ACTIVE_POLL_INTERVAL_MS` (3 seconds), and stops the moment it isn't —
+`frontend/lib/query/polling.ts`'s `pollWhileActive` builds a `refetchInterval` callback from
+a single shared predicate (`anyWebsiteHasActiveRun`, `frontend/lib/api/run-status.ts`), so
+"is a run still running" is decided in exactly one place regardless of which query asks.
+Polling also pauses on a hidden tab (`refetchIntervalInBackground: false`, set as a
+`QueryClient` default in `app/providers.tsx` rather than trusted to every `useQuery` call) —
+a run that takes ten minutes should not poll a tab nobody is looking at roughly 200 times.
+`useWebsite` (a single website, no run information on that endpoint) deliberately does not
+poll at all; inventing a poll for data that cannot change would be worse than not polling,
+because it would look like a feature and do nothing.
+
 ---
 
 ## 9. Secrets hygiene

@@ -133,7 +133,8 @@ make dev           # run Supabase, Redis, the API, worker, and frontend locally
 make migrate       # create a migration from schema.prisma (review the SQL, then commit it)
 make migrate-apply # apply pending migrations to the local database
 make test          # backend and frontend test suites
-make lint          # ruff + mypy for backend, eslint + tsc for frontend
+make lint          # ruff + mypy for backend, eslint + tsc for frontend, OpenAPI drift checks
+make openapi       # regenerate the OpenAPI snapshot and the generated TS client types
 make down          # stop the Supabase and Redis containers
 make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```
@@ -281,11 +282,17 @@ green laptop and a green pull request mean the same thing.
 
 | Workflow | Runs when a change touches | What it does |
 | --- | --- | --- |
-| `ci-backend.yml` | `backend/**`, `db/**`, the workflow, the path filter | **lint** — `ruff check`, `ruff format --check`, `mypy`<br>**test** — a real `postgres:16`, migrations applied with `prisma migrate deploy`, then `pytest`<br>**build-check** — boots the app under uvicorn and probes `/health` |
-| `ci-frontend.yml` | `frontend/**`, the workflow, the path filter | **verify** — `tsc --noEmit`, eslint, `next build`, then a rendered-output smoke test |
+| `ci-backend.yml` | `backend/**`, `db/**`, `frontend/lib/api/openapi.json`, `scripts/**`, the workflow, the path filter | **lint** — `ruff check`, `ruff format --check`, `mypy`, then `scripts/export-openapi.sh --check` (the committed OpenAPI snapshot still matches `app.openapi()`)<br>**test** — a real `postgres:16`, migrations applied with `prisma migrate deploy`, then `pytest`<br>**build-check** — boots the app under uvicorn and probes `/health` |
+| `ci-frontend.yml` | `frontend/**`, the workflow, the path filter | **verify** — `tsc --noEmit`, eslint, `next build`, an OpenAPI client drift check (the generated `lib/api/schema.d.ts` still matches the committed `lib/api/openapi.json`), then a rendered-output smoke test |
 
 `db/**` is on the backend list because a schema change must re-run the tests that depend on
-it. Every job runs in parallel; the whole matrix finishes in a little over a minute.
+it. `frontend/lib/api/openapi.json` is on the backend list too, even though it lives under
+`frontend/`: it is the OpenAPI snapshot `scripts/export-openapi.sh --check` verifies against
+the live app, so a hand-edit of only that file still has to pass backend CI. `scripts/**` is
+there because that is where the exporter behind that check lives
+(`backend/scripts/export_openapi.py` does the work; `scripts/export-openapi.sh` is its
+wrapper — see ARCHITECTURE.md §8.6). Every job runs in parallel; the whole matrix finishes
+in a little over a minute.
 
 The `test` job applies migrations with `prisma migrate deploy` — the command the deploy runs,
 never `prisma db push` — against a throwaway Postgres container, so a migration that cannot

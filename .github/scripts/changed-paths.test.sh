@@ -30,8 +30,9 @@ expect() {
   fi
 }
 
-backend_patterns=('backend/**' 'db/**' '.github/workflows/ci-backend.yml'
-  '.github/scripts/changed-paths.sh' '.github/scripts/changed-paths.test.sh')
+backend_patterns=('backend/**' 'db/**' 'frontend/lib/api/openapi.json' 'scripts/**'
+  '.github/workflows/ci-backend.yml' '.github/scripts/changed-paths.sh'
+  '.github/scripts/changed-paths.test.sh')
 frontend_patterns=('frontend/**' '.github/workflows/ci-frontend.yml'
   '.github/scripts/changed-paths.sh' '.github/scripts/changed-paths.test.sh')
 
@@ -64,6 +65,19 @@ expect true '.github/scripts/changed-paths.sh' "${frontend_patterns[@]}"
 # A mixed change runs both.
 expect true $'backend/app/main.py\nfrontend/app/page.tsx' "${backend_patterns[@]}"
 expect true $'backend/app/main.py\nfrontend/app/page.tsx' "${frontend_patterns[@]}"
+
+# frontend/lib/api/openapi.json is the one file both workflows care about, for different
+# reasons: ci-backend.yml's `lint` job proves it still matches the live schema
+# (scripts/export-openapi.sh --check), and ci-frontend.yml's own drift check regenerates
+# lib/api/schema.d.ts FROM it. A hand-edit therefore has to run both.
+expect true 'frontend/lib/api/openapi.json' "${backend_patterns[@]}"
+expect true 'frontend/lib/api/openapi.json' "${frontend_patterns[@]}"
+
+# scripts/export-openapi.sh is backend-only tooling (it wraps
+# backend/scripts/export_openapi.py) even though it lives outside backend/ — it has
+# nothing to do with the frontend build.
+expect true 'scripts/export-openapi.sh' "${backend_patterns[@]}"
+expect false 'scripts/export-openapi.sh' "${frontend_patterns[@]}"
 
 # Prefix collisions must not match: `backend-notes.md` is not inside `backend/`.
 expect false 'backend-notes.md' "${backend_patterns[@]}"

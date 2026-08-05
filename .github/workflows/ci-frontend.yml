@@ -88,10 +88,21 @@ jobs:
       - name: next build
         run: npm run build
 
-      # The OpenAPI drift check goes HERE, added by the typed API client ticket: it
-      # regenerates the client from the FastAPI schema and fails the job if the committed
-      # client differs. It belongs after the build so a drifted client is reported
-      # separately from a broken one.
+      # Regenerates lib/api/schema.d.ts from the COMMITTED lib/api/openapi.json and fails
+      # on a diff — the frontend half of the drift check described in ARCHITECTURE.md
+      # §8.6. This step needs no Python and no running backend: it only ever reads the
+      # JSON snapshot already sitting in the repo. That snapshot's own correctness — does
+      # it still match the live FastAPI schema — is a separate question, checked
+      # separately, by `scripts/export-openapi.sh --check` in ci-backend.yml's `lint` job.
+      # It belongs after the build so a drifted client is reported separately from a
+      # broken one.
+      - name: OpenAPI client drift check
+        run: |
+          npm run gen:api
+          if ! git diff --exit-code -- lib/api/schema.d.ts; then
+            echo "::error::lib/api/schema.d.ts is out of date with lib/api/openapi.json. Run \`cd frontend && npm run gen:api\` and commit the result." >&2
+            exit 1
+          fi
 
       # Static gates are not enough. A font wiring bug that made every page fall back to
       # Times passed tsc, eslint and `next build` cleanly; nothing above this line can
