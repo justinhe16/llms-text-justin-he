@@ -146,6 +146,16 @@ fi
 
 # --- frontend (skipped when frontend/ is absent) --------------------------------------
 if [ -d frontend ]; then
+  # Generates frontend/.env.local from the running local Supabase stack (never
+  # overwriting one a developer has hand-edited — see scripts/local-env.sh). Without
+  # this, the frontend boots with NEXT_PUBLIC_SUPABASE_URL unset and its Supabase
+  # client throws on first use. Same failure-propagation reasoning as env_exports
+  # above: captured into an if-condition rather than run bare, so a failure here stops
+  # this script instead of leaking a half-configured frontend downstream.
+  if ! API_HOST="$api_host" API_PORT="$api_port" bash scripts/local-env.sh write-frontend-env; then
+    echo "dev: could not write frontend/.env.local — see the error above" >&2
+    exit 1
+  fi
   run_prefixed frontend "$c_frontend" npm --prefix frontend run dev
 else
   echo "frontend: skipped — no frontend/ in this checkout"

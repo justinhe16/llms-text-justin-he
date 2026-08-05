@@ -1,6 +1,11 @@
+import { Suspense } from "react";
+
 import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text";
 import { BlurFade } from "@/components/magicui/blur-fade";
 import { DotPattern } from "@/components/magicui/dot-pattern";
+import { AuthErrorToast } from "@/components/auth/auth-error-toast";
+import { AuthPanel } from "@/components/auth/auth-panel";
+import { Skeleton } from "@/components/ui/skeleton";
 
 // Placeholder. The real landing page is a later ticket — this exists so the
 // design system has somewhere to prove itself: the warm gradient from
@@ -15,6 +20,13 @@ export default function Home() {
         height={28}
         className="[mask-image:radial-gradient(400px_circle_at_center,white,transparent)]"
       />
+
+      {/* useSearchParams() (here, and transitively through AuthPanel's
+          sign-in affordances below) needs a Suspense boundary during static
+          prerendering, or the build warns and bails. */}
+      <Suspense fallback={null}>
+        <AuthErrorToast />
+      </Suspense>
 
       <div className="relative flex flex-col items-center gap-6 text-center">
         <BlurFade delay={0.08}>
@@ -33,6 +45,12 @@ export default function Home() {
 
         <BlurFade delay={0.24}>
           <p className="font-mono text-sm text-muted-foreground">/llms.txt</p>
+        </BlurFade>
+
+        <BlurFade delay={0.32}>
+          <Suspense fallback={<Skeleton className="h-8 w-32 rounded-full" />}>
+            <AuthPanel />
+          </Suspense>
         </BlurFade>
       </div>
     </main>

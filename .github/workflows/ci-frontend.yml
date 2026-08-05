@@ -54,6 +54,16 @@ jobs:
     defaults:
       run:
         working-directory: frontend
+    # Placeholders, not credentials. Both are NEXT_PUBLIC_, so `next build` inlines
+    # whatever they hold into the client bundle — CI has no Supabase project, and must not
+    # have one: a real key here would be a committed secret (ARCHITECTURE.md §9.2). These
+    # only have to be well-formed enough for `createBrowserClient()` to construct, which
+    # is all the build and the smoke test below exercise — with no session cookie in play
+    # the client never calls out to the host named here. Vercel supplies the real values
+    # to deployed builds (README.md "Infrastructure").
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: https://ci-placeholder.supabase.co
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ci-placeholder-not-a-real-key
     steps:
       - uses: actions/checkout@v7
 

@@ -442,11 +442,38 @@ never exist only in the README.
 
 ### 8.2 Auth and sessions
 
-- The Supabase session lives in **httpOnly cookies**, managed by `@supabase/ssr`.
-- **The access token is never exposed to client JavaScript.** Do not read it in a client
-  component, do not put it in `localStorage`, do not pass it as a prop.
-- Server-side code attaches the token to the outbound FastAPI request. That is the only
-  place it is read.
+- The Supabase session lives in **cookies managed by `@supabase/ssr`**, never in
+  `localStorage` or `sessionStorage`. `frontend/lib/supabase/client.ts`,
+  `server.ts`, and `middleware.ts` are the only places that construct a Supabase
+  client, and every one of them goes through `@supabase/ssr`'s cookie storage — there
+  is no second, hand-rolled place that reads or writes the session.
+- **Application code never reads the access token.** No call site pulls it out of a
+  session to inspect, log, prop-drill through components, or copy into another store.
+  The only reader of the session cookie is `@supabase/ssr` itself, plus the server-side
+  proxy in `app/api/[...path]/`, which attaches it to the outbound FastAPI request —
+  that is the one place a token is deliberately handled, and it happens entirely on the
+  server.
+- **Authorization decisions use `getClaims()` or `getUser()`, never `getSession()`.**
+  `getSession()` returns whatever the cookie currently holds without revalidating it, so
+  it must never gate access. `getClaims()` verifies the JWT (locally when the project
+  uses asymmetric signing keys, otherwise via a call to the Auth server) and refreshes an
+  about-to-expire session before returning; `frontend/lib/supabase/middleware.ts` calls
+  it, not `getSession()`, for exactly this reason.
+- **Route protection is enforced in `frontend/middleware.ts`, and only there** — never
+  client-side. A client component may render differently for a signed-in vs. signed-out
+  user (`frontend/lib/auth/use-user.ts`), but that is a display decision, not an
+  authorization check; a page that must not be reached while signed out is gated by
+  middleware, which runs on the server before any component renders.
+
+**On `httpOnly`.** The session cookie is not marked `httpOnly`. That is a property of
+`@supabase/ssr@0.12.4` — its default cookie options set `httpOnly: false` deliberately,
+because `createBrowserClient` has to read the cookie itself to keep the session alive and
+to drive `onAuthStateChange` in the browser — not a choice made in this repo, and not one
+this repo can make differently without dropping `@supabase/ssr`. It is exactly why the
+token itself is never what authorizes anything here: every read goes through a JWT-aware
+Supabase call (`getClaims()`/`getUser()`), and every write is checked server-side, so
+nothing in this system trusts the cookie's mere presence the way an `httpOnly`-only
+threat model would.
 
 ### 8.3 Environment variables
 
@@ -464,6 +491,7 @@ never exist only in the README.
 | `components/ui/` | shadcn/ui primitives — generated, edited only when a primitive genuinely needs it |
 | `components/magicui/` | Magic UI components |
 | `components/crawls/` | App-specific composites built from the above |
+| `components/auth/` | Sign-in / sign-out affordances and the client-side identity hook |
 
 Feature composites go in `components/crawls/`. Do not put app-specific logic into
 `components/ui/`; those files should stay close to what the generator produced so they can
