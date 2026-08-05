@@ -1,6 +1,6 @@
 # Runtime dependencies for the backend image (FastAPI API + ARQ worker).
 # Pinned exactly so the image CI builds is the image that was tested.
-# The Redis/ARQ and auth dependencies land with their own tickets.
+# The Redis/ARQ dependencies land with their own ticket.
 
 # Web framework
 fastapi==0.141.1
@@ -12,3 +12,15 @@ pydantic-settings==2.14.2   # environment parsing and validation for app/core/se
 # Database
 asyncpg==0.31.0   # Postgres driver used by app/infrastructure/db/ — see requirements-dev.txt
                    # for why asyncpg-stubs is a separate, dev-only dependency
+
+# Auth
+pyjwt[crypto]==2.13.0   # local JWT verification against the Supabase JWKS (app/core/auth/)
+cryptography==50.0.0    # pinned on its own line even though pyjwt[crypto] pulls it in: an
+                         # extra alone floats the transitive pin, and this file's policy is
+                         # "the image CI builds is the image that was tested"
+
+# HTTP client
+httpx==0.28.1   # RUNTIME, not dev: app/core/auth/jwks.py fetches the JWKS document with it.
+                # build-check installs this file alone, so an httpx that lived only in
+                # requirements-dev.txt would pass lint and test and fail there — and only
+                # there. The test suite's ASGITransport client inherits it from here.

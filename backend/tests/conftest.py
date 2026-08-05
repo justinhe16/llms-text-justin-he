@@ -1,18 +1,27 @@
 """Shared pytest fixtures.
 
-Two families of fixtures live here: an in-process HTTP client, which is all a shallow
-`/health` needs, and — for tests that exercise real Postgres, like
-`tests/test_transaction.py` — a session-scoped pool and a function-scoped, always-rolled-
--back connection.
+Three families of fixtures live here: an in-process HTTP client, which is all a shallow
+`/health` needs; for tests that exercise real Postgres, like `tests/test_transaction.py`, a
+session-scoped pool and a function-scoped, always-rolled-back connection; and — for
+`tests/test_jwks.py` and `tests/test_auth_dependencies.py` — a kit for generating throwaway
+signing keys and standing up a fake JWKS endpoint that counts genuine HTTP requests.
 """
 
+import asyncio
 import os
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any, NoReturn
 
 import asyncpg
+import httpx
+import jwt
 import pytest
 from asyncpg import Connection, Pool
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from httpx import ASGITransport, AsyncClient
+from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 
 
 # `app.core.settings` validates its configuration at import time (by design — see that
@@ -35,6 +44,7 @@ os.environ["REDIS_URL"] = "redis://localhost:6379/0"
 os.environ["SUPABASE_URL"] = "https://test-project.supabase.co"
 os.environ["SUPABASE_SECRET_KEY"] = "not-a-real-key"
 
+from app.core.auth.jwks import JwksCache  # noqa: E402  — must follow the assignments above
 from app.main import app  # noqa: E402  — must follow the assignments above
 
 
@@ -77,6 +87,43 @@ async def client() -> AsyncIterator[AsyncClient]:
     """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
+
+
+def _refuse_real_network_access(self: object, request: httpx.Request) -> NoReturn:
+    """Raise instead of letting a request reach a real socket.
+
+    Installed onto `httpx.AsyncHTTPTransport.handle_async_request` by the autouse fixture
+    below, in place of the real method. Signature is `(self, request)` — not just
+    `(request)` — because `monkeypatch.setattr` assigns this as an ordinary function
+    attribute on the class, and Python's descriptor protocol binds `self` to it exactly as
+    it would for the method it replaced.
+    """
+    raise RuntimeError(
+        "A test attempted a real HTTP request through httpx's default network transport. "
+        "Every httpx.AsyncClient in this suite must be built with an explicit "
+        "transport=httpx.MockTransport(...) (see the JWKS test kit below) instead of "
+        "falling back to a real connection."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turn "tests pass without network access" from a hope into a guarantee.
+
+    Patches httpx's REAL transport class, not any code this repository owns, so a test
+    that accidentally builds an `httpx.AsyncClient` without a `MockTransport` fails loudly
+    with a `RuntimeError` instead of silently succeeding against a live connection — and,
+    worse, silently succeeding against a real Supabase project if one happened to be
+    reachable from wherever the suite runs.
+
+    Disturbs nothing that already exists: the `client` fixture above builds its
+    `AsyncClient` with `ASGITransport`, an unrelated class that calls the FastAPI app
+    in-process rather than opening a socket, and asyncpg does not use httpx at all — this
+    guard has no surface to touch on either of those paths.
+    """
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _refuse_real_network_access
+    )
 
 
 @pytest.fixture(scope="session")
@@ -138,3 +185,216 @@ async def db_conn(db_pool: Pool) -> AsyncIterator[Connection]:
             yield conn
         finally:
             await tx.rollback()
+
+
+# -----------------------------------------------------------------------------------------
+# JWKS test kit, used by tests/test_jwks.py and tests/test_auth_dependencies.py.
+#
+# NO KEY MATERIAL IS EVER COMMITTED (ARCHITECTURE.md §9.1) — every keypair below is
+# generated fresh, in this process, on every test run. Nothing here is written to disk.
+# -----------------------------------------------------------------------------------------
+
+# An obviously-fake UUID, not a real Supabase user id, used as the default `sub` claim.
+_TEST_SUB = "5b3d1c2e-6a4f-4b8e-9c2a-1f7e4d6a9b3c"
+
+
+@dataclass
+class _SigningKey:
+    """A throwaway keypair plus the JWKS entry describing its public half."""
+
+    kid: str
+    algorithm: str
+    private_key: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey
+    jwk: dict[str, Any]
+
+    def sign(self, claims: dict[str, Any], *, headers: dict[str, Any] | None = None) -> str:
+        """Sign `claims` with this key. `kid` is always set; `headers` can override it.
+
+        Signs with the private key OBJECT directly (PyJWT accepts it — no PEM round trip
+        needed), which is why `private_key` above is the cryptography key type rather than
+        PEM bytes.
+        """
+        merged_headers = {"kid": self.kid, **(headers or {})}
+        return jwt.encode(
+            claims, self.private_key, algorithm=self.algorithm, headers=merged_headers
+        )
+
+
+def _generate_es256_key(kid: str) -> _SigningKey:
+    """Generate a fresh EC P-256 keypair.
+
+    Shaped like what the local Supabase stack actually publishes: a real sign-in against
+    it (measured) returns a token signed ES256 over a single EC P-256 JWKS key.
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    jwk = ECAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+    jwk.update({"kid": kid, "alg": "ES256", "use": "sig"})
+    return _SigningKey(kid=kid, algorithm="ES256", private_key=private_key, jwk=jwk)
+
+
+def _generate_rs256_key(kid: str) -> _SigningKey:
+    """Generate a fresh RSA keypair — Supabase's other supported asymmetric algorithm."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = RSAAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+    jwk.update({"kid": kid, "alg": "RS256", "use": "sig"})
+    return _SigningKey(kid=kid, algorithm="RS256", private_key=private_key, jwk=jwk)
+
+
+def user_claims(
+    sub: str = _TEST_SUB,
+    *,
+    aud: str = "authenticated",
+    expires_in: float = 3600.0,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Build claims shaped like a real Supabase access token (measured against the local
+    stack): `sub`, `aud`, `iss`, `role`, `iat`, `exp`.
+
+    `expires_in` is seconds from now added to `exp`; a negative value builds an
+    already-expired token. `**overrides` replace or add claims after the defaults are
+    built — e.g. `user_claims(sub="")` for the "no usable sub" case, or `user_claims(aud=
+    "service_role")` for the service-role-shaped-token case.
+    """
+    now = time.time()
+    claims: dict[str, Any] = {
+        "sub": sub,
+        "aud": aud,
+        "iss": "http://127.0.0.1:54321/auth/v1",
+        "role": "authenticated",
+        "iat": int(now),
+        "exp": int(now + expires_in),
+    }
+    claims.update(overrides)
+    return claims
+
+
+@pytest.fixture(scope="session")
+def es256_key() -> _SigningKey:
+    return _generate_es256_key("kid-es256-primary")
+
+
+@pytest.fixture(scope="session")
+def rs256_key() -> _SigningKey:
+    return _generate_rs256_key("kid-rs256-secondary")
+
+
+@pytest.fixture(scope="session")
+def rotated_key() -> _SigningKey:
+    """A key absent from the initial JWKS document — simulates a Supabase key rotation."""
+    return _generate_es256_key("kid-rotated")
+
+
+@pytest.fixture(scope="session")
+def foreign_key() -> _SigningKey:
+    """Same `kid` as `es256_key`, a DIFFERENT private key, and never published.
+
+    A token signed with this key and presented under `es256_key`'s `kid` is "signed by a
+    different key," done properly: the `kid` resolves to a real, cached key (so no refetch
+    should happen), but the signature must still fail verification because the key
+    material does not match.
+    """
+    return _generate_es256_key("kid-es256-primary")
+
+
+class _JwksServer:
+    """A fake JWKS endpoint behind a REAL `httpx.AsyncClient` — the measurement instrument.
+
+    `request_count` increments on the first line of `handle()`, the callable
+    `httpx.MockTransport` invokes. That happens INSIDE the real `httpx.AsyncClient`
+    request pipeline — after the client has built the `httpx.Request` from a URL, and
+    before it parses the `httpx.Response` — so it counts genuine HTTP requests while URL
+    construction, status handling, and response parsing all still execute for real. That is
+    what lets this ticket's two "must be measured, not inferred" acceptance criteria (no
+    I/O on a cache hit; at most one refetch per rate-limit window) be measured at the HTTP
+    layer, rather than at a seam this codebase owns which could be faked out.
+
+    `handle()` is async and suspends with `await asyncio.sleep(0)` on purpose. Without a
+    genuine suspension point inside the fetch, an `asyncio.gather` burst of concurrent
+    lookups would run to completion one coroutine at a time on a single-threaded event
+    loop, and the concurrency tests — which exist to prove the cache's lock actually
+    serializes concurrent refetches — would pass for a reason unrelated to the lock.
+    """
+
+    # A distinct sentinel for "the test hasn't overridden the body" — rather than `None` —
+    # because a malformed-document test needs to send a literal JSON `null` as the body,
+    # and `None` doubling as both "unset" and "the JSON value null" would make that case
+    # impossible to express.
+    _UNSET_BODY: Any = object()
+
+    def __init__(self, keys: list[dict[str, Any]]) -> None:
+        self.keys = keys
+        self.status_code = 200
+        self.body: Any = self._UNSET_BODY  # _UNSET_BODY => serve {"keys": self.keys}
+        self.failure: Exception | None = None
+        self.request_count = 0
+        self.requested_urls: list[str] = []
+        self.transport = httpx.MockTransport(self.handle)
+        self.client = httpx.AsyncClient(transport=self.transport, timeout=httpx.Timeout(5.0))
+
+    async def handle(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        self.requested_urls.append(str(request.url))
+        await asyncio.sleep(0)  # see the class docstring — required for gather() to matter
+        if self.failure is not None:
+            raise self.failure
+        body = {"keys": self.keys} if self.body is self._UNSET_BODY else self.body
+        return httpx.Response(self.status_code, json=body)
+
+
+class _FakeClock:
+    """A stand-in for `time.monotonic()` that only moves when a test tells it to.
+
+    Injected into `JwksCache(clock=...)` so the rate-limit tests can cross the 60-second
+    window instantly with `advance()` instead of sleeping for real.
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+@pytest.fixture
+async def jwks_server() -> AsyncIterator[_JwksServer]:
+    """A fresh `_JwksServer` with an empty key document; tests populate `.keys` themselves."""
+    server = _JwksServer(keys=[])
+    yield server
+    await server.client.aclose()
+
+
+@pytest.fixture
+def fake_clock() -> _FakeClock:
+    return _FakeClock()
+
+
+@pytest.fixture
+async def jwks_cache(
+    jwks_server: _JwksServer,
+    fake_clock: _FakeClock,
+    es256_key: _SigningKey,
+    rs256_key: _SigningKey,
+) -> JwksCache:
+    """A `JwksCache` wired to the fake JWKS endpoint, primed exactly like startup primes it.
+
+    The document behind `jwks_server` starts with BOTH `es256_key` and `rs256_key`
+    published, so `tests/test_auth_dependencies.py` can verify a token signed with either
+    algorithm without triggering a refetch. Priming with `await cache.refresh()` — rather
+    than going through `open_jwks_cache()` — reproduces the startup semantics exactly:
+    `request_count` is `1` afterward, and the rate-limit window is still CLOSED, because
+    `refresh()` deliberately never touches `_last_refetch_at` (see `jwks.py`). A test that
+    forgets that and immediately looks up an unknown kid correctly observes a real,
+    un-rate-limited refetch rather than a suppressed one — matching what a freshly-booted
+    process would do.
+    """
+    jwks_server.keys = [es256_key.jwk, rs256_key.jwk]
+    cache = JwksCache(
+        jwks_server.client,
+        "https://test-project.supabase.co/auth/v1/.well-known/jwks.json",
+        clock=fake_clock,
+    )
+    await cache.refresh()
+    return cache
