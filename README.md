@@ -253,6 +253,12 @@ be applied fails on the pull request that introduces it rather than during a dep
 container's credentials are literals in the workflow. They are not secrets, and they must
 never be replaced with any, least of all `DIRECT_DATABASE_URL`, which points at production.
 
+No test opens a connection to that container yet — `backend/tests/conftest.py` deliberately
+overrides `DATABASE_URL` with its own dummy so that a developer's environment cannot reach
+the suite — so today the container proves that the migrations apply, and nothing more. The
+database layer ticket removes that override and inherits a Postgres that is already
+healthchecked, migrated, and addressable at `DATABASE_URL`.
+
 ### The gate jobs
 
 Each workflow ends in a job named after it — `backend-ci` and `frontend-ci` — and **those two
@@ -298,7 +304,7 @@ cd frontend && npm run build && npm run smoke
 
 It drives the Chrome already installed on the machine — `puppeteer-core` downloads no
 browser. Set `CHROME_PATH` if yours is somewhere unusual. This is a smoke test and not a
-browser test suite: one page, fourteen assertions, a few seconds. Playwright and end-to-end
+browser test suite: one page, fifteen assertions, a few seconds. Playwright and end-to-end
 coverage remain out of scope.
 
 ### Branch protection

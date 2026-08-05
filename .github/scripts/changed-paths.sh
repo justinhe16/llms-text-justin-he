@@ -52,8 +52,10 @@ changed_files() {
       # The API answer is exactly the pull request's file list, with no dependence on
       # how deep the checkout was cloned or on which merge commit was checked out.
       [ -n "${PR_NUMBER:-}" ] || return 1
+      # Both sides of a rename count: moving backend/x.py to frontend/x.py changes the
+      # backend as surely as deleting it would, and only `previous_filename` says so.
       gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-        --jq '.[].filename'
+        --jq '.[] | .filename, (.previous_filename // empty)'
       ;;
     push)
       # `github.event.before` is all zeros when the branch was just created, and can

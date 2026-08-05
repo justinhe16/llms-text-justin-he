@@ -66,11 +66,14 @@ jobs:
       - name: npm ci
         run: npm ci
 
-      - name: tsc --noEmit
-        run: npm run typecheck
-
+      # Same order as `make lint`, which runs eslint before tsc. The two are independent,
+      # but the docs claim CI and the Makefile run the same checks — so they run them the
+      # same way, and nobody has to work out whether the difference is meaningful.
       - name: eslint
         run: npm run lint
+
+      - name: tsc --noEmit
+        run: npm run typecheck
 
       - name: next build
         run: npm run build
