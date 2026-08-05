@@ -81,13 +81,14 @@ the services in anticipation of a design that does not exist yet.
 frontend/                       Next.js App Router → Vercel
 backend/app/api/routers/        thin HTTP handlers
 backend/app/features/<name>/    schemas.py, service.py, internals/{<name>_reader,<name>_writer}.py
+backend/app/infrastructure/db/  asyncpg pool factory, base Reader/Writer, transaction()
 backend/app/worker/             ARQ job functions — thin, they call services
 db/schema.prisma                the schema, and the only source of truth for it
 db/migrations/                  reviewed, committed SQL
 ```
 
-Import direction is one-way: `api` → `features` → `core`. No feature imports another
-feature's `internals/` — it calls that feature's service.
+Import direction is one-way: `api` → `features` → `infrastructure` → `core`. No feature
+imports another feature's `internals/` — it calls that feature's service.
 
 **Naming:** Python `snake_case` files and functions, `PascalCase` classes, line length 100.
 TypeScript `kebab-case` files, `PascalCase` components, `camelCase` functions. API routes are

@@ -104,6 +104,13 @@ migrate-apply: check-supabase check-db-deps ## Apply pending migrations to the l
 	cd db && npm run migrate:apply
 
 test: check-python check-venv ## Run the backend and frontend test suites
+	@if bash scripts/local-env.sh export >/dev/null 2>&1; then \
+		echo "test: local Supabase stack detected — database-backed backend tests will run"; \
+	else \
+		echo "test: local Supabase stack not running — database-backed backend tests will be skipped (run 'make dev' to enable them)"; \
+	fi
+	@eval "$$(bash scripts/local-env.sh export 2>/dev/null)"; \
+	export TEST_DATABASE_URL="$${DATABASE_URL:-}"; \
 	cd backend && $(VENV_BIN)/pytest
 	@if [ -f frontend/package.json ]; then \
 		cd frontend && npm run --if-present test; \

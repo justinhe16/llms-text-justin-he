@@ -68,6 +68,13 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --strict-markers"
 asyncio_mode = "auto"
+# Session-scoped so the `db_pool` fixture (tests/conftest.py) — one real asyncpg pool for
+# the whole run — and everything that uses it share a single event loop. A pool's
+# connections are bound to the loop they were opened in; a per-test (function-scoped)
+# loop would make every test after the first one that touches the pool fail with a
+# "Future attached to a different loop" error.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 # Make `app` importable when pytest is invoked as `pytest` from backend/, which does not
 # put the working directory on sys.path the way `python -m pytest` does.
 pythonpath = ["."]

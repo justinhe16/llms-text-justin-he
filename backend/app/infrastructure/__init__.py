@@ -1,4 +1,5 @@
 """Infrastructure clients: the Postgres pool and the Redis/ARQ connection.
 
-Empty until the database and queue tickets land.
+`db/` holds the asyncpg pool factory, the base repository classes, and the transaction
+helper (ARCHITECTURE.md §3.5). The Redis/ARQ client lands with the worker ticket.
 """

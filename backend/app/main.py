@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from app.api.routers import health
 from app.core.settings import settings
+from app.infrastructure.db.pool import close_pool, open_pool
 
 
 logger = logging.getLogger(__name__)
@@ -34,13 +35,18 @@ def _configure_logging() -> None:
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Application startup and shutdown.
 
-    The Postgres pool and the Redis connection are opened and closed here by the
-    infrastructure tickets. Today it does nothing but log, so that those tickets have a
-    seam to extend rather than a decision to make.
+    Opens the process-wide Postgres pool via `open_pool()` on startup and closes it via
+    `close_pool()` on shutdown — the same factory (`app.infrastructure.db.pool`) a future
+    ARQ worker startup hook will call, so the API and the worker build their pools
+    identically. `close_pool()` awaits `pool.close()` rather than dropping the reference,
+    so in-flight connections finish and are released instead of being torn down mid-query.
+    The Redis connection is opened and closed here by its own infrastructure ticket.
     """
     logger.info("Starting llms-text API (environment=%s)", settings.environment)
+    await open_pool(settings)
     yield
     logger.info("Shutting down llms-text API")
+    await close_pool()
 
 
 def create_app() -> FastAPI:

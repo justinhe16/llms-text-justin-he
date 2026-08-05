@@ -1,13 +1,17 @@
 """Shared pytest fixtures.
 
-Real database and Redis fixtures land with the infrastructure tickets. Today the only
-fixture is an in-process HTTP client, which is all a shallow `/health` needs.
+Two families of fixtures live here: an in-process HTTP client, which is all a shallow
+`/health` needs, and — for tests that exercise real Postgres, like
+`tests/test_transaction.py` — a session-scoped pool and a function-scoped, always-rolled-
+-back connection.
 """
 
 import os
 from collections.abc import AsyncIterator
 
+import asyncpg
 import pytest
+from asyncpg import Connection, Pool
 from httpx import ASGITransport, AsyncClient
 
 
@@ -16,10 +20,10 @@ from httpx import ASGITransport, AsyncClient
 # These are obvious non-values: never put a real credential in this file.
 #
 # Assigned unconditionally rather than with setdefault(), so that a developer's exported
-# variables and their backend/.env cannot reach the suite. Nothing under test opens a
-# connection today, but the moment real database and Redis fixtures land, an ambient
-# DATABASE_URL leaking in would point the tests at real infrastructure. The suite decides
-# what it connects to; the surrounding environment does not.
+# variables and their backend/.env cannot reach the suite. Nothing that reads these
+# specific settings-backed values opens a real connection — the database fixtures below
+# deliberately use a *different* variable (TEST_DATABASE_URL) for that. The suite decides
+# what app.core.settings sees; the surrounding environment does not.
 os.environ["ENVIRONMENT"] = "development"
 os.environ["DATABASE_URL"] = "postgresql://localhost:5432/llms_text_test"
 os.environ["REDIS_URL"] = "redis://localhost:6379/0"
@@ -29,12 +33,88 @@ os.environ["SUPABASE_SECRET_KEY"] = "not-a-real-key"
 from app.main import app  # noqa: E402  — must follow the assignments above
 
 
+# A variable distinct from DATABASE_URL above, read from the real environment rather than
+# overwritten with a non-value. That separation is what lets DATABASE_URL's isolation
+# stay absolute — app.core.settings never sees a real database — while still giving the
+# fixtures below a real Postgres to run database-backed tests against. `make test` sets
+# this from the local Supabase stack (see Makefile and scripts/local-env.sh); export it
+# yourself to run these tests with `pytest` directly.
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+
+# An obviously test-only name for the scratch table tests/test_transaction.py reads and
+# writes. Created and dropped by the db_pool fixture below.
+_SCRATCH_TABLE = "per_145_transaction_scratch_test"
+
+
 @pytest.fixture
 async def client() -> AsyncIterator[AsyncClient]:
     """An HTTP client bound to the app in-process.
 
     ASGITransport calls the application directly, so the suite needs no running server
-    and opens no socket.
+    and opens no socket. It also never triggers `app.main`'s lifespan (startup/shutdown),
+    so this fixture never opens the real database pool — tests that need `GET /health` to
+    see a working or failing database override `app.api.deps.get_db_pool` instead.
     """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
+
+
+@pytest.fixture(scope="session")
+async def db_pool() -> AsyncIterator[Pool]:
+    """A real asyncpg pool against TEST_DATABASE_URL, shared for the whole test session.
+
+    Skips loudly rather than failing when there is nothing to connect to, so this suite
+    still runs offline (CLAUDE.md "Commands": `make test` must work without Supabase
+    running). The scratch table is created here, outside of any per-test transaction —
+    see `db_conn` below for why that matters — and as a real table, not a `TEMP` one:
+    `transaction()` (app/infrastructure/db/transaction.py) acquires an arbitrary
+    connection from the pool, and a `TEMP` table would only be visible on the connection
+    that created it.
+    """
+    if not TEST_DATABASE_URL:
+        pytest.skip(
+            "TEST_DATABASE_URL is not set - database-backed tests are skipped. Start the "
+            "local Supabase stack with `make dev`, then run `make test` (which exports "
+            "TEST_DATABASE_URL for you), or export it yourself before running pytest "
+            "directly."
+        )
+
+    try:
+        pool = await asyncpg.create_pool(dsn=TEST_DATABASE_URL, min_size=1, max_size=5)
+    except (OSError, asyncpg.PostgresError) as exc:
+        pytest.skip(
+            f"TEST_DATABASE_URL is set but the database is unreachable ({type(exc).__name__}). "
+            "Start the local Supabase stack with `make dev` and re-run `make test`."
+        )
+        return  # pytest.skip() always raises; this line only satisfies static analysis.
+
+    await pool.execute(
+        f"CREATE TABLE IF NOT EXISTS {_SCRATCH_TABLE} (key text PRIMARY KEY, value text NOT NULL)"
+    )
+
+    yield pool
+
+    await pool.execute(f"DROP TABLE IF EXISTS {_SCRATCH_TABLE}")
+    await pool.close()
+
+
+@pytest.fixture
+async def db_conn(db_pool: Pool) -> AsyncIterator[Connection]:
+    """A connection inside its own transaction, always rolled back after the test.
+
+    The per-test isolation mechanism for future feature tests: whatever a test writes
+    through this connection disappears when the test ends, pass or fail.
+
+    Independent of `transaction()` (app/infrastructure/db/transaction.py): that helper
+    acquires its own connection from `db_pool`, so calling it from inside a test that also
+    uses `db_conn` does not nest inside this fixture's rollback — they are two separate
+    connections. That is why tests/test_transaction.py clean up their own rows rather than
+    relying on this fixture.
+    """
+    async with db_pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            yield conn
+        finally:
+            await tx.rollback()

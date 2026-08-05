@@ -13,3 +13,7 @@ httpx==0.28.1           # ASGITransport client used by the test suite
 # Linting and type checking
 ruff==0.16.1
 mypy==2.3.0
+asyncpg-stubs==0.31.3   # asyncpg ships no py.typed; with ignore_missing_imports = true every
+                        # asyncpg symbol would silently resolve to Any, defeating
+                        # warn_return_any = true on exactly the module where correctness
+                        # matters most (app/infrastructure/db/)
