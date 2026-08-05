@@ -161,17 +161,23 @@ jobs:
         run: npm ci
 
       # `npm run migrate:deploy` is `prisma migrate deploy` — the exact command the deploy
-      # pipeline will run, never `prisma db push` (ARCHITECTURE.md section 6.3).
-      # db/migrations/ is empty until the schema ticket lands, so this is a no-op today
-      # and still worth running: it is the step that starts failing the day a migration
-      # is wrong.
+      # pipeline will run, never `prisma db push` (ARCHITECTURE.md section 6.3). The
+      # backend suite reads the tables this creates, so a migration that cannot be applied
+      # fails here rather than as a confusing pile of test errors below.
       - name: Apply migrations
         working-directory: db
         run: npm run migrate:deploy
 
-      # Proves the claim the acceptance criteria make — that the suite has a real
-      # database behind it — while no test opens a connection yet. Delete this step once
-      # a test does.
+      # PER-145 left this step marked "delete once a test opens a connection". Tests now
+      # do (tests/test_websites_api.py), and it STAYS — for a different reason than the one
+      # it was added for.
+      #
+      # The database fixtures in tests/conftest.py deliberately SKIP, rather than fail, when
+      # the database is unreachable, so that `make test` works offline. In CI that politeness
+      # inverts: an unreachable container would skip every database-backed test and report a
+      # green required check over code nothing executed. This step is the thing that makes
+      # "the database is really there" a hard failure in the one environment where skipping
+      # must not be an option.
       - name: Verify the database is real and reachable
         run: psql "$DATABASE_URL" --set ON_ERROR_STOP=1 -c 'select current_database(), version()'
 

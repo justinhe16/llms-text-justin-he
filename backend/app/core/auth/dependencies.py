@@ -99,6 +99,7 @@ FROM `app.core.auth`, never the reverse.
 
 import logging
 from typing import Annotated, Any, Final, NoReturn
+from uuid import UUID
 
 import jwt
 from fastapi import Depends, HTTPException, Request, status
@@ -242,3 +243,36 @@ async def get_optional_user_id(
 
 CurrentUser = Annotated[str, Depends(get_current_user_id)]
 OptionalUser = Annotated[str | None, Depends(get_optional_user_id)]
+
+
+async def get_current_user_uuid(user_id: CurrentUser) -> UUID:
+    """Require a valid token and return its `sub` claim as a `UUID`.
+
+    A thin adapter over `get_current_user_id`, not a second verification path: by the time
+    this runs the token has already been through the full ordered recipe in the module
+    docstring, and all this adds is parsing the `sub` that recipe produced.
+
+    **Why routes want a `UUID` rather than the raw `str`.** Every owner value this
+    application compares a `sub` against comes out of Postgres as a `uuid.UUID` —
+    `websites.user_id` is a `uuid` column (db/schema.prisma) and asyncpg decodes it as one.
+    A `str` compared against a `UUID` is never equal, so an ownership check written against
+    the raw claim would answer `403` for the resource's actual owner, on every request,
+    with no error anywhere. Parsing once here, in the dependency, is what keeps that bug
+    from having to be re-avoided in every feature.
+
+    **Why a non-UUID `sub` is a 401.** Supabase issues UUID `sub` claims. A token carrying
+    anything else was not minted by the identity provider this API trusts, whatever else is
+    true of its signature — it cannot own a row and cannot create one, so there is no
+    request it could legitimately make. Routing it through `_reject` gives it the same body
+    as every other authentication failure, rather than leaking through a distinct status or
+    message that the signature verified but the subject did not fit.
+    """
+    try:
+        return UUID(user_id)
+    except ValueError:
+        # A description, never the claim's value: `sub` comes out of a credential, and this
+        # repository's logs are public (ARCHITECTURE.md §9.4, and `_reject`'s docstring).
+        _reject("verified token's sub is not a UUID")
+
+
+CurrentUserId = Annotated[UUID, Depends(get_current_user_uuid)]

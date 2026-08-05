@@ -80,8 +80,9 @@ the services in anticipation of a design that does not exist yet.
 ```
 frontend/                       Next.js App Router → Vercel
 backend/app/api/routers/        thin HTTP handlers
-backend/app/core/auth/          JWKS cache + JWT verification dependencies
+backend/app/core/auth/          JWKS cache, JWT verification dependencies, require_owner
 backend/app/features/<name>/    schemas.py, service.py, internals/{<name>_reader,<name>_writer}.py
+                                websites/ is the reference implementation — read it first
 backend/app/infrastructure/db/  asyncpg pool factory, base Reader/Writer, transaction()
 backend/app/worker/             ARQ job functions — thin, they call services
 db/schema.prisma                the schema, and the only source of truth for it

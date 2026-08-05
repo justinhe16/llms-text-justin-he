@@ -1,18 +1,22 @@
 """Shared pytest fixtures.
 
-Three families of fixtures live here: an in-process HTTP client, which is all a shallow
+Four families of fixtures live here: an in-process HTTP client, which is all a shallow
 `/health` needs; for tests that exercise real Postgres, like `tests/test_transaction.py`, a
-session-scoped pool and a function-scoped, always-rolled-back connection; and — for
-`tests/test_jwks.py` and `tests/test_auth_dependencies.py` — a kit for generating throwaway
-signing keys and standing up a fake JWKS endpoint that counts genuine HTTP requests.
+session-scoped pool and a function-scoped, always-rolled-back connection; for
+`tests/test_jwks.py` and `tests/test_auth_dependencies.py`, a kit for generating throwaway
+signing keys and standing up a fake JWKS endpoint that counts genuine HTTP requests; and —
+at the bottom of this file — signed-in API clients for two different users, which is what
+lets a feature suite assert both halves of the authorization contract (ARCHITECTURE.md §4)
+against the real application.
 """
 
 import asyncio
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, Final, NoReturn
+from uuid import UUID
 
 import asyncpg
 import httpx
@@ -20,6 +24,7 @@ import jwt
 import pytest
 from asyncpg import Connection, Pool
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 
@@ -44,7 +49,8 @@ os.environ["REDIS_URL"] = "redis://localhost:6379/0"
 os.environ["SUPABASE_URL"] = "https://test-project.supabase.co"
 os.environ["SUPABASE_SECRET_KEY"] = "not-a-real-key"
 
-from app.core.auth.jwks import JwksCache  # noqa: E402  — must follow the assignments above
+from app.api.deps import get_db_pool  # noqa: E402  — must follow the assignments above
+from app.core.auth.jwks import JwksCache, get_jwks_cache  # noqa: E402  — as above
 from app.main import app  # noqa: E402  — must follow the assignments above
 
 
@@ -398,3 +404,144 @@ async def jwks_cache(
     )
     await cache.refresh()
     return cache
+
+
+# -----------------------------------------------------------------------------------------
+# Signed-in API clients, for feature suites that drive the real application.
+#
+# Two users, because this project's authorization contract is only half-testable with one
+# (ARCHITECTURE.md §4): "any signed-in user can read everything" and "only the owner may
+# write" are both statements about a SECOND user, and a suite that only ever signs in as the
+# owner passes identically whether reads are unscoped or scoped to the caller.
+#
+# These fixtures deliberately drive `app.main.app` — the shipped application, with its real
+# routers, its real dependency graph, and its real exception handling — rather than a
+# throwaway FastAPI instance. `tests/test_auth_dependencies.py` builds a throwaway app
+# instead, and correctly so: it tests two dependencies in isolation. A feature suite is
+# testing the endpoints as deployed, so it uses the real thing.
+# -----------------------------------------------------------------------------------------
+
+# Obviously-fake, deterministic user ids — not real Supabase subjects. Deterministic rather
+# than random so that `_delete_test_user_rows` below can clean up after a run that crashed
+# before its teardown, and so a failure message names the same id every time.
+TEST_USER_A_ID: Final = UUID("aaaaaaaa-0000-4000-8000-000000000001")
+TEST_USER_B_ID: Final = UUID("bbbbbbbb-0000-4000-8000-000000000002")
+
+_TEST_USER_IDS: Final = (TEST_USER_A_ID, TEST_USER_B_ID)
+
+
+def _bearer_headers(key: _SigningKey, user_id: UUID) -> dict[str, str]:
+    """Sign a token for `user_id` with a key the `jwks_cache` fixture publishes.
+
+    A real, signed, verifiable JWT rather than a stubbed-out `get_current_user_id`. That
+    costs nothing here — the keypair already exists for the auth suite — and it means the
+    endpoints under test are reached through the actual verification path, so a route that
+    forgot its authentication dependency cannot pass by being handed a user id anyway.
+    """
+    return {"Authorization": f"Bearer {key.sign(user_claims(sub=str(user_id)))}"}
+
+
+@pytest.fixture
+async def websites_db(db_pool: Pool) -> AsyncIterator[Pool]:
+    """The test database, with this suite's rows removed before and after each test.
+
+    **Deletes only rows owned by `TEST_USER_A_ID` / `TEST_USER_B_ID`, never `TRUNCATE`.**
+    `TEST_DATABASE_URL` may point at a developer's local Supabase database (that is what
+    `make test` wires up), which can hold websites they added by hand while working on the
+    frontend. A suite that truncated the table would delete them, be entirely green about
+    it, and only ever do it on a laptop — never in CI, where someone would notice.
+
+    `schedules` and `runs` need no separate cleanup: both cascade from `websites`
+    (db/migrations/20260805092204_init/migration.sql).
+
+    Skips rather than errors when the migrations have not been applied, matching how
+    `db_pool` handles an absent database — "the schema is not there" is a setup problem with
+    a known fix, not a test failure.
+    """
+    if await db_pool.fetchval("SELECT to_regclass('public.websites')") is None:
+        pytest.skip(
+            "The `websites` table does not exist in TEST_DATABASE_URL. Apply the migrations "
+            "with `make migrate-apply` (or `make reset`) and re-run."
+        )
+
+    await _delete_test_user_rows(db_pool)
+    yield db_pool
+    await _delete_test_user_rows(db_pool)
+
+
+async def _delete_test_user_rows(pool: Pool) -> None:
+    """Remove every website owned by this suite's two fake users, and their cascades."""
+    await pool.execute("DELETE FROM websites WHERE user_id = ANY($1::uuid[])", list(_TEST_USER_IDS))
+
+
+@pytest.fixture
+def api_app(websites_db: Pool, jwks_cache: JwksCache) -> Iterator[FastAPI]:
+    """`app.main.app`, wired to the test database and the fake JWKS document.
+
+    Two dependencies are overridden, and both are required even for a request that sends no
+    credentials at all:
+
+    * `get_db_pool`, because the `client` fixture's `ASGITransport` never runs the lifespan,
+      so the process-wide pool was never opened.
+    * `get_jwks_cache`, because FastAPI resolves *every* sub-dependency before calling the
+      dependency that needs them. `get_current_user_id`'s "no credentials -> 401" check runs
+      only after its `cache` parameter has been solved, so an un-overridden
+      `get_jwks_cache()` raises `RuntimeError` first and the unauthenticated tests would
+      error out instead of observing a 401.
+
+    Teardown restores exactly the two keys this fixture set, rather than calling
+    `dependency_overrides.clear()`, which would silently discard overrides belonging to an
+    enclosing fixture or another test module.
+    """
+    overrides: dict[Callable[..., Any], Callable[..., Any]] = {
+        get_db_pool: lambda: websites_db,
+        get_jwks_cache: lambda: jwks_cache,
+    }
+    sentinel = object()
+    previous = {key: app.dependency_overrides.get(key, sentinel) for key in overrides}
+    app.dependency_overrides.update(overrides)
+    try:
+        yield app
+    finally:
+        for key, value in previous.items():
+            if value is sentinel:
+                app.dependency_overrides.pop(key, None)
+            else:
+                app.dependency_overrides[key] = value
+
+
+def _api_client(api_app: FastAPI, headers: dict[str, str]) -> AsyncClient:
+    """An httpx client bound to the app in-process, carrying `headers` on every request."""
+    return AsyncClient(
+        transport=ASGITransport(app=api_app), base_url="http://test", headers=headers
+    )
+
+
+@pytest.fixture
+async def unauthenticated_client(api_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """A client that sends no `Authorization` header. Every endpoint must answer 401."""
+    async with _api_client(api_app, {}) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def user_client(api_app: FastAPI, es256_key: _SigningKey) -> AsyncIterator[AsyncClient]:
+    """Signed in as `TEST_USER_A_ID` — the owner in most tests."""
+    async with _api_client(api_app, _bearer_headers(es256_key, TEST_USER_A_ID)) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def second_user_client(
+    api_app: FastAPI, es256_key: _SigningKey
+) -> AsyncIterator[AsyncClient]:
+    """Signed in as `TEST_USER_B_ID` — a different, equally valid user.
+
+    The fixture that makes the authorization contract testable, and the reason it lives in
+    `conftest.py` rather than in one feature's test module: every endpoint added after this
+    one has a "someone else tries to write it" case, and they should all express it the same
+    way. Use it for the `403` tests, and — just as importantly — for the "a non-owner CAN
+    read this" tests, which are the ones that catch a well-meaning `WHERE user_id = $1`.
+    """
+    async with _api_client(api_app, _bearer_headers(es256_key, TEST_USER_B_ID)) as ac:
+        yield ac
