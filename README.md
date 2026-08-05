@@ -89,13 +89,13 @@ confirm with `supabase --version` before running `supabase start` or `make dev`.
 1. Install the prerequisites above. In particular, pin the **Supabase CLI to 2.111.0** —
    see the note under Prerequisites.
 2. `make setup` — creates `backend/.venv`, installs backend dependencies, installs the
-   Prisma CLI in `db/`, and installs `frontend/` dependencies once that directory exists
-   (PER-147). Run this once per checkout, and again after pulling a dependency change.
+   Prisma CLI in `db/`, and installs `frontend/` dependencies. Run this once per checkout,
+   and again after pulling a dependency change.
 3. `make dev` — starts the local Supabase stack (Postgres, Auth, Storage) and Redis in
-   Docker, then the FastAPI API with autoreload. It prints the table of URLs below once
-   everything is up. The ARQ worker and the frontend dev server are skipped with a note
-   until their own tickets land — that's expected, not a failure.
-4. `Ctrl-C` stops the API (and the worker and frontend, once they exist). Supabase and
+   Docker, then the FastAPI API with autoreload and the Next.js dev server, each with its
+   own log prefix. It prints the table of URLs below once everything is up. The ARQ worker
+   is skipped with a note until its ticket lands — that's expected, not a failure.
+4. `Ctrl-C` stops the API and frontend (and the worker, once it exists). Supabase and
    Redis keep running in Docker after that — local Postgres data and the seeded test user
    persist across `make dev` sessions. `make down` stops those containers too.
 

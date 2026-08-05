@@ -115,7 +115,17 @@ fi
 # Bridges `supabase status` into DATABASE_URL / SUPABASE_URL / SUPABASE_SECRET_KEY /
 # REDIS_URL for the API and worker below, without ever printing a value (see
 # scripts/local-env.sh and ARCHITECTURE.md §9.4).
-eval "$(bash scripts/local-env.sh export)"
+#
+# Captured into a variable *before* `eval` on purpose. `eval "$(cmd)"` would discard cmd's
+# exit status even under `set -e` — a failing local-env.sh would print its error and this
+# script would carry on and boot the API against an empty configuration, which is exactly
+# the "half-parsed configuration leaking downstream" that local-env.sh promises to prevent.
+# Assigning from a command substitution does propagate the failure, so this stops here.
+if ! env_exports="$(bash scripts/local-env.sh export)"; then
+  echo "dev: could not read the local Supabase configuration — see the error above" >&2
+  exit 1
+fi
+eval "$env_exports"
 export DATABASE_URL DIRECT_DATABASE_URL SUPABASE_URL SUPABASE_SECRET_KEY REDIS_URL
 
 # --- API ------------------------------------------------------------------------------
@@ -134,11 +144,11 @@ else
   echo "worker: skipped — backend/app/worker does not exist yet (lands with the ARQ ticket)"
 fi
 
-# --- frontend (graceful skip until PER-147 lands) -------------------------------------
+# --- frontend (skipped when frontend/ is absent) --------------------------------------
 if [ -d frontend ]; then
   run_prefixed frontend "$c_frontend" npm --prefix frontend run dev
 else
-  echo "frontend: skipped — frontend/ does not exist yet (lands with PER-147)"
+  echo "frontend: skipped — no frontend/ in this checkout"
 fi
 
 cat <<EOF

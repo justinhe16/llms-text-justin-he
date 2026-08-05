@@ -109,9 +109,9 @@ make down          # stop the Supabase and Redis containers
 make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```
 
-Every target gracefully skips work that isn't buildable yet — the ARQ worker (until its own
-ticket lands) and everything under `frontend/` (until PER-147 lands) — and says so instead of
-silently doing nothing. `make setup` first, once per checkout; see README.md "Run locally" for
+Every target gracefully skips work that isn't buildable yet — the ARQ worker, until its own
+ticket lands, and anything under `frontend/` if that directory is absent — and says so instead
+of silently doing nothing. `make setup` first, once per checkout; see README.md "Run locally" for
 the full walkthrough, prerequisites, and troubleshooting. When you add a target to the
 `Makefile`, add it to this list in the same PR.
 

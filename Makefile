@@ -7,7 +7,18 @@
 
 SHELL := /bin/bash
 
-PYTHON := python3.12
+# The first interpreter on PATH satisfying backend/pyproject.toml's requires-python
+# (>=3.12). README.md documents the requirement as "3.12+", so someone whose only
+# interpreter is python3.13 should not be told to go install 3.12. Override explicitly
+# with e.g. `make setup PYTHON=/opt/homebrew/bin/python3.13`.
+ifeq ($(origin PYTHON), undefined)
+PYTHON := $(shell for c in python3.12 python3.13 python3.14 python3; do \
+	command -v $$c >/dev/null 2>&1 \
+	  && $$c -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 12) else 1)' >/dev/null 2>&1 \
+	  && { echo $$c; break; }; \
+	done)
+endif
+
 VENV_DIR := backend/.venv
 VENV_BIN := $(CURDIR)/$(VENV_DIR)/bin
 WORKER_MODULE ?= app.worker.settings.WorkerSettings
@@ -27,6 +38,12 @@ help: ## Show this help and exit
 # --- prerequisite checks (internal; not listed in `make help`) ------------------------
 
 check-python:
+	@[ -n "$(PYTHON)" ] || { \
+		echo "make: no Python 3.12+ interpreter found on PATH." >&2; \
+		echo "make: tried python3.12, python3.13, python3.14, python3." >&2; \
+		echo "make: install Python 3.12+ (README.md > Run locally > Prerequisites) and re-run." >&2; \
+		exit 1; \
+	}
 	@command -v $(PYTHON) >/dev/null 2>&1 || { \
 		echo "make: '$(PYTHON)' not found on PATH." >&2; \
 		echo "make: install Python 3.12+ (README.md > Run locally > Prerequisites) and re-run." >&2; \
@@ -72,7 +89,7 @@ setup: check-python ## Create backend/.venv and install backend + db deps (front
 	@if [ -f frontend/package.json ]; then \
 		cd frontend && npm ci; \
 	else \
-		echo "frontend: skipped — frontend/ does not exist yet (lands with PER-147)"; \
+		echo "frontend: skipped — no frontend/ in this checkout"; \
 	fi
 
 dev: check-python check-docker check-supabase check-venv ## Run Supabase, Redis, the API, worker, and frontend
@@ -86,29 +103,29 @@ migrate-apply: check-supabase check-db-deps ## Apply pending migrations to the l
 	bash scripts/local-env.sh write-db-env
 	cd db && npm run migrate:apply
 
-test: check-python check-venv ## Run the backend test suite (frontend tests land with PER-147)
+test: check-python check-venv ## Run the backend and frontend test suites
 	cd backend && $(VENV_BIN)/pytest
 	@if [ -f frontend/package.json ]; then \
 		cd frontend && npm run --if-present test; \
 	else \
-		echo "frontend: skipped — frontend/ does not exist yet (lands with PER-147)"; \
+		echo "frontend: skipped — no frontend/ in this checkout"; \
 	fi
 
-lint: check-python check-venv ## Run ruff + mypy on backend/ (frontend lint lands with PER-147)
+lint: check-python check-venv ## Run ruff + mypy on backend/, eslint + tsc on frontend/
 	$(VENV_BIN)/ruff check backend
 	$(VENV_BIN)/ruff format --check backend
 	cd backend && $(VENV_BIN)/mypy app
 	@if [ -f frontend/package.json ]; then \
 		cd frontend && npm run --if-present lint && npm run --if-present typecheck; \
 	else \
-		echo "frontend: skipped — frontend/ does not exist yet (lands with PER-147)"; \
+		echo "frontend: skipped — no frontend/ in this checkout"; \
 	fi
 
-down: check-docker ## Stop Supabase and Redis containers
+down: check-docker check-supabase ## Stop Supabase and Redis containers
 	supabase stop
 	docker compose down
 
-reset: check-supabase check-db-deps ## Recreate the local DB, reseed it, and replay Prisma migrations
+reset: check-docker check-supabase check-db-deps ## Recreate the local DB, reseed it, and replay Prisma migrations
 	supabase db reset --local
 	docker compose up -d --force-recreate --wait redis
 	bash scripts/local-env.sh write-db-env
