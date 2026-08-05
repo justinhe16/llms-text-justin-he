@@ -1,0 +1,305 @@
+name: Backend CI
+
+# Path filtering happens in the `changes` job below rather than in a `paths:` filter
+# here, because `backend-ci` is a required status check on `main` and a workflow that
+# never triggers never reports one — which would leave every docs-only pull request
+# permanently unmergeable. See .github/scripts/changed-paths.sh for the full argument and
+# README.md "CI" for the operator-facing version.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Pushing twice in quick succession should not run two full matrices. Runs on `main` are
+# never cancelled: `main` is what the deploy pipeline reads, so every commit on it gets
+# its own verdict.
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Read-only. Nothing in this workflow writes to the repository, and the deploy
+# credentials live in the deploy workflow, not here.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The push path diffs against github.event.before, which is not in a shallow
+          # clone.
+          fetch-depth: 0
+
+      - name: Test the path filter
+        run: bash .github/scripts/changed-paths.test.sh
+
+      - name: Does this change touch the backend?
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # db/** is here because a schema change must re-run the tests that depend on it.
+          backend="$(bash .github/scripts/changed-paths.sh \
+            'backend/**' \
+            'db/**' \
+            '.github/workflows/ci-backend.yml' \
+            '.github/scripts/changed-paths.sh' \
+            '.github/scripts/changed-paths.test.sh')"
+          echo "backend=${backend}" >>"$GITHUB_OUTPUT"
+          echo "backend changed: \`${backend}\`" >>"$GITHUB_STEP_SUMMARY"
+
+  lint:
+    name: lint
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      # The three commands below are exactly what `make lint` runs for the backend, so a
+      # green laptop and a green CI mean the same thing. `--preview` is not passed on the
+      # command line: backend/pyproject.toml sets `preview = true` under [tool.ruff.lint],
+      # which is what PLC0415 needs, and one source of truth beats two.
+      - name: ruff check
+        run: ruff check backend
+
+      - name: ruff format --check
+        run: ruff format --check backend
+
+      - name: mypy
+        working-directory: backend
+        run: mypy app
+
+  test:
+    name: test
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      # A real Postgres, not a mock. The migrations are applied to it with the same
+      # command the deploy runs, so a migration that cannot be applied fails on the pull
+      # request that introduces it rather than in production.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: llms_text_test
+        ports:
+          - 5432:5432
+        # No step runs until this reports healthy, so the suite never races the container.
+        options: >-
+          --health-cmd "pg_isready --username postgres --dbname llms_text_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # Throwaway values for a container that is destroyed with the job, and obvious
+      # non-values for everything else. app/core/settings.py validates at import, so every
+      # required variable must be present or the suite fails to collect — a missing one
+      # produces a confusing CI-only failure. Never put a real credential here: this
+      # repository and its CI logs are public (ARCHITECTURE.md section 9).
+      #
+      # DIRECT_DATABASE_URL is what db/schema.prisma reads; DATABASE_URL is what the
+      # application reads. They point at the same container here because there is no
+      # pooler in front of it.
+      #
+      # DIRECT_DATABASE_URL IS ALSO THE NAME OF A REAL REPOSITORY SECRET, pointing at the
+      # production database, which the deploy workflow uses to migrate before deploying.
+      # It must never be referenced here. A pull request that ran `prisma migrate deploy`
+      # against production would apply an unreviewed migration outside the
+      # migrate -> deploy web -> deploy worker ordering (ARCHITECTURE.md section 7), from
+      # a branch, which is prohibited three separate ways. The literal below is a
+      # container that is created and destroyed inside this job.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/llms_text_test
+      DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/llms_text_test
+      REDIS_URL: redis://localhost:6379/0
+      SUPABASE_URL: https://ci.example.supabase.co
+      SUPABASE_SECRET_KEY: ci-placeholder-not-a-real-key
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: db/package-lock.json
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install the Prisma CLI
+        working-directory: db
+        run: npm ci
+
+      # `npm run migrate:deploy` is `prisma migrate deploy` — the exact command the deploy
+      # pipeline will run, never `prisma db push` (ARCHITECTURE.md section 6.3).
+      # db/migrations/ is empty until the schema ticket lands, so this is a no-op today
+      # and still worth running: it is the step that starts failing the day a migration
+      # is wrong.
+      - name: Apply migrations
+        working-directory: db
+        run: npm run migrate:deploy
+
+      # Proves the claim the acceptance criteria make — that the suite has a real
+      # database behind it — while no test opens a connection yet. Delete this step once
+      # a test does.
+      - name: Verify the database is real and reachable
+        run: psql "$DATABASE_URL" --set ON_ERROR_STOP=1 -c 'select current_database(), version()'
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: pytest
+        working-directory: backend
+        run: pytest tests -v --tb=short
+
+  build-check:
+    name: build-check
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # ENVIRONMENT=production on purpose: this job is the one that answers "would the
+      # image boot", and the deployed processes boot with production configuration.
+      ENVIRONMENT: production
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/llms_text_boot
+      REDIS_URL: redis://localhost:6379/0
+      SUPABASE_URL: https://ci.example.supabase.co
+      SUPABASE_SECRET_KEY: ci-placeholder-not-a-real-key
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      # Runtime dependencies only — the same set the Dockerfile installs. A module that
+      # imports something only requirements-dev.txt provides fails here rather than on
+      # the first deploy.
+      - name: Install runtime dependencies
+        run: pip install -r backend/requirements.txt
+
+      # pytest reaches the app through ASGITransport and never starts a server, so it
+      # cannot catch a failure in uvicorn's startup path. This can.
+      - name: Boot the app and probe /health
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 --log-level info &
+          server_pid=$!
+          trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
+
+          body=""
+          for _ in $(seq 1 30); do
+            if body="$(curl --fail --silent --show-error http://127.0.0.1:8000/health)"; then
+              break
+            fi
+            if ! kill -0 "${server_pid}" 2>/dev/null; then
+              echo "::error::the API exited before it served /health"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "GET /health -> ${body:-<no response>}"
+          if [ "${body}" != '{"status":"ok"}' ]; then
+            echo "::error::/health did not return {\"status\":\"ok\"}"
+            exit 1
+          fi
+
+  backend-ci:
+    # THE REQUIRED STATUS CHECK FOR `main`. It is the only job here that always runs, and
+    # that is the point: the jobs above are path-filtered and skip on a pull request with
+    # no backend changes, but branch protection still needs a verdict. `skipped` counts as
+    # a pass; `failure` and `cancelled` do not.
+    #
+    # Requiring the individual jobs instead would deadlock every docs-only pull request.
+    name: backend-ci
+    needs: [changes, lint, test, build-check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect the result of every backend job
+        env:
+          FILTER_RESULT: ${{ needs.changes.result }}
+          FILTER_OUTPUT: ${{ needs.changes.outputs.backend }}
+          RESULTS: |
+            lint=${{ needs.lint.result }}
+            test=${{ needs.test.result }}
+            build-check=${{ needs.build-check.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          {
+            echo "| job | result |"
+            echo "| --- | --- |"
+            echo "| \`changes\` | ${FILTER_RESULT} (backend=\`${FILTER_OUTPUT:-}\`) |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # `changes` is the only job in this workflow with no `if:`, so it always runs.
+          # Anything other than success means the path filter itself broke, and the skips
+          # below are then meaningless — `skipped` is deliberately NOT accepted here. This
+          # is the failure that would otherwise be invisible: a filter that wrongly
+          # answers "false" skips every real job and leaves a green required check on
+          # untested code.
+          if [ "$FILTER_RESULT" = "success" ]; then
+            printf 'ok      %-12s %s\n' changes "$FILTER_RESULT"
+          else
+            printf 'NOT OK  %-12s %s\n' changes "$FILTER_RESULT"
+            failed=1
+          fi
+
+          # The jobs below are path-filtered: `skipped` means this pull request cannot
+          # affect the backend, which is a pass.
+          while IFS='=' read -r job result; do
+            [ -n "$job" ] || continue
+            case "$result" in
+              success | skipped) printf 'ok      %-12s %s\n' "$job" "$result" ;;
+              *)
+                printf 'NOT OK  %-12s %s\n' "$job" "$result"
+                failed=1
+                ;;
+            esac
+            echo "| \`${job}\` | ${result} |" >>"$GITHUB_STEP_SUMMARY"
+          done <<<"$RESULTS"
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::a backend CI job did not succeed"
+            exit 1
+          fi

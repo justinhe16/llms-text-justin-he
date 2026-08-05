@@ -1,0 +1,149 @@
+name: Frontend CI
+
+# Path filtering happens in the `changes` job below rather than in a `paths:` filter
+# here. See .github/workflows/ci-backend.yml for why, or README.md "CI".
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Test the path filter
+        run: bash .github/scripts/changed-paths.test.sh
+
+      - name: Does this change touch the frontend?
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          frontend="$(bash .github/scripts/changed-paths.sh \
+            'frontend/**' \
+            '.github/workflows/ci-frontend.yml' \
+            '.github/scripts/changed-paths.sh' \
+            '.github/scripts/changed-paths.test.sh')"
+          echo "frontend=${frontend}" >>"$GITHUB_OUTPUT"
+          echo "frontend changed: \`${frontend}\`" >>"$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: verify
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      # Same order as `make lint`, which runs eslint before tsc. The two are independent,
+      # but the docs claim CI and the Makefile run the same checks — so they run them the
+      # same way, and nobody has to work out whether the difference is meaningful.
+      - name: eslint
+        run: npm run lint
+
+      - name: tsc --noEmit
+        run: npm run typecheck
+
+      - name: next build
+        run: npm run build
+
+      # The OpenAPI drift check goes HERE, added by the typed API client ticket: it
+      # regenerates the client from the FastAPI schema and fails the job if the committed
+      # client differs. It belongs after the build so a drifted client is reported
+      # separately from a broken one.
+
+      # Static gates are not enough. A font wiring bug that made every page fall back to
+      # Times passed tsc, eslint and `next build` cleanly; nothing above this line can
+      # see it. This step loads the production build in headless Chrome and measures what
+      # the browser actually resolved. See frontend/scripts/smoke.mjs.
+      #
+      # The browser is the one preinstalled on the runner image — puppeteer-core
+      # downloads none, which keeps the step to a few seconds. That version therefore
+      # moves without a diff in this repository, so the version is logged: it is the
+      # first thing to look at if this step ever fails on an unchanged frontend.
+      - name: Record the browser version
+        run: google-chrome --version
+
+      - name: Rendered-output smoke test
+        run: npm run smoke
+
+  frontend-ci:
+    # THE REQUIRED STATUS CHECK FOR `main` — see the same job in ci-backend.yml. Always
+    # runs, so a pull request that touches no frontend file still reports a verdict
+    # instead of blocking the merge forever.
+    name: frontend-ci
+    needs: [changes, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect the result of every frontend job
+        env:
+          FILTER_RESULT: ${{ needs.changes.result }}
+          FILTER_OUTPUT: ${{ needs.changes.outputs.frontend }}
+          RESULTS: |
+            verify=${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          {
+            echo "| job | result |"
+            echo "| --- | --- |"
+            echo "| \`changes\` | ${FILTER_RESULT} (frontend=\`${FILTER_OUTPUT:-}\`) |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # `changes` always runs, so `skipped` is not an acceptable result for it — see
+          # the same job in ci-backend.yml for why that distinction matters.
+          if [ "$FILTER_RESULT" = "success" ]; then
+            printf 'ok      %-12s %s\n' changes "$FILTER_RESULT"
+          else
+            printf 'NOT OK  %-12s %s\n' changes "$FILTER_RESULT"
+            failed=1
+          fi
+
+          while IFS='=' read -r job result; do
+            [ -n "$job" ] || continue
+            case "$result" in
+              success | skipped) printf 'ok      %-12s %s\n' "$job" "$result" ;;
+              *)
+                printf 'NOT OK  %-12s %s\n' "$job" "$result"
+                failed=1
+                ;;
+            esac
+            echo "| \`${job}\` | ${result} |" >>"$GITHUB_STEP_SUMMARY"
+          done <<<"$RESULTS"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::a frontend CI job did not succeed"
+            exit 1
+          fi

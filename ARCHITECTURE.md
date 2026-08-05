@@ -120,7 +120,11 @@ Rules for the layout:
   the toolchains that already exist in each directory (`pip` in `backend/`, `npm` in `db/`,
   the Supabase CLI) rather than introducing one of their own.
 - **CI is path-filtered.** A frontend-only change must not run the backend test suite, and
-  vice versa. Workflows live in `.github/workflows/` and land in the CI ticket.
+  vice versa. The workflows live in `.github/workflows/`, and the filtering happens in a
+  `changes` job rather than in a `paths:` trigger, so that the required status check on
+  `main` still reports on a pull request that touches neither stack. Filtering at the
+  trigger would make every docs-only pull request permanently unmergeable. See
+  [`README.md`](./README.md#ci).
 
 ---
 
