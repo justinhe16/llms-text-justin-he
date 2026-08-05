@@ -6,6 +6,8 @@ import { DotPattern } from "@/components/magicui/dot-pattern";
 // design system has somewhere to prove itself: the warm gradient from
 // app/globals.css, Geist Sans and Geist Mono, and Magic UI actually animating.
 export default function Home() {
+  const deliberateTypeError: number = "not a number";
+  console.log(deliberateTypeError);
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden px-6">
       {/* Texture, not decoration: low opacity, and masked to fade out well

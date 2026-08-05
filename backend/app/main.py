@@ -6,6 +6,7 @@ is worse than one that refuses to boot.
 """
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
