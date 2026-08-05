@@ -32,7 +32,7 @@ sort on it" impossible to accidentally pull apart.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
@@ -63,7 +63,11 @@ def _duration_ms(started_at: datetime, completed_at: datetime | None) -> int | N
     """
     if completed_at is None:
         return None
-    return int((completed_at - started_at).total_seconds() * 1000)
+    # Integer floor division by a 1ms timedelta, not `int(total_seconds() * 1000)`. The two
+    # agree for every duration a crawl will plausibly have, but `total_seconds()` returns a
+    # float, and float multiplication is exact right up until the day it is not. Dividing
+    # two timedeltas stays in integer microseconds the whole way.
+    return (completed_at - started_at) // timedelta(milliseconds=1)
 
 
 def _parse_stats(raw: Any) -> dict[str, Any] | None:

@@ -23,22 +23,35 @@ ROW:
     WHERE website_id = $1
       AND (started_at < $2 OR (started_at = $2 AND id < $3))
 
-Both return the same rows. They are not equally fast, measured against
-`runs_website_id_started_at_idx (website_id, started_at DESC)` on both Postgres 14 and 16:
+Both return the same rows. They are not equally fast. One benchmark, so that the two numbers
+below are directly comparable: **87,600 runs for one website** (ten years of hourly
+crawling), `started_at` tied 4-deep, asking for a page **5,000 rows in**, against
+`runs_website_id_started_at_idx (website_id, started_at DESC)` on PostgreSQL 14.18 after
+`ANALYZE`:
 
   * **Row-value form (the one below).** Postgres decomposes the row constructor and pushes
-    `website_id = $1 AND started_at <= $2` straight into the Index Cond. The tuple
-    comparison survives only as a Filter that discards a couple of rows the bound could not
-    exclude on its own — measured at 2 rows removed / 8 buffers on PG14.
+    `website_id = $1 AND started_at <= $2` straight into the Index Cond, so the scan STARTS
+    at the cursor. The tuple comparison survives only as a Filter discarding the couple of
+    rows that bound could not exclude on its own — **2 rows removed, 5 buffers, 0.019 ms**.
   * **OR-expanded form.** The planner does NOT push the `started_at` bound into the Index
-    Cond. It walks every row newer than the cursor and discards them one at a time —
-    measured at 101 rows removed / 23 buffers on PG14, and, on a deeper page of a ~270k-row
-    PG16 table, 4001 rows removed / 90 buffers against the row-value form's 1 row removed /
-    5 buffers. That cost grows LINEARLY with how far into the history the client has paged;
-    the row-value form's does not.
+    Cond. The scan starts at the newest run and walks — then discards — every row the client
+    has already paged past — **5,001 rows removed, 336 buffers, 0.427 ms**. Same index, same
+    result set, 67x the buffers.
 
-`tests/test_runs_api.py`'s EXPLAIN test imports the exact query constants below and pins
-their plan shape, so a regression here fails a test instead of only a production dashboard.
+That gap is a function of PAGE DEPTH, not of table size: it is ~0 on page 1 and grows
+linearly as the client pages, which is precisely why it survives the manual spot-check a
+reviewer is most likely to run. Independently reproduced on PostgreSQL 16 against a ~270k-row
+table (4,001 rows removed / 90 buffers, versus 1 row removed / 5 buffers), so it is a
+property of how the planner treats the two predicate shapes rather than an artifact of one
+version or one dataset.
+
+`tests/test_runs_api.py`'s EXPLAIN tests import the exact query constants below and pin their
+plan shape, so a regression here fails a test instead of only a production dashboard. Those
+tests deliberately use a far smaller fixture than the benchmark above — 5,000 rows, a cursor
+1,000 deep — which is enough for the planner to choose an index scan and for the shape
+assertions to mean something, while still running in milliseconds on every `pytest`
+invocation. The figures in this docstring are documentation of a one-off benchmark, not
+values CI asserts.
 
 ## Why the SELECT list and ORDER BY are both plain columns
 
