@@ -1,0 +1,83 @@
+# Local Supabase stack configuration for llms-text.
+#
+# This is a curated subset of what `supabase init` generates — every key left out here
+# takes the CLI's documented default. Full reference:
+# https://supabase.com/docs/guides/local-development/cli/config
+#
+# Pinned Supabase CLI version: 2.111.0 (see README.md "Run locally" for why the version
+# matters — config keys and defaults have moved between CLI releases).
+
+project_id = "llms-text-justin-he"
+
+[api]
+enabled = true
+port = 54321
+
+[db]
+port = 54322
+# Only used by `supabase db diff`; not part of the day-to-day dev loop.
+shadow_port = 54320
+# Must match production's Postgres major version (Supabase's current hosted default).
+major_version = 17
+
+[db.seed]
+enabled = true
+# Runs after `supabase db reset --local` replays supabase/migrations/ (deliberately empty
+# — Prisma owns migrations, see ARCHITECTURE.md §6). Consequence: seed.sql may only depend
+# on Supabase-managed schemas (auth), never on application tables. See the comment at the
+# top of seed.sql.
+sql_paths = ["./seed.sql"]
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+# Local email testing server. The Supabase CLI (2.111.0) names this `local_smtp`; earlier
+# CLI versions called the same service `inbucket`.
+[local_smtp]
+enabled = true
+port = 54324
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+# Mirrors the private production bucket (README.md "Infrastructure" — Supabase row).
+[storage.buckets.crawl-payloads]
+public = false
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:3000"
+# Both hosts, because a browser hitting the Next.js dev server may land on either
+# depending on how it was launched (`next dev` prints "localhost"), and GoTrue matches
+# redirect URLs exactly.
+additional_redirect_urls = ["http://127.0.0.1:3000", "http://localhost:3000"]
+jwt_expiry = 3600
+enable_signup = true
+minimum_password_length = 6
+
+[auth.email]
+enable_signup = true
+# No mail step locally: sign-in works immediately after signup instead of waiting on a
+# confirmation link (there'd be nowhere to click it — see local_smtp above).
+enable_confirmations = false
+
+# GitHub OAuth is verified in production only (Supabase dashboard), not locally. Left
+# explicitly disabled here rather than configured with placeholder client credentials —
+# local auth is email/password, see README.md "Run locally".
+[auth.external.github]
+enabled = false
+
+# Disabled locally to cut `supabase start` startup time. None of these are in use yet:
+# no realtime subscriptions, no analytics backend, no edge functions (ARCHITECTURE.md
+# §11 — out of scope). Re-enable here the day a ticket needs one.
+[realtime]
+enabled = false
+
+[analytics]
+enabled = false
+
+[edge_runtime]
+enabled = false
