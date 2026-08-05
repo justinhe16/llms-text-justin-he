@@ -62,6 +62,31 @@ llms-text-justin-he/
 Full detail, including the authorization contract and the transaction rules, is in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
+### Authorization and RLS posture
+
+FastAPI connects with the Supabase service role and therefore bypasses Row Level Security.
+Authorization is enforced in application code: reads are unrestricted for any authenticated
+user, and writes are ownership-checked in the service layer. Never expose the service key to
+a client.
+
+[`ARCHITECTURE.md` §4](./ARCHITECTURE.md#4-the-authorization-contract--public-read-owner-write)
+is the authoritative statement of that contract, and
+[§4.3](./ARCHITECTURE.md#43-where-authorization-lives) is the authoritative statement of where
+it is enforced. This section restates the posture rather than re-deriving it; if the two ever
+disagree, `ARCHITECTURE.md` governs.
+
+Authentication is the other half. Requests are authenticated by verifying the Supabase JWT
+**locally**, against the public keys the project publishes at
+`{SUPABASE_URL}/auth/v1/.well-known/jwks.json` — there is no shared HS256 secret anywhere in
+this repo, and no network round-trip per request. The key set is fetched once at startup and
+cached by `kid`; a token carrying a `kid` the cache has not seen triggers a single refetch,
+rate-limited to at most once per minute, which is what makes a Supabase key rotation a
+non-event rather than an outage. If the key set cannot be fetched at startup the API still
+boots, logs the failure, and recovers on the first request that needs a refetch. Every
+authentication failure is a `401` with one generic message; the specific reason is logged
+server-side only. See `backend/app/core/auth/jwks.py` and
+`backend/app/core/auth/dependencies.py`.
+
 ---
 
 ## Prerequisites

@@ -8,7 +8,9 @@
 # Testing
 pytest==9.1.1
 pytest-asyncio==1.4.0   # async tests; asyncio_mode = "auto" is set in pyproject.toml
-httpx==0.28.1           # ASGITransport client used by the test suite
+# httpx is a runtime dependency now (see requirements.txt) — dev inherits it via
+# `-r requirements.txt` above. It backs both the ASGITransport client the test suite uses
+# and the MockTransport client tests/test_jwks.py and tests/test_auth_dependencies.py use.
 
 # Linting and type checking
 ruff==0.16.1
