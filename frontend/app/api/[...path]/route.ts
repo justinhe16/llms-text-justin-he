@@ -163,11 +163,16 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
     try {
       const buffered = await request.arrayBuffer();
       outgoingBody = buffered.byteLength > 0 ? buffered : undefined;
-    } catch {
+    } catch (error) {
       // Reading the incoming body can fail on its own — a client that disconnects
       // mid-upload, a malformed transfer-encoding. Catching it keeps that answerable in
       // this file's own error shape instead of falling through to Next's generic error
-      // page, which is the one response here a UI could not parse.
+      // page, which is the one response here a UI could not parse. Logged like the other
+      // two failure paths in this handler — message only, never the body itself.
+      console.error(
+        "api proxy: could not read the request body —",
+        error instanceof Error ? error.message : "unknown error"
+      );
       return proxyErrorResponse(400, "invalid_body", "Could not read the request body.");
     }
   }
