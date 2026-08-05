@@ -71,6 +71,21 @@ jobs:
       DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
 
     steps:
+      # The `push` trigger above is pinned to `main`. `workflow_dispatch` is NOT: the
+      # Actions UI offers a branch picker and will happily aim this workflow at any ref
+      # that contains the file — which would migrate production and then deploy a feature
+      # branch that no required check ever ran against. ARCHITECTURE.md §7 permits deploys
+      # from `main` and nowhere else, and this pipeline is the thing that enforces it.
+      #
+      # This FAILS rather than skipping, on purpose. The same guard written as a job-level
+      # `if:` would skip the whole chain, and a skipped chain reports green — at a glance
+      # indistinguishable from a deploy that worked.
+      - name: Refuse to deploy anything but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Refusing to deploy from ${GITHUB_REF}. Deploys come from main only (ARCHITECTURE.md §7)."
+          exit 1
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
@@ -113,14 +128,25 @@ jobs:
         working-directory: db
         run: |
           set -euo pipefail
+          # Captured rather than piped through tee, so that the summary always gets a
+          # COMPLETE, closed code block: writing the opening fence, then streaming, then
+          # writing the closing fence would abort between the two if Prisma exited
+          # non-zero, leaving the run summary holding an unterminated block.
+          #
+          # The exit status is captured and re-raised at the end, so this step still fails
+          # the job exactly as before — that is what makes it the gate.
+          status=0
+          output="$(npm run migrate:status 2>&1)" || status=$?
+
+          printf '%s\n' "${output}"
           {
             echo '### Migration status after apply'
             echo '```'
+            printf '%s\n' "${output}"
+            echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
-          # pipefail is what makes the tee transparent: a non-zero exit from Prisma still
-          # fails the step rather than being masked by tee's success.
-          npm run migrate:status | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >>"$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"
 
   # ---------------------------------------------------------------------------------------
   # 2. Deploy. Only reachable with the schema already migrated.
@@ -167,10 +193,16 @@ jobs:
         working-directory: backend
         continue-on-error: true
         run: |
+          # `awk NR<=5` rather than `head -5`: head closes the pipe as soon as it has its
+          # five lines, which SIGPIPEs flyctl. That happens to be harmless under the
+          # runner's default `bash -e {0}` shell, which does NOT set `pipefail` — but it
+          # makes this step's behaviour depend on a shell default nobody should have to
+          # know, and it would start failing the day someone adds `shell: bash`. awk reads
+          # the stream to the end, so the question never arises.
           {
             echo '### Fly releases'
             echo '```'
-            flyctl releases | head -5
+            flyctl releases | awk 'NR<=5'
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -195,8 +227,15 @@ jobs:
           # --retry-all-errors because plain --retry only retries curl's idea of a
           # transient failure; a machine that is still coming up answers 502, and
           # --retry-connrefused covers the window before it is listening at all.
+          #
+          # The budget is ~50s rather than the ~25s the ticket sketched, because
+          # backend/fly.toml carries no Fly health checks yet — PER-157 owns those. Until
+          # it lands, `flyctl deploy` returns once the machine has STARTED, not once it is
+          # serving, so this curl absorbs the whole of uvicorn's boot and the asyncpg
+          # pool's first connection. PER-157 can bring it back down: with health checks in
+          # place, flyctl does that waiting itself.
           body="$(curl --fail --silent --show-error \
-            --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused \
+            --retry 10 --retry-delay 5 --retry-all-errors --retry-connrefused \
             --connect-timeout 10 \
             https://llms-text-justin-he.fly.dev/health)"
 
