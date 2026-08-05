@@ -1,18 +1,20 @@
 // Named, feature-level wrappers around `api` (lib/api/fetcher.ts) for `/websites`. Every
 // call site in the app — a page, a component, a React Query hook in `lib/query/` — should
 // import from here rather than reaching for `api.get`/`api.post`/`api.delete` directly, so
-// the endpoint list in this one file is the entire inventory of what the frontend can ask
-// the backend for.
+// the endpoint list in this file, together with `lib/api/runs.ts` and `lib/api/health.ts`,
+// is the entire inventory of what the frontend can ask the backend for.
 //
-// Runs, schedules, and stats helpers are deliberately ABSENT. `GET /websites/{id}/runs`,
-// `POST /websites/{id}/runs`, `GET/PUT /websites/{id}/schedule`, and any stats endpoint do
-// not exist in the backend yet (see backend/app/api/routers/websites.py — three routes
-// today, no more) — they land with their own tickets, each of which adds its own helpers
-// here or in a sibling file. Writing `listRuns`/`triggerRun`/`getSchedule` now, ahead of a
-// real endpoint, would either hand-write a response shape nothing generates or silently
-// point at a path `paths` does not know about — the latter is exactly what
-// `PathsWithMethod` in fetcher.ts turns into a compile error, which is the intended
-// guardrail working correctly, not a gap to work around.
+// Read helpers for `GET /websites/{id}/runs` and `GET /runs/{id}` now live in
+// `lib/api/runs.ts`, not here — the runs feature (PER-155) owns its own response shapes, the
+// same way this file owns `WebsiteResponse` and friends. What is still ABSENT, from both
+// files: `POST /websites/{id}/runs` (triggering a run), `GET`/`PUT /websites/{id}/schedule`,
+// and any stats endpoint — see backend/app/api/routers/websites.py and
+// backend/app/api/routers/runs.py, neither of which declares those routes yet. They land
+// with their own tickets, each of which adds its own helpers here or in a sibling file.
+// Writing `triggerRun`/`getSchedule` now, ahead of a real endpoint, would either hand-write a
+// response shape nothing generates or silently point at a path `paths` does not know about —
+// the latter is exactly what `PathsWithMethod` in fetcher.ts turns into a compile error,
+// which is the intended guardrail working correctly, not a gap to work around.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";

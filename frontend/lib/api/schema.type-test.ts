@@ -18,6 +18,8 @@ import type { components } from "./schema";
 import { api } from "./fetcher";
 import { getHealth, type HealthStatus } from "./health";
 import type { RunStatus } from "./run-status";
+import { getRun, listRuns } from "./runs";
+import type { RunDetail, RunPage } from "./runs";
 import { createWebsite, deleteWebsite, getWebsite, listWebsites } from "./websites";
 import type { Website, WebsiteListItem } from "./websites";
 
@@ -64,16 +66,43 @@ export type AssertGetHealthReturnsHealthStatus = Expect<
   Equal<Awaited<ReturnType<typeof getHealth>>, HealthStatus>
 >;
 
+export type AssertListRunsReturnsRunPage = Expect<
+  Equal<Awaited<ReturnType<typeof listRuns>>, RunPage>
+>;
+
+export type AssertGetRunReturnsRunDetail = Expect<
+  Equal<Awaited<ReturnType<typeof getRun>>, RunDetail>
+>;
+
 // --- RunStatus is derived from the generated schema, not hand-copied --------------------
 //
 // This is the assertion `lib/api/run-status.ts`'s own comment promises: if a fifth
 // `run_status` value is ever added to the Postgres enum and flows through to
-// `LatestRunSummary.status`, `RunStatus` (a direct alias of that field) picks it up the
-// next time `npm run gen:api` runs — this check only exists to catch the alias itself ever
-// drifting from its source, e.g. someone "simplifying" it to a hand-written union later.
+// `RunListItemResponse.status`, `RunStatus` (a direct alias of that field, via
+// `RunListItem["status"]`) picks it up the next time `npm run gen:api` runs — this check
+// only exists to catch the alias itself ever drifting from its source, e.g. someone
+// "simplifying" it to a hand-written union later.
 
 export type AssertRunStatusMatchesGeneratedEnum = Expect<
-  Equal<RunStatus, components["schemas"]["LatestRunSummary"]["status"]>
+  Equal<RunStatus, components["schemas"]["RunListItemResponse"]["status"]>
+>;
+
+// The runs feature's own status field (`RunListItemResponse.status`, the definition now
+// backing `RunStatus` above) and the websites feature's folded summary of it
+// (`LatestRunSummary.status`, `GET /websites?include=latest_run`) are two independently
+// generated fields that are both supposed to trace back to the single `RunStatusName`
+// Literal the runs feature owns (`backend/app/features/runs/schemas.py`'s module docstring
+// explains why there is only one copy of it, and why `websites/schemas.py` imports rather
+// than redefines it). This assertion is the compile-time guarantee that the two have not
+// quietly drifted apart: if the runs feature ever grows a fifth status the websites fold
+// does not know about, this fails `tsc`, rather than `websiteHasActiveRun` and `runIsActive`
+// (lib/api/run-status.ts) silently answering "is this active" two different ways for what
+// was supposed to be one vocabulary.
+export type AssertWebsiteRunStatusMatchesRunsRunStatus = Expect<
+  Equal<
+    components["schemas"]["LatestRunSummary"]["status"],
+    components["schemas"]["RunListItemResponse"]["status"]
+  >
 >;
 
 // --- the generic client rejects what it should -------------------------------------------
@@ -96,6 +125,12 @@ async function assertInvalidCallsDoNotCompile(): Promise<void> {
 
   // @ts-expect-error GET /health declares no DELETE method
   await api.delete("/health");
+
+  // @ts-expect-error the "/websites/{id}/runs" path parameter is a string, not a number
+  await api.get("/websites/{id}/runs", { params: { id: 123 } });
+
+  // @ts-expect-error "queued" is not a member of RunStatusName
+  await api.get("/websites/{id}/runs", { params: { id: "abc" }, query: { status: "queued" } });
 }
 
 // Referenced so this is "used" for lint purposes without ever actually being called —

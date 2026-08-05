@@ -35,6 +35,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/runs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run
+         * @description Return one run in full, including `llms_txt` and `storage_path`.
+         *
+         *     Any signed-in user may read any run (ARCHITECTURE.md §4.1); `user_id` is present only
+         *     to require a token and is deliberately never passed to the service. `404` if `id` names
+         *     no run.
+         */
+        get: operations["get_run_runs__id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/websites": {
         parameters: {
             query?: never;
@@ -95,6 +119,34 @@ export interface paths {
          *     Returns `204` with no body — hence no `response_model` and a `None` return.
          */
         delete: operations["delete_website_websites__id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/websites/{id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Runs
+         * @description List one website's run history, newest first. Any signed-in user, any website.
+         *
+         *     Not filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to
+         *     require authentication and is intentionally not passed to the service. `404` if `id`
+         *     names no website; see `RunService.list_runs`.
+         *
+         *     The path parameter is `id`, not `website_id`, because the noun is already in the path
+         *     (ARCHITECTURE.md §10.3) — it shadows the `id` builtin inside this function body, which
+         *     is the accepted cost of the route contract, matching `websites.get_website`.
+         */
+        get: operations["list_runs_websites__id__runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -173,6 +225,107 @@ export interface components {
              * @enum {string}
              */
             status: "pending" | "processing" | "completed" | "failed";
+        };
+        /** Page[RunListItemResponse] */
+        Page_RunListItemResponse_: {
+            /** Items */
+            items: components["schemas"]["RunListItemResponse"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+        };
+        /**
+         * RunDetailResponse
+         * @description The full body of `GET /runs/{id}` — every list-item field, plus the two that are too
+         *     large or too rarely needed for a list view.
+         *
+         *     A subclass of `RunListItemResponse`, the same relationship `WebsiteListItemResponse`
+         *     has to `WebsiteResponse`: the detail view is the list item plus more, not an
+         *     independently maintained sibling that could drift from it field by field.
+         */
+        RunDetailResponse: {
+            /** Completed At */
+            completed_at: string | null;
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Error */
+            error: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Llms Txt */
+            llms_txt: string | null;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Stats */
+            stats: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "completed" | "failed";
+            /** Storage Path */
+            storage_path: string | null;
+            /**
+             * Trigger
+             * @enum {string}
+             */
+            trigger: "manual" | "scheduled";
+            /**
+             * Website Id
+             * Format: uuid
+             */
+            website_id: string;
+        };
+        /**
+         * RunListItemResponse
+         * @description One row of `GET /websites/{id}/runs`.
+         *
+         *     Deliberately excludes `llms_txt` and `storage_path` — an artifact can be large and no
+         *     list view renders it; `RunDetailResponse` below is the endpoint that returns them.
+         */
+        RunListItemResponse: {
+            /** Completed At */
+            completed_at: string | null;
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Error */
+            error: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Stats */
+            stats: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "completed" | "failed";
+            /**
+             * Trigger
+             * @enum {string}
+             */
+            trigger: "manual" | "scheduled";
+            /**
+             * Website Id
+             * Format: uuid
+             */
+            website_id: string;
         };
         /**
          * ScheduleSummary
@@ -342,6 +495,37 @@ export interface operations {
             };
         };
     };
+    get_run_runs__id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetailResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_websites_websites_get: {
         parameters: {
             query?: {
@@ -464,6 +648,44 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_runs_websites__id__runs_get: {
+        parameters: {
+            query?: {
+                /** @description Return only runs with this status. An unrecognized value is a 422. */
+                status?: ("pending" | "processing" | "completed" | "failed") | null;
+                /** @description Page size. Values above the maximum (100) are silently clamped to it rather than rejected; `<= 0` is a 422. */
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous page's `next_cursor`. Omit it to fetch the first page. Treat it as a blob — see `Page.next_cursor`. */
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_RunListItemResponse_"];
+                };
             };
             /** @description Validation Error */
             422: {

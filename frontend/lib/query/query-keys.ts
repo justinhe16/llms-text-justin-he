@@ -10,6 +10,8 @@
 // this repo elsewhere reaches for a literal type to protect (see `RunStatus` in
 // lib/api/run-status.ts for the same instinct applied to a different problem).
 
+import type { RunListOptions } from "@/lib/api/runs";
+
 const websites = {
   // The root of every website-related key. `queryClient.invalidateQueries({ queryKey:
   // queryKeys.websites.all })` matches this and everything nested under it (the `list` and
@@ -26,10 +28,24 @@ const websites = {
   detail: (id: string) => ["websites", "detail", id] as const,
 };
 
-// No `runs` key here yet. `GET /websites/{id}/runs` does not exist (see the note at the
-// top of lib/api/websites.ts), so there is nothing to key a run list or a single run by.
-// It slots in beside `websites` above, as `runs: { all, list: (websiteId) => ..., detail:
-// (id) => ... }`, when that endpoint's ticket lands.
+const runs = {
+  // The root of every run-related key, mirroring `websites.all` above — coarse enough to
+  // invalidate every run list and every run detail currently mounted, for the rare change
+  // that could affect any of them at once.
+  all: ["runs"] as const,
+
+  // `websiteId` scopes the key to one website's run history; `options` (cursor, status,
+  // limit — `RunListOptions`, lib/api/runs.ts) is part of it for the same reason `include`
+  // is part of `websites.list` above: two different option sets are two different pages or
+  // filters of the same underlying list, and caching them under one key would let a
+  // component reading one see a response fetched for the other.
+  list: (websiteId: string, options?: RunListOptions) =>
+    ["runs", "list", websiteId, options] as const,
+
+  // One run's own detail (`GET /runs/{id}`) — independent of which website's history it was
+  // reached from, since a run's id alone identifies it.
+  detail: (id: string) => ["runs", "detail", id] as const,
+};
 
 const health = {
   status: ["health"] as const,
@@ -37,5 +53,6 @@ const health = {
 
 export const queryKeys = {
   websites,
+  runs,
   health,
 };

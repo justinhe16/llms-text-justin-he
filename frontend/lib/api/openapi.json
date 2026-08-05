@@ -118,6 +118,251 @@
         "title": "LatestRunSummary",
         "type": "object"
       },
+      "Page_RunListItemResponse_": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RunListItemResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[RunListItemResponse]",
+        "type": "object"
+      },
+      "RunDetailResponse": {
+        "description": "The full body of `GET /runs/{id}` — every list-item field, plus the two that are too\nlarge or too rarely needed for a list view.\n\nA subclass of `RunListItemResponse`, the same relationship `WebsiteListItemResponse`\nhas to `WebsiteResponse`: the detail view is the list item plus more, not an\nindependently maintained sibling that could drift from it field by field.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "llms_txt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llms Txt"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stats"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "storage_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Path"
+          },
+          "trigger": {
+            "enum": [
+              "manual",
+              "scheduled"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "website_id",
+          "status",
+          "trigger",
+          "started_at",
+          "completed_at",
+          "duration_ms",
+          "stats",
+          "error",
+          "llms_txt",
+          "storage_path"
+        ],
+        "title": "RunDetailResponse",
+        "type": "object"
+      },
+      "RunListItemResponse": {
+        "description": "One row of `GET /websites/{id}/runs`.\n\nDeliberately excludes `llms_txt` and `storage_path` — an artifact can be large and no\nlist view renders it; `RunDetailResponse` below is the endpoint that returns them.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stats"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trigger": {
+            "enum": [
+              "manual",
+              "scheduled"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "website_id",
+          "status",
+          "trigger",
+          "started_at",
+          "completed_at",
+          "duration_ms",
+          "stats",
+          "error"
+        ],
+        "title": "RunListItemResponse",
+        "type": "object"
+      },
       "ScheduleSummary": {
         "description": "The compact view of a website's schedule, folded into the list response.\n\nLike `LatestRunSummary`, a fragment: enough to render \"every 6 hours, next at 14:00\" and\nnothing else. The schedules feature owns the full representation and the endpoints that\nchange it.",
         "properties": {
@@ -390,6 +635,55 @@
         ]
       }
     },
+    "/runs/{id}": {
+      "get": {
+        "description": "Return one run in full, including `llms_txt` and `storage_path`.\n\nAny signed-in user may read any run (ARCHITECTURE.md §4.1); `user_id` is present only\nto require a token and is deliberately never passed to the service. `404` if `id` names\nno run.",
+        "operationId": "get_run_runs__id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Run",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
     "/websites": {
       "get": {
         "description": "List **every** website, from every user, most recently active first.\n\nNot filtered by the caller, on purpose: this application is not multi-tenant and\nbrowsing everyone's sites is the product (ARCHITECTURE.md §4.1). `user_id` is present to\nrequire authentication and is intentionally not passed to the service.",
@@ -593,6 +887,110 @@
         "summary": "Get Website",
         "tags": [
           "websites"
+        ]
+      }
+    },
+    "/websites/{id}/runs": {
+      "get": {
+        "description": "List one website's run history, newest first. Any signed-in user, any website.\n\nNot filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to\nrequire authentication and is intentionally not passed to the service. `404` if `id`\nnames no website; see `RunService.list_runs`.\n\nThe path parameter is `id`, not `website_id`, because the noun is already in the path\n(ARCHITECTURE.md §10.3) — it shadows the `id` builtin inside this function body, which\nis the accepted cost of the route contract, matching `websites.get_website`.",
+        "operationId": "list_runs_websites__id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return only runs with this status. An unrecognized value is a 422.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "pending",
+                    "processing",
+                    "completed",
+                    "failed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only runs with this status. An unrecognized value is a 422.",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "Page size. Values above the maximum (100) are silently clamped to it rather than rejected; `<= 0` is a 422.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "description": "Page size. Values above the maximum (100) are silently clamped to it rather than rejected; `<= 0` is a 422.",
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque pagination cursor from a previous page's `next_cursor`. Omit it to fetch the first page. Treat it as a blob — see `Page.next_cursor`.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque pagination cursor from a previous page's `next_cursor`. Omit it to fetch the first page. Treat it as a blob — see `Page.next_cursor`.",
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_RunListItemResponse_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Runs",
+        "tags": [
+          "runs"
         ]
       }
     }

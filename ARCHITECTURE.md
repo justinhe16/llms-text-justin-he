@@ -654,7 +654,7 @@ routes already described in §3 — and `frontend/lib/api/schema.d.ts` is genera
 snapshot by `openapi-typescript` (`npm run gen:api`, or `make openapi` for both halves at
 once). No frontend code hand-writes a request or response shape: `frontend/lib/api/fetcher.ts`
 exports a small typed client (`api.get`/`api.post`/`api.delete`) generic over the generated
-`paths` type, and every feature-level helper (`frontend/lib/api/websites.ts`,
+`paths` type, and every feature-level helper (`frontend/lib/api/websites.ts`, `runs.ts`,
 `health.ts`) calls through it and re-exports readable aliases of `components["schemas"][...]`.
 Calling a path that does not exist, or getting a parameter or a body wrong, is a `tsc` error,
 not a runtime one.
@@ -670,21 +670,30 @@ backend, because it only ever reads the JSON already in the repo. Both checks fa
 
 **The query key factory.** `frontend/lib/query/query-keys.ts` is the only place a React
 Query cache key is constructed — `queryKeys.websites.all`, `.list(include?)`,
-`.detail(id)` — so that invalidating "every website" or "this one website" is a call to a
-function here rather than an array literal a caller has to get byte-for-byte right at every
-call site.
+`.detail(id)`, and the mirroring `queryKeys.runs.all`, `.list(websiteId, options?)`,
+`.detail(id)` — so that invalidating "every website" or "this one website" (or "every run"
+or "this one run") is a call to a function here rather than an array literal a caller has to
+get byte-for-byte right at every call site.
 
 **Polling.** A query polls only while something in its data is still in progress, at
 `ACTIVE_POLL_INTERVAL_MS` (3 seconds), and stops the moment it isn't —
 `frontend/lib/query/polling.ts`'s `pollWhileActive` builds a `refetchInterval` callback from
-a single shared predicate (`anyWebsiteHasActiveRun`, `frontend/lib/api/run-status.ts`), so
-"is a run still running" is decided in exactly one place regardless of which query asks.
-Polling also pauses on a hidden tab (`refetchIntervalInBackground: false`, set as a
-`QueryClient` default in `app/providers.tsx` rather than trusted to every `useQuery` call) —
-a run that takes ten minutes should not poll a tab nobody is looking at roughly 200 times.
-`useWebsite` (a single website, no run information on that endpoint) deliberately does not
-poll at all; inventing a poll for data that cannot change would be worse than not polling,
-because it would look like a feature and do nothing.
+a predicate over that query's own data, so "is a run still running" is decided in exactly
+one place regardless of which query asks. `frontend/lib/api/run-status.ts`'s
+`isActiveRunStatus` — an exhaustive `Record` over the `runs.status` enum — is that one
+place, and three call sites currently build a `pollWhileActive` predicate on top of it, one
+per response shape that carries a status: `anyWebsiteHasActiveRun` for the websites list
+(`useWebsites`, `GET /websites?include=latest_run`), `anyRunActive` for a website's run
+history (`useRuns`, `GET /websites/{id}/runs`), and `runIsActive` for a single run's own
+detail (`useRun`, `GET /runs/{id}`). A fourth call site means a fourth thin fold over
+`isActiveRunStatus`, never a fresh string comparison. Polling also pauses on a hidden tab
+(`refetchIntervalInBackground: false`, set as a `QueryClient` default in `app/providers.tsx`
+rather than trusted to every `useQuery` call) — a run that takes ten minutes should not poll
+a tab nobody is looking at roughly 200 times. `useWebsite` (`GET /websites/{id}`, a single
+website with no run or schedule information on that endpoint) deliberately does not poll at
+all; a detail screen composes it with `useRuns`/`useRun` instead, which is where the run
+data — and therefore the polling — actually lives. Inventing a poll on `useWebsite` itself
+would be worse than not polling, because it would look like a feature and do nothing.
 
 ---
 
