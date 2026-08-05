@@ -30,6 +30,7 @@ type ProxyErrorCode =
   | "not_authenticated"
   | "proxy_misconfigured"
   | "invalid_path"
+  | "invalid_body"
   | "upstream_unreachable"
   | "upstream_timeout";
 
@@ -69,8 +70,12 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
   // trip. This handler decides for itself whether the caller is signed in.
   let isAuthenticated: boolean;
   try {
-    const { data: claims, error } = await supabase.auth.getClaims();
-    isAuthenticated = Boolean(claims) && !error;
+    // `data` is the wrapper `{ claims, header, signature }`, not the claims payload itself,
+    // so the check is `data?.claims` — the same shape lib/supabase/middleware.ts reads.
+    // Destructuring `data` as `claims` here would still be correct today and would mean
+    // something else entirely to the next person who writes `claims.sub`.
+    const { data, error } = await supabase.auth.getClaims();
+    isAuthenticated = Boolean(data?.claims) && !error;
   } catch (error) {
     // Reached when the Auth server can't be talked to at all (DNS, timeout, an outage).
     // Treated as "not authenticated" rather than a 502: from the caller's side there is no
@@ -124,7 +129,13 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
   // `path` element of `..` can walk the resolved URL back above `base` (e.g. above an
   // `API_URL` that itself carries a path prefix). Comparing the fully-resolved `href`
   // against `base` after the fact catches that cheaply, without writing a path parser.
-  if (!target.href.startsWith(base)) {
+  //
+  // The comparison is against `${base}/`, not `base`, because a bare `startsWith(base)` is
+  // a string test rather than a path test: with a `base` of ".../api", a resolved
+  // ".../api-internal" shares the prefix and would sail through. The trailing slash forces
+  // the match onto a path-segment boundary. `href === base` is allowed separately — that is
+  // the base itself, which is contained by definition, not an escape from it.
+  if (target.href !== base && !target.href.startsWith(`${base}/`)) {
     return proxyErrorResponse(400, "invalid_path", "Invalid request path.");
   }
 
@@ -149,8 +160,16 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
   // the only method among the five exported below that Next ever routes without a body.
   let outgoingBody: ArrayBuffer | undefined;
   if (request.method !== "GET") {
-    const buffered = await request.arrayBuffer();
-    outgoingBody = buffered.byteLength > 0 ? buffered : undefined;
+    try {
+      const buffered = await request.arrayBuffer();
+      outgoingBody = buffered.byteLength > 0 ? buffered : undefined;
+    } catch {
+      // Reading the incoming body can fail on its own — a client that disconnects
+      // mid-upload, a malformed transfer-encoding. Catching it keeps that answerable in
+      // this file's own error shape instead of falling through to Next's generic error
+      // page, which is the one response here a UI could not parse.
+      return proxyErrorResponse(400, "invalid_body", "Could not read the request body.");
+    }
   }
 
   let upstream: Response;
