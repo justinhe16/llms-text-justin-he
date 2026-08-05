@@ -50,6 +50,16 @@ class Settings(BaseSettings):
     # Optional: error reporting is disabled when this is unset.
     sentry_dsn: str | None = None
 
+    # Pool sizing, kept deliberately small: Fly machines are small, Supabase connection
+    # limits are real, and the API and the ARQ worker draw connections from the same
+    # budget (both processes construct this same Settings class — see the module
+    # docstring). A pool that is too large on either process starves the other, or trips
+    # Supabase's own connection cap. See app/infrastructure/db/pool.py for the factory
+    # that reads these.
+    db_pool_min_size: int = 2
+    db_pool_max_size: int = 10
+    db_command_timeout: float = 30.0
+
     def validate_required_secrets(self) -> None:
         """Fail loudly if any required variable is unset, naming every one of them.
 

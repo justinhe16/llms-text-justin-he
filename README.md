@@ -113,6 +113,11 @@ make down          # stop the Supabase and Redis containers
 make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```
 
+`make test` runs the backend suite either way, but its database-backed tests (a real
+asyncpg pool and transaction rollback/commit) only run if the local Supabase stack is up
+— start it with `make dev` first. Without it, those tests skip with a message saying so;
+the rest of the suite is unaffected.
+
 ### URLs
 
 Printed by `make dev` once the stack is up:

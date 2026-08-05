@@ -189,6 +189,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    services:
+      # PER-145 moved the Postgres pool into the FastAPI lifespan, so "would the image
+      # boot" now genuinely includes "can it reach its database": app/main.py opens the
+      # pool on startup and the process exits if that fails. That is deliberate fail-fast
+      # (a bad DSN should not boot into a permanently degraded app), and it means this job
+      # needs a real database to answer the question it is named for. Destroyed with the
+      # job, same as the `test` job's container.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: llms_text_boot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username postgres --dbname llms_text_boot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
     env:
       # ENVIRONMENT=production on purpose: this job is the one that answers "would the
       # image boot", and the deployed processes boot with production configuration.
@@ -237,8 +258,12 @@ jobs:
           done
 
           echo "GET /health -> ${body:-<no response>}"
-          if [ "${body}" != '{"status":"ok"}' ]; then
-            echo "::error::/health did not return {\"status\":\"ok\"}"
+          # PER-145 added the `db` field. Asserting the full body on purpose rather than
+          # grepping for "ok": `db` is exactly the part that would silently read
+          # "degraded"/"timeout" if the pool were misconfigured, and a substring match
+          # would call that a pass.
+          if [ "${body}" != '{"status":"ok","db":"ok"}' ]; then
+            echo "::error::/health did not return {\"status\":\"ok\",\"db\":\"ok\"}"
             exit 1
           fi
 

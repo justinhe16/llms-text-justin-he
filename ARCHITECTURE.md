@@ -158,9 +158,10 @@ may call only its own feature's reader and writer. If feature A needs data owned
 B, it calls **B's service**, never B's reader. This is the rule that keeps the dependency
 graph acyclic.
 
-**Import direction is one-way:** `api` → `features` → `core`. Nothing in `core` may import
-from `api` or `features`, and no feature may import another feature's `internals/`. Import
-absolutely — `from app.core.settings import settings`, never `from ..core import settings`.
+**Import direction is one-way:** `api` → `features` → `infrastructure` → `core`. Nothing in
+`core` may import from `api`, `features`, or `infrastructure`, and no feature may import
+another feature's `internals/`. Import absolutely — `from app.core.settings import settings`,
+never `from ..core import settings`.
 
 The first feature module to land becomes the reference implementation for every one after
 it. Read it before writing the second. If it drifts from this document, fix the module — not
@@ -206,6 +207,16 @@ def generate_llms_txt(pages: list[Page]) -> str:
 Build against that signature. Do not scatter crawling, parsing, or LLM-calling logic
 through the services in anticipation of a design that does not exist yet, and do not widen
 the signature without a ticket that redesigns this seam.
+
+### 3.5 The database infrastructure layer
+
+`backend/app/infrastructure/db/` holds the pieces every feature's reader, writer, and
+service build on, so no feature reimplements them: `pool.py` (the asyncpg pool factory
+and process-wide singleton), `base_repository.py` (`Reader`/`Writer` base classes that
+convert `asyncpg.Record` to `dict[str, Any]` so a `Record` never escapes a repository),
+and `transaction.py` (the `transaction()` context manager services use to open a unit of
+work — §5). It has no feature-specific logic and no schema knowledge; a feature's reader
+and writer subclass `Reader`/`Writer`, and its service calls `transaction()`.
 
 ---
 

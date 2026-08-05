@@ -1,6 +1,6 @@
 # Runtime dependencies for the backend image (FastAPI API + ARQ worker).
 # Pinned exactly so the image CI builds is the image that was tested.
-# The database, Redis/ARQ, and auth dependencies land with their own tickets.
+# The Redis/ARQ and auth dependencies land with their own tickets.
 
 # Web framework
 fastapi==0.141.1
@@ -8,3 +8,7 @@ uvicorn[standard]==0.52.1   # ASGI server; [standard] adds uvloop and httptools
 
 # Configuration
 pydantic-settings==2.14.2   # environment parsing and validation for app/core/settings.py
+
+# Database
+asyncpg==0.31.0   # Postgres driver used by app/infrastructure/db/ — see requirements-dev.txt
+                   # for why asyncpg-stubs is a separate, dev-only dependency
