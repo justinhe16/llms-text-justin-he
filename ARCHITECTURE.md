@@ -98,6 +98,7 @@ document:
 llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
+│   └── app/core/auth/   JWKS cache + JWT verification dependencies
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
 ├── supabase/            local Supabase stack config (config.toml, seed.sql)
 ├── scripts/             shell helpers used by the Makefile (dev.sh, local-env.sh)
