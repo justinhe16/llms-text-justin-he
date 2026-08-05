@@ -373,6 +373,105 @@
         "title": "RunListItemResponse",
         "type": "object"
       },
+      "RunStatsPoint": {
+        "description": "One bucket of `GET /websites/{id}/stats`'s `series`.\n\nEvery bucket in the requested window appears exactly once, in order — including buckets\nwith zero runs, which report zeroes rather than being omitted (`RunsReader.\nwebsite_stats`'s `_WEBSITE_STATS` zero-fills them with `generate_series`). `avg_pages`\nand `avg_duration_ms` are therefore never `null`: see `service.py`'s `_to_stats` for the\nrounding that turns SQL's already-zero-filled averages into these two fields.",
+        "properties": {
+          "avg_duration_ms": {
+            "title": "Avg Duration Ms",
+            "type": "integer"
+          },
+          "avg_pages": {
+            "title": "Avg Pages",
+            "type": "number"
+          },
+          "completed": {
+            "title": "Completed",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "runs": {
+            "title": "Runs",
+            "type": "integer"
+          },
+          "t": {
+            "format": "date-time",
+            "title": "T",
+            "type": "string"
+          }
+        },
+        "required": [
+          "t",
+          "runs",
+          "completed",
+          "failed",
+          "avg_pages",
+          "avg_duration_ms"
+        ],
+        "title": "RunStatsPoint",
+        "type": "object"
+      },
+      "RunStatsTotals": {
+        "description": "The whole-window summary alongside `series` in `GET /websites/{id}/stats`.\n\nField names are `completed`/`failed`, matching `RunStatsPoint` above — not\n`total_completed`/`total_failed` — because they are still counts of completed/failed\nruns, merely summed over the whole window instead of one bucket.",
+        "properties": {
+          "avg_duration_ms": {
+            "title": "Avg Duration Ms",
+            "type": "integer"
+          },
+          "avg_pages": {
+            "title": "Avg Pages",
+            "type": "number"
+          },
+          "completed": {
+            "title": "Completed",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          },
+          "success_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Success Rate"
+          },
+          "total_runs": {
+            "title": "Total Runs",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_runs",
+          "completed",
+          "failed",
+          "success_rate",
+          "avg_duration_ms",
+          "avg_pages",
+          "last_run_at"
+        ],
+        "title": "RunStatsTotals",
+        "type": "object"
+      },
       "ScheduleResponse": {
         "description": "One website's schedule, as both schedules endpoints return it.\n\n**`auto_publish` MUST NOT appear here, in either direction.** The column is reserved and\nunused in this milestone (its comment in `db/schema.prisma` says so directly): no code\nreads or writes it yet, and it exists only so that turning on publish-on-success later is\na behaviour change rather than a migration on a table the cron tick is actively scanning.\nExposing it now — even read-only — would let a client start depending on a value nothing\nin this system ever sets to anything but its default, and would give this API two things\nto keep in sync the day `auto_publish` does become real.\n\n`interval_minutes` here is a plain `int`, **not** `ScheduleIntervalMinutes`. The allowlist\non the request is an input guardrail — \"these are the presets this product offers right\nnow\" — and the ticket that defined it notes arbitrary intervals may be allowed later\nwithout a migration. A response model that re-validated the same allowlist on the way out\nwould turn any row outside it (a legacy value, a hand-seeded row, a future relaxation that\nships before this model is updated) into a `500` on a plain `GET` — the read path failing\nfor a reason that has nothing to do with reading.\n\n`last_run_at` **is** exposed, read-only. It is not one of the two knobs\n`UpsertScheduleRequest` accepts, and this API never writes it — only the cron tick and the\nrun pipeline (neither built yet) ever will. Surfacing it here is what lets a settings page\nshow \"last ran 3 hours ago\" without a second endpoint.",
         "properties": {
@@ -689,6 +788,46 @@
           "created_at"
         ],
         "title": "WebsiteResponse",
+        "type": "object"
+      },
+      "WebsiteStatsResponse": {
+        "description": "The full body of `GET /websites/{id}/stats`.\n\n`window` and `bucket` echo the request back (`bucket` is derived from `window`, never\nsupplied by the caller — see `internals/stats_window.resolve_window`), so a client that\nonly stores the response still knows what it is looking at.",
+        "properties": {
+          "bucket": {
+            "enum": [
+              "hour",
+              "day"
+            ],
+            "title": "Bucket",
+            "type": "string"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/RunStatsPoint"
+            },
+            "title": "Series",
+            "type": "array"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/RunStatsTotals"
+          },
+          "window": {
+            "enum": [
+              "7d",
+              "30d",
+              "90d"
+            ],
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "window",
+          "bucket",
+          "series",
+          "totals"
+        ],
+        "title": "WebsiteStatsResponse",
         "type": "object"
       }
     },
@@ -1199,6 +1338,72 @@
         "summary": "Upsert Schedule",
         "tags": [
           "schedules"
+        ]
+      }
+    },
+    "/websites/{id}/stats": {
+      "get": {
+        "description": "Return one website's run statistics over `window`, bucketed and zero-filled, plus a\nwhole-window summary. Any signed-in user, any website.\n\nNot filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to\nrequire authentication and is intentionally not passed to the service. `404` if `id`\nnames no website; an unrecognized `window` is a native `422` (`StatsWindowName` is a\n`Literal`, so FastAPI rejects it before this handler runs).\n\nThe path parameter is `id`, not `website_id`, matching `list_runs` above\n(ARCHITECTURE.md §10.3).",
+        "operationId": "get_website_stats_websites__id__stats_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "30d",
+              "description": "Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422.",
+              "enum": [
+                "7d",
+                "30d",
+                "90d"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsiteStatsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Website Stats",
+        "tags": [
+          "runs"
         ]
       }
     }

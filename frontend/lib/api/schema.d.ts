@@ -209,6 +209,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/websites/{id}/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Website Stats
+         * @description Return one website's run statistics over `window`, bucketed and zero-filled, plus a
+         *     whole-window summary. Any signed-in user, any website.
+         *
+         *     Not filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to
+         *     require authentication and is intentionally not passed to the service. `404` if `id`
+         *     names no website; an unrecognized `window` is a native `422` (`StatsWindowName` is a
+         *     `Literal`, so FastAPI rejects it before this handler runs).
+         *
+         *     The path parameter is `id`, not `website_id`, matching `list_runs` above
+         *     (ARCHITECTURE.md §10.3).
+         */
+        get: operations["get_website_stats_websites__id__stats_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -399,6 +428,57 @@ export interface components {
              * Format: uuid
              */
             website_id: string;
+        };
+        /**
+         * RunStatsPoint
+         * @description One bucket of `GET /websites/{id}/stats`'s `series`.
+         *
+         *     Every bucket in the requested window appears exactly once, in order — including buckets
+         *     with zero runs, which report zeroes rather than being omitted (`RunsReader.
+         *     website_stats`'s `_WEBSITE_STATS` zero-fills them with `generate_series`). `avg_pages`
+         *     and `avg_duration_ms` are therefore never `null`: see `service.py`'s `_to_stats` for the
+         *     rounding that turns SQL's already-zero-filled averages into these two fields.
+         */
+        RunStatsPoint: {
+            /** Avg Duration Ms */
+            avg_duration_ms: number;
+            /** Avg Pages */
+            avg_pages: number;
+            /** Completed */
+            completed: number;
+            /** Failed */
+            failed: number;
+            /** Runs */
+            runs: number;
+            /**
+             * T
+             * Format: date-time
+             */
+            t: string;
+        };
+        /**
+         * RunStatsTotals
+         * @description The whole-window summary alongside `series` in `GET /websites/{id}/stats`.
+         *
+         *     Field names are `completed`/`failed`, matching `RunStatsPoint` above — not
+         *     `total_completed`/`total_failed` — because they are still counts of completed/failed
+         *     runs, merely summed over the whole window instead of one bucket.
+         */
+        RunStatsTotals: {
+            /** Avg Duration Ms */
+            avg_duration_ms: number;
+            /** Avg Pages */
+            avg_pages: number;
+            /** Completed */
+            completed: number;
+            /** Failed */
+            failed: number;
+            /** Last Run At */
+            last_run_at: string | null;
+            /** Success Rate */
+            success_rate: number | null;
+            /** Total Runs */
+            total_runs: number;
         };
         /**
          * ScheduleResponse
@@ -611,6 +691,29 @@ export interface components {
              * Format: uuid
              */
             user_id: string;
+        };
+        /**
+         * WebsiteStatsResponse
+         * @description The full body of `GET /websites/{id}/stats`.
+         *
+         *     `window` and `bucket` echo the request back (`bucket` is derived from `window`, never
+         *     supplied by the caller — see `internals/stats_window.resolve_window`), so a client that
+         *     only stores the response still knows what it is looking at.
+         */
+        WebsiteStatsResponse: {
+            /**
+             * Bucket
+             * @enum {string}
+             */
+            bucket: "hour" | "day";
+            /** Series */
+            series: components["schemas"]["RunStatsPoint"][];
+            totals: components["schemas"]["RunStatsTotals"];
+            /**
+             * Window
+             * @enum {string}
+             */
+            window: "7d" | "30d" | "90d";
         };
     };
     responses: never;
@@ -897,6 +1000,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ScheduleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_website_stats_websites__id__stats_get: {
+        parameters: {
+            query?: {
+                /** @description Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422. */
+                window?: "7d" | "30d" | "90d";
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebsiteStatsResponse"];
                 };
             };
             /** @description Validation Error */
