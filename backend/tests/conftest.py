@@ -690,17 +690,30 @@ async def seed_schedule(
     active: bool = True,
     interval_minutes: int = 360,
     next_run_at: datetime | None = None,
+    last_run_at: datetime | None = None,
+    auto_publish: bool = False,
 ) -> UUID:
+    """Insert a schedule directly.
+
+    `last_run_at` and `auto_publish` are the two columns `PUT /websites/{id}/schedule`
+    deliberately never writes. Both default to what a freshly created row would hold, and
+    `tests/test_schedules_api.py` sets them explicitly so it can assert afterwards that a
+    write left them exactly as it found them — a helper unable to seed them would make "this
+    API never touches these columns" untestable.
+    """
     schedule_id: UUID = await pool.fetchval(
         """
-        INSERT INTO schedules (website_id, active, interval_minutes, next_run_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO schedules
+            (website_id, active, interval_minutes, next_run_at, last_run_at, auto_publish)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
         """,
         website_id,
         active,
         interval_minutes,
         next_run_at,
+        last_run_at,
+        auto_publish,
     )
     return schedule_id
 

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routers import health, runs, websites
+from app.api.routers import health, runs, schedules, websites
 from app.core.auth.jwks import close_jwks_cache, create_jwks_client, open_jwks_cache
 from app.core.logging import configure_logging
 from app.core.settings import settings
@@ -102,6 +102,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(websites.router)
     app.include_router(runs.router)
+    app.include_router(schedules.router)
     return app
 
 
