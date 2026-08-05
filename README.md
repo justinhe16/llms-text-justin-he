@@ -38,7 +38,7 @@ migrations, and nothing else — at runtime the backend talks to Postgres over a
                        │  │  (web)     │ (worker)   │ │
                        │  └────────────┴────────────┘ │
                        └────────┬─────────────┬───────┘
-                       asyncpg  │             │  job queue
+                  asyncpg/HTTP  │             │  job queue
                                 ▼             ▼
                   ┌───────────────────┐  ┌──────────────┐
                   │  Supabase         │  │  Redis       │
@@ -119,6 +119,10 @@ These are prohibitions, not preferences. They exist because the failure they pre
 production database on a schema that no commit in this repo describes — is slow to notice and
 expensive to unwind. If you want an exception, talk to Justin first; do not take one
 unilaterally.
+
+This restates [`ARCHITECTURE.md` §7](./ARCHITECTURE.md#7-deploy-policy), which is the
+authoritative copy. If the two disagree, that one governs. Never add a deploy rule here
+without adding it there.
 
 - **Merging to `main` with green CI triggers the deploy. That is the only path to
   production.** There is no manual promotion step and no alternate route.

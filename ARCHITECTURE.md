@@ -11,7 +11,15 @@ code. Do not let the two drift.
 
 **Vocabulary.** A **website** is a domain a user has registered for crawling. A **run** is
 one crawl of a website. A run produces an **llms.txt** artifact, stored as the `llms_txt`
-field. Those three nouns are used consistently throughout the codebase.
+field. Those three nouns are used consistently in the database, the API, and the backend —
+tables, columns, routes, services, readers, and writers all say `website` and `run`, never
+`crawl`.
+
+The one deliberate exception is the frontend directory `components/crawls/` (§8.4), which
+groups the user-facing UI for this product area. "Crawl" is a UI-level category name there
+and nowhere else; it is not a schema noun, not a route segment, and not a service name. Do
+not let it leak back into the API or the database — `/websites/{id}/runs` is a run, and the
+table is `runs`.
 
 ---
 
@@ -51,7 +59,7 @@ Four moving parts, three deploy targets:
                        │  │  (web)     │ (worker)   │ │
                        │  └────────────┴────────────┘ │
                        └────────┬─────────────┬───────┘
-                       asyncpg  │             │  job queue
+                  asyncpg/HTTP  │             │  job queue
                                 ▼             ▼
                   ┌───────────────────┐  ┌──────────────┐
                   │  Supabase         │  │  Redis       │
@@ -59,6 +67,10 @@ Four moving parts, three deploy targets:
                   │  Storage          │  └──────────────┘
                   └───────────────────┘
 ```
+
+Postgres is reached over **asyncpg**; Supabase **Auth and Storage are ordinary HTTPS calls**,
+not database traffic. That distinction matters in §5.1: a Storage upload is a network call and
+therefore happens outside any transaction.
 
 | Piece | Runtime | Deployed to | Notes |
 | --- | --- | --- | --- |
@@ -73,7 +85,7 @@ document:
 
 - **The browser never talks to Fly.** All frontend requests go to Next.js route handlers,
   which forward to FastAPI server-side. There is therefore **no CORS configuration
-  anywhere in this repo**, and no ticket should add any.
+  anywhere in this repo**, and none is to be added.
 - **The frontend never talks to Postgres.** Not through Prisma Client, not through the
   Supabase JS client's data APIs, not through a direct connection string. Data reaches the
   browser only by way of FastAPI.
@@ -242,7 +254,10 @@ Ownership is checked with a single shared helper:
 require_owner(resource, user_id)  # raises 403 if resource.user_id != user_id
 ```
 
-It is called as the **first line of the service method**, before any other work:
+It is called **as soon as the resource is in hand, and before any other work** — before any
+mutation, before any transaction is opened, and before any external call. Fetching the
+resource is the only thing allowed to precede it, because you cannot check an owner without
+the row:
 
 ```python
 async def delete_website(self, website_id: UUID, user_id: UUID) -> None:
@@ -255,6 +270,9 @@ async def delete_website(self, website_id: UUID, user_id: UUID) -> None:
 Never scatter ownership checks inline in routers, and never reimplement the comparison. One
 helper, called from services, is what makes "is this endpoint authorized?" answerable by
 reading a single line.
+
+The review test for a write path is mechanical: find the `require_owner` call, and check that
+nothing above it does anything but fetch the resource.
 
 ### 4.3 Where authorization lives
 
@@ -366,14 +384,26 @@ These are prohibitions, not preferences.
   whatever happens to be in your working tree, and can leave production running against a
   migration revision that does not exist in the repo. The same applies to `vercel --prod`
   and to any other manual push of a build artifact.
+- **Never deploy from a feature branch.** Deploys come from `main`.
 - **Migrations run in a GitHub Actions job _before_ the Fly deploy.** A failed migration
   aborts the deploy. Application code therefore never lands ahead of the schema it needs.
+- **Never apply a schema _or data_ change to production by hand**, through any channel —
+  `psql`, the Supabase SQL editor, a one-off script, a Python shell on a Fly machine. The
+  only way a change reaches the production database is a reviewed migration committed to
+  this repo and applied by `prisma migrate deploy` in CI (§6). Read-only inspection —
+  `SELECT`, reading logs and config — is fine.
 - **Never deploy a rollback by re-running an old workflow.** Roll forward: revert the commit
   on `main`, let CI deploy the revert. Schema changes are not rolled back by redeploying an
-  older image — they are corrected with a new migration.
+  older image — an old image against a new schema is a second outage. A bad migration is
+  corrected by a new migration.
 
 The ordering is the point. Deploy is `migrate → deploy web → deploy worker`, and every step
 is gated on the one before it.
+
+This policy is restated in [`README.md`](./README.md#deploy-policy) so that it is visible to
+anyone who reads only the README. **This section is the authoritative copy.** If the two ever
+disagree, this one governs, and the README must be corrected to match. A deploy rule must
+never exist only in the README.
 
 ---
 

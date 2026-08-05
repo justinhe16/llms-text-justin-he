@@ -37,8 +37,9 @@ production on a migration revision that no longer exists in the repo.
 multi-tenant**. Read endpoints require a valid JWT and **do not** filter by `user_id` — every
 signed-in user can read every website and every run. Do not "helpfully" add
 `WHERE user_id = $1` to a read query. Writes require a valid JWT **and** ownership, checked
-by `require_owner(resource, user_id)` as the first line of the service method. Non-owners get
-`403`. There is no `tenant_id` in this codebase and no ticket adds one.
+by `require_owner(resource, user_id)` in the service method as soon as the resource is
+fetched — before any mutation, before any transaction, before any external call. Non-owners
+get `403`. There is no `tenant_id` in this codebase and no ticket adds one.
 
 **5. Transactions live in the service layer; writers do not commit.** A service opens an
 async `transaction()` that commits on success and rolls back on any exception. A writer
@@ -118,7 +119,7 @@ same commands, path-filtered by stack.
 - [ ] Every `SELECT` is in the reader; every write is in the writer; the writer does not commit
 - [ ] Router is thin — parse, call one service method, return
 - [ ] Read endpoints do **not** filter by `user_id`
-- [ ] Every write path calls `require_owner(...)` as the first line of the service method
+- [ ] Every write path calls `require_owner(...)` right after fetching the resource, with nothing but the fetch above it
 - [ ] Transactions are opened in the service, and no network call happens inside one
 - [ ] Schema change and its generated migration are committed together, with the SQL read
 - [ ] No new `NEXT_PUBLIC_` variable holds anything sensitive
