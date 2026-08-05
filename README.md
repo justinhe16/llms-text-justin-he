@@ -233,10 +233,100 @@ upstash redis get --db-id <id> \
 
 ---
 
+## CI
+
+Two workflows, one per stack, in [`.github/workflows/`](./.github/workflows). Where they
+overlap with the `Makefile` they run the same commands `make lint` and `make test` run, so a
+green laptop and a green pull request mean the same thing.
+
+| Workflow | Runs when a change touches | What it does |
+| --- | --- | --- |
+| `ci-backend.yml` | `backend/**`, `db/**`, the workflow, the path filter | **lint** — `ruff check`, `ruff format --check`, `mypy`<br>**test** — a real `postgres:16`, migrations applied with `prisma migrate deploy`, then `pytest`<br>**build-check** — boots the app under uvicorn and probes `/health` |
+| `ci-frontend.yml` | `frontend/**`, the workflow, the path filter | **verify** — `tsc --noEmit`, eslint, `next build`, then a rendered-output smoke test |
+
+`db/**` is on the backend list because a schema change must re-run the tests that depend on
+it. Every job runs in parallel; the whole matrix finishes in about three minutes.
+
+The `test` job applies migrations with `prisma migrate deploy` — the command the deploy runs,
+never `prisma db push` — against a throwaway Postgres container, so a migration that cannot
+be applied fails on the pull request that introduces it rather than during a deploy. The
+container's credentials are literals in the workflow. They are not secrets, and they must
+never be replaced with any, least of all `DIRECT_DATABASE_URL`, which points at production.
+
+### The gate jobs
+
+Each workflow ends in a job named after it — `backend-ci` and `frontend-ci` — and **those two
+are the required status checks on `main`**, not the jobs that do the work.
+
+That indirection is the only non-obvious thing here, and it is load-bearing. GitHub's `paths:`
+trigger filter works by not starting the workflow at all, and a workflow that never starts
+never reports a check. A *required* check that never reports blocks the merge forever — so
+filtering at the trigger would leave every docs-only pull request (a README fix, an
+`ARCHITECTURE.md` edit) permanently unmergeable. Instead both workflows start on every pull
+request, the path filter lives in a `changes` job, and the expensive jobs are *skipped* rather
+than never started. The gate job always runs; it treats a skipped job as a pass, a failed or
+cancelled one as a failure, and a `changes` job that is anything but successful as a failure —
+because if the filter itself broke, the skips below it mean nothing.
+
+The cost is one ~10 second job per workflow per pull request. The alternative — a second
+workflow carrying the complementary `paths-ignore` list and a job with the same name that
+exits 0 — costs the same, duplicates every path list, and the day the two copies drift the
+required check either reports twice or not at all.
+
+The filter is [`.github/scripts/changed-paths.sh`](./.github/scripts/changed-paths.sh). It has
+its own test, which both workflows run before trusting it, because a filter that wrongly
+answers "false" skips every real job and leaves a green check on untested code:
+
+```bash
+bash .github/scripts/changed-paths.test.sh
+```
+
+### The rendered-output smoke test
+
+`tsc --noEmit`, eslint and `next build` all pass on a page that renders wrong: a font wiring
+bug that made every page fall back to Times cleared all three. So the frontend job ends by
+starting the production server and loading `/` in headless Chrome, where it measures what the
+browser actually resolved — that both Geist faces load and that `<html>` resolves to the sans
+face rather than a fallback, that the page gradient paints, that a heading is genuinely
+visible (ancestor opacity included, so a page that never hydrates fails instead of shipping
+blank), that the page ignores `prefers-color-scheme: dark`, and that nothing logged an error
+or 404ed.
+
+```bash
+cd frontend && npm run build && npm run smoke
+```
+
+It drives the Chrome already installed on the machine — `puppeteer-core` downloads no
+browser. Set `CHROME_PATH` if yours is somewhere unusual. This is a smoke test and not a
+browser test suite: one page, fourteen assertions, a few seconds. Playwright and end-to-end
+coverage remain out of scope.
+
+### Branch protection
+
+`main` requires the `backend-ci` and `frontend-ci` checks to pass, and requires linear
+history. **This is what makes auto-deploy safe**: the deploy pipeline can ship every commit
+on `main` without a second opinion precisely because nothing reaches `main` without both
+gates green.
+
+Three consequences worth knowing before your first merge:
+
+- **Merge with squash or rebase, never a merge commit.** Linear history forbids merge
+  commits, and the repository's allowed merge methods were narrowed to match — so
+  `gh pr merge <n> --squash`, not `--merge`.
+- **Review approval is deliberately not required.** Pull requests here are opened and merged
+  by automation on the one account that owns the repository, and GitHub refuses a
+  self-approval; requiring one would deadlock every pull request. Code review is a posted
+  review, not a branch protection setting.
+- **Administrators are not forced through the gates.** That is the escape hatch for the day a
+  required check is wedged by something outside this repository. Using it is a decision, not
+  a convenience.
+
+---
+
 ## Deploy
 
-_Forthcoming — filled in by the deploy pipeline ticket, which lands the GitHub Actions
-workflows._
+_Forthcoming — filled in by the deploy pipeline ticket. The CI workflows above already
+exist; what is missing is the workflow that migrates and then deploys on a push to `main`._
 
 The mechanism is forthcoming. **The policy below is not** — it is written now, in full,
 because it constrains how that pipeline gets built.

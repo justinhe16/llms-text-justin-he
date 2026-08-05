@@ -115,8 +115,19 @@ of silently doing nothing. `make setup` first, once per checkout; see README.md 
 the full walkthrough, prerequisites, and troubleshooting. When you add a target to the
 `Makefile`, add it to this list in the same PR.
 
-There is no CI workflow yet; it lands with the CI ticket. Once it exists, it runs the same
-commands, path-filtered by stack.
+CI runs these same commands, path-filtered by stack: `.github/workflows/ci-backend.yml` and
+`.github/workflows/ci-frontend.yml`. Two rules follow from that. **Keep CI and the `Makefile`
+running the same command** — if you change how a check is invoked in one, change the other in
+the same PR, or a green laptop stops meaning a green pull request. And **the required status
+checks on `main` are the `backend-ci` and `frontend-ci` gate jobs, not the jobs that do the
+work** — do not move the path filter into a `paths:` trigger, which would make every
+docs-only PR permanently unmergeable. README.md "CI" explains why in full.
+
+The frontend job ends with a rendered-output smoke test (`cd frontend && npm run smoke`) that
+loads the built page in headless Chrome and measures computed styles. It exists because
+`tsc`, eslint and `next build` all pass on a page that renders wrong. If you change
+`app/layout.tsx` or the font or colour wiring in `app/globals.css`, expect it to have an
+opinion.
 
 ---
 
