@@ -19,7 +19,6 @@ database may legitimately hold other rows, and a `len(body) == 2` assertion woul
 in CI and red on a developer's machine.
 """
 
-import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,7 +26,14 @@ from uuid import UUID, uuid4
 
 import pytest
 from asyncpg import Connection, Pool, UniqueViolationError
-from conftest import TEST_USER_A_ID, TEST_USER_B_ID
+from conftest import (
+    TEST_USER_A_ID,
+    TEST_USER_B_ID,
+    parse,
+    seed_run,
+    seed_schedule,
+    seed_website,
+)
 from fastapi import HTTPException
 from httpx import AsyncClient
 
@@ -39,92 +45,14 @@ from app.features.websites.service import WebsiteService
 
 # A time base for seeded runs. Fixed relative to "now" rather than to a literal date so the
 # rows always sort sensibly against `websites.created_at`, which the database sets itself.
+#
+# Not shared with `tests/test_runs_api.py`'s own `_NOW` — see the seed helpers' section
+# docstring in `conftest.py` for why each suite keeps its own time base.
 _NOW = datetime.now(UTC)
-
-
-async def _seed_website(pool: Pool, user_id: UUID, origin: str, url: str | None = None) -> UUID:
-    """Insert a website directly, bypassing the API.
-
-    Read-path tests seed with SQL on purpose: a test that builds its fixtures by calling
-    `POST /websites` cannot distinguish "the list query is wrong" from "the create endpoint
-    is wrong", and it silently stops testing anything the day create starts failing.
-    """
-    website_id: UUID = await pool.fetchval(
-        "INSERT INTO websites (user_id, url, origin) VALUES ($1, $2, $3) RETURNING id",
-        user_id,
-        url or f"{origin}/",
-        origin,
-    )
-    return website_id
-
-
-async def _seed_run(
-    pool: Pool,
-    website_id: UUID,
-    *,
-    started_at: datetime,
-    status: str = "completed",
-    completed_at: datetime | None = None,
-    stats: dict[str, Any] | str | None = None,
-) -> UUID:
-    """Insert a run directly.
-
-    `stats` is passed as a JSON *string* cast to jsonb: asyncpg encodes and decodes
-    `json`/`jsonb` as `str` and will not accept a Python dict for a jsonb parameter without a
-    custom type codec. It also accepts a raw string, so a test can seed deliberately
-    malformed stats.
-
-    `"trigger"` is quoted because it is a SQL keyword, matching the generated migration.
-    """
-    encoded = json.dumps(stats) if isinstance(stats, dict) else stats
-    run_id: UUID = await pool.fetchval(
-        """
-        INSERT INTO runs (website_id, "trigger", status, started_at, completed_at, stats)
-        VALUES ($1, 'manual'::run_trigger, $2::run_status, $3, $4, $5::jsonb)
-        RETURNING id
-        """,
-        website_id,
-        status,
-        started_at,
-        completed_at,
-        encoded,
-    )
-    return run_id
-
-
-async def _seed_schedule(
-    pool: Pool,
-    website_id: UUID,
-    *,
-    active: bool = True,
-    interval_minutes: int = 360,
-    next_run_at: datetime | None = None,
-) -> UUID:
-    schedule_id: UUID = await pool.fetchval(
-        """
-        INSERT INTO schedules (website_id, active, interval_minutes, next_run_at)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id
-        """,
-        website_id,
-        active,
-        interval_minutes,
-        next_run_at,
-    )
-    return schedule_id
 
 
 def _ids(body: list[dict[str, Any]]) -> list[str]:
     return [item["id"] for item in body]
-
-
-def _parse(timestamp: str) -> datetime:
-    """Parse a timestamp out of a JSON response, for comparison against what was seeded.
-
-    Every column involved is `timestamptz` with microsecond precision, so this round trip is
-    exact — an assertion may compare for equality rather than for approximate closeness.
-    """
-    return datetime.fromisoformat(timestamp)
 
 
 # -----------------------------------------------------------------------------------------
@@ -256,7 +184,7 @@ async def test_losing_the_duplicate_race_produces_the_same_409(
     Driven against `WebsiteService` directly rather than over HTTP, because the thing under
     test is service-layer recovery, and the router adds nothing but a status code here.
     """
-    existing_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://race.example")
+    existing_id = await seed_website(websites_db, TEST_USER_A_ID, "https://race.example")
     _make_the_pre_check_miss_once(monkeypatch)
 
     service = WebsiteService(websites_db)
@@ -295,7 +223,7 @@ async def test_a_unique_violation_on_a_different_constraint_is_not_reported_as_a
     it. Verified by deleting the guard again after this rewrite.) With the row present,
     removing the guard turns this into a 409 and the test goes red.
     """
-    await _seed_website(websites_db, TEST_USER_A_ID, "https://other-constraint.example")
+    await seed_website(websites_db, TEST_USER_A_ID, "https://other-constraint.example")
     _make_the_pre_check_miss_once(monkeypatch)
 
     async def insert_violates_another_constraint(
@@ -357,9 +285,9 @@ async def test_the_list_is_ordered_most_recently_active_first(
     Asserts relative position rather than exact indices: the table may hold rows this suite
     did not create.
     """
-    older = await _seed_website(websites_db, TEST_USER_A_ID, "https://older.example")
-    newer = await _seed_website(websites_db, TEST_USER_A_ID, "https://newer.example")
-    await _seed_run(websites_db, older, started_at=_NOW + timedelta(hours=1))
+    older = await seed_website(websites_db, TEST_USER_A_ID, "https://older.example")
+    newer = await seed_website(websites_db, TEST_USER_A_ID, "https://newer.example")
+    await seed_run(websites_db, older, started_at=_NOW + timedelta(hours=1))
 
     params = {"include": include} if include else {}
     ids = _ids((await user_client.get("/websites", params=params)).json())
@@ -375,9 +303,9 @@ async def test_include_latest_run_folds_in_the_newest_run_and_the_schedule(
     Three runs are seeded out of chronological order so that a query which forgot its
     `ORDER BY started_at DESC` would have to get lucky twice to pass.
     """
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://folded.example")
-    await _seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=2), status="failed")
-    newest = await _seed_run(
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://folded.example")
+    await seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=2), status="failed")
+    newest = await seed_run(
         websites_db,
         website_id,
         started_at=_NOW - timedelta(hours=1),
@@ -385,9 +313,9 @@ async def test_include_latest_run_folds_in_the_newest_run_and_the_schedule(
         status="completed",
         stats={"pages_crawled": 42, "duration_ms": 1234},
     )
-    await _seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1), status="failed")
+    await seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1), status="failed")
     next_run_at = _NOW + timedelta(hours=5)
-    await _seed_schedule(
+    await seed_schedule(
         websites_db, website_id, active=True, interval_minutes=360, next_run_at=next_run_at
     )
 
@@ -397,21 +325,21 @@ async def test_include_latest_run_folds_in_the_newest_run_and_the_schedule(
     assert item["latest_run"]["id"] == str(newest)
     assert item["latest_run"]["status"] == "completed"
     assert item["latest_run"]["pages_crawled"] == 42
-    assert _parse(item["latest_run"]["started_at"]) == _NOW - timedelta(hours=1)
-    assert _parse(item["latest_run"]["completed_at"]) == _NOW - timedelta(minutes=50)
+    assert parse(item["latest_run"]["started_at"]) == _NOW - timedelta(hours=1)
+    assert parse(item["latest_run"]["completed_at"]) == _NOW - timedelta(minutes=50)
 
     # Each field against the value that was seeded. A dict comparison that fills the
     # timestamp in from the response itself (`"next_run_at": item[...]["next_run_at"]`)
     # reads like an assertion but compares that field to itself and can never fail.
     assert item["schedule"]["active"] is True
     assert item["schedule"]["interval_minutes"] == 360
-    assert _parse(item["schedule"]["next_run_at"]) == next_run_at
+    assert parse(item["schedule"]["next_run_at"]) == next_run_at
 
 
 async def test_a_website_with_no_run_or_schedule_folds_to_nulls(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://bare.example")
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://bare.example")
 
     body = (await user_client.get("/websites", params={"include": "latest_run"})).json()
     item = next(entry for entry in body if entry["id"] == str(website_id))
@@ -423,8 +351,8 @@ async def test_a_website_with_no_run_or_schedule_folds_to_nulls(
 async def test_the_fold_is_null_without_include(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://unfolded.example")
-    await _seed_run(websites_db, website_id, started_at=_NOW, stats={"pages_crawled": 7})
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://unfolded.example")
+    await seed_run(websites_db, website_id, started_at=_NOW, stats={"pages_crawled": 7})
 
     body = (await user_client.get("/websites")).json()
     item = next(entry for entry in body if entry["id"] == str(website_id))
@@ -451,8 +379,8 @@ async def test_malformed_stats_yield_a_null_page_count_rather_than_a_500(
     One row with an unexpected `pages_crawled` must not take down the list endpoint for
     every website.
     """
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://weird-stats.example")
-    await _seed_run(websites_db, website_id, started_at=_NOW, stats=stats)
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://weird-stats.example")
+    await seed_run(websites_db, website_id, started_at=_NOW, stats=stats)
 
     response = await user_client.get("/websites", params={"include": "latest_run"})
 
@@ -465,8 +393,8 @@ async def test_a_fractional_page_count_is_truncated_rather_than_raising(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     """`jsonb_typeof` calls 12.5 a number, and `'12.5'::bigint` raises. Hence `::numeric`."""
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://fractional.example")
-    await _seed_run(websites_db, website_id, started_at=_NOW, stats='{"pages_crawled": 12.5}')
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://fractional.example")
+    await seed_run(websites_db, website_id, started_at=_NOW, stats='{"pages_crawled": 12.5}')
 
     response = await user_client.get("/websites", params={"include": "latest_run"})
 
@@ -530,12 +458,12 @@ async def test_the_latest_run_fold_costs_one_query_regardless_of_row_count(
     complexity rather than about a particular fixture size.
     """
     for index in range(website_count):
-        website_id = await _seed_website(
+        website_id = await seed_website(
             websites_db, TEST_USER_A_ID, f"https://n-plus-one-{index}.example"
         )
-        await _seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1))
-        await _seed_run(websites_db, website_id, started_at=_NOW)
-        await _seed_schedule(websites_db, website_id)
+        await seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1))
+        await seed_run(websites_db, website_id, started_at=_NOW)
+        await seed_schedule(websites_db, website_id)
 
     reader, handle = counting_reader
     rows = await reader.list_all_with_latest_run()
@@ -587,10 +515,10 @@ async def test_deleting_your_own_website_returns_204_and_cascades(
     The cascade is enforced by the foreign keys, not by application code — which is exactly
     why it is worth a test: nothing in `WebsitesWriter` would fail if the FK were dropped.
     """
-    website_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://cascade.example")
-    await _seed_schedule(websites_db, website_id)
-    await _seed_run(websites_db, website_id, started_at=_NOW)
-    await _seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1))
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://cascade.example")
+    await seed_schedule(websites_db, website_id)
+    await seed_run(websites_db, website_id, started_at=_NOW)
+    await seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1))
 
     response = await user_client.delete(f"/websites/{website_id}")
 
