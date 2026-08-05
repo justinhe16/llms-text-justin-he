@@ -26,11 +26,15 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from asyncpg import Connection, Pool
+from asyncpg import Connection, Pool, UniqueViolationError
 from conftest import TEST_USER_A_ID, TEST_USER_B_ID
+from fastapi import HTTPException
 from httpx import AsyncClient
 
 from app.features.websites.internals.websites_reader import WebsitesReader
+from app.features.websites.internals.websites_writer import WebsitesWriter
+from app.features.websites.schemas import CreateWebsiteRequest
+from app.features.websites.service import WebsiteService
 
 
 # A time base for seeded runs. Fixed relative to "now" rather than to a literal date so the
@@ -112,6 +116,15 @@ async def _seed_schedule(
 
 def _ids(body: list[dict[str, Any]]) -> list[str]:
     return [item["id"] for item in body]
+
+
+def _parse(timestamp: str) -> datetime:
+    """Parse a timestamp out of a JSON response, for comparison against what was seeded.
+
+    Every column involved is `timestamptz` with microsecond precision, so this round trip is
+    exact — an assertion may compare for equality rather than for approximate closeness.
+    """
+    return datetime.fromisoformat(timestamp)
 
 
 # -----------------------------------------------------------------------------------------
@@ -201,6 +214,105 @@ async def test_a_body_without_a_url_is_rejected_with_422(user_client: AsyncClien
     assert (await user_client.post("/websites", json={})).status_code == 422
 
 
+def _make_the_pre_check_miss_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the duplicate pre-check return `None` on its first call only.
+
+    This is the loser of a concurrent create, reproduced deterministically: it looks for an
+    existing origin at the moment the other request has not committed yet, finds nothing,
+    and proceeds to an INSERT that then fails against the real constraint. Every later call
+    — including the re-read inside the `except` branch — sees the database as it really is.
+    """
+    real_lookup = WebsitesReader.get_by_user_and_origin
+    calls = 0
+
+    async def pre_check_misses_once(
+        self: WebsitesReader, user_id: UUID, origin: str
+    ) -> dict[str, Any] | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return await real_lookup(self, user_id, origin)
+
+    monkeypatch.setattr(WebsitesReader, "get_by_user_and_origin", pre_check_misses_once)
+
+
+async def test_losing_the_duplicate_race_produces_the_same_409(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent create that slips past the pre-check must still get the 409 with the id.
+
+    `create_website` checks for an existing origin and then inserts, which is two statements
+    and therefore not atomic: two simultaneous POSTs of the same URL can both find nothing.
+    The database's `UNIQUE (user_id, origin)` index is what actually enforces uniqueness, and
+    the service turns the loser's `UniqueViolationError` back into the same 409 the
+    sequential path returns — so a client cannot tell the two apart.
+
+    That branch is unreachable from the outside without real concurrency, so the race is
+    simulated at its seam: the pre-check returns `None` exactly once, as it would for the
+    loser, while the row genuinely exists in the database. The INSERT then fails for real
+    against the real constraint — the part worth testing is not stubbed.
+
+    Driven against `WebsiteService` directly rather than over HTTP, because the thing under
+    test is service-layer recovery, and the router adds nothing but a status code here.
+    """
+    existing_id = await _seed_website(websites_db, TEST_USER_A_ID, "https://race.example")
+    _make_the_pre_check_miss_once(monkeypatch)
+
+    service = WebsiteService(websites_db)
+    with pytest.raises(HTTPException) as raised:
+        await service.create_website(
+            CreateWebsiteRequest(url="https://race.example/deep/link"), TEST_USER_A_ID
+        )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail["website_id"] == str(existing_id)
+    assert raised.value.detail["code"] == "website_already_exists"
+    # The failed INSERT was rolled back — the race must not leave a second row behind.
+    assert (
+        await websites_db.fetchval(
+            "SELECT count(*) FROM websites WHERE user_id = $1 AND origin = $2",
+            TEST_USER_A_ID,
+            "https://race.example",
+        )
+        == 1
+    )
+
+
+async def test_a_unique_violation_on_a_different_constraint_is_not_reported_as_a_duplicate(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the origin constraint becomes a 409; anything else surfaces as itself.
+
+    Without the constraint-name check, a unique violation added by some later migration
+    would be reported as "you already added this website" and point the frontend at a
+    website id that has nothing to do with the failure.
+
+    **The setup is what makes this test able to fail.** A row with this origin must already
+    exist, and the pre-check must miss it — otherwise the `except` branch's re-read finds
+    nothing, falls through to its own `raise`, and the test passes whether the constraint
+    guard is there or not. (It was written that way first; deleting the guard did not fail
+    it. Verified by deleting the guard again after this rewrite.) With the row present,
+    removing the guard turns this into a 409 and the test goes red.
+    """
+    await _seed_website(websites_db, TEST_USER_A_ID, "https://other-constraint.example")
+    _make_the_pre_check_miss_once(monkeypatch)
+
+    async def insert_violates_another_constraint(
+        self: WebsitesWriter, user_id: UUID, url: str, origin: str
+    ) -> dict[str, Any]:
+        # `constraint_name` is None here, which is precisely "not the origin index".
+        raise UniqueViolationError("duplicate key value violates some other unique constraint")
+
+    monkeypatch.setattr(WebsitesWriter, "insert", insert_violates_another_constraint)
+
+    service = WebsiteService(websites_db)
+    with pytest.raises(UniqueViolationError):
+        await service.create_website(
+            CreateWebsiteRequest(url="https://other-constraint.example"), TEST_USER_A_ID
+        )
+
+
 # -----------------------------------------------------------------------------------------
 # GET /websites
 # -----------------------------------------------------------------------------------------
@@ -231,10 +343,16 @@ async def test_listing_returns_other_users_websites(
     assert listed_theirs["user_id"] == str(TEST_USER_B_ID)
 
 
+@pytest.mark.parametrize("include", [None, "latest_run"], ids=["plain", "with-fold"])
 async def test_the_list_is_ordered_most_recently_active_first(
-    user_client: AsyncClient, websites_db: Pool
+    user_client: AsyncClient, websites_db: Pool, include: str | None
 ) -> None:
     """A website that ran recently sorts above one added later that has never run.
+
+    Run for both list queries, because they are two separate SQL statements that share one
+    `_ACTIVITY_ORDER` constant: asking for the fold must change what a row *contains*, never
+    what order rows arrive in. Only checking the plain list would leave the other query's
+    ordering unverified the day someone edits it.
 
     Asserts relative position rather than exact indices: the table may hold rows this suite
     did not create.
@@ -243,8 +361,8 @@ async def test_the_list_is_ordered_most_recently_active_first(
     newer = await _seed_website(websites_db, TEST_USER_A_ID, "https://newer.example")
     await _seed_run(websites_db, older, started_at=_NOW + timedelta(hours=1))
 
-    body = (await user_client.get("/websites")).json()
-    ids = _ids(body)
+    params = {"include": include} if include else {}
+    ids = _ids((await user_client.get("/websites", params=params)).json())
 
     assert ids.index(str(older)) < ids.index(str(newer))
 
@@ -268,12 +386,9 @@ async def test_include_latest_run_folds_in_the_newest_run_and_the_schedule(
         stats={"pages_crawled": 42, "duration_ms": 1234},
     )
     await _seed_run(websites_db, website_id, started_at=_NOW - timedelta(days=1), status="failed")
+    next_run_at = _NOW + timedelta(hours=5)
     await _seed_schedule(
-        websites_db,
-        website_id,
-        active=True,
-        interval_minutes=360,
-        next_run_at=_NOW + timedelta(hours=5),
+        websites_db, website_id, active=True, interval_minutes=360, next_run_at=next_run_at
     )
 
     body = (await user_client.get("/websites", params={"include": "latest_run"})).json()
@@ -282,12 +397,15 @@ async def test_include_latest_run_folds_in_the_newest_run_and_the_schedule(
     assert item["latest_run"]["id"] == str(newest)
     assert item["latest_run"]["status"] == "completed"
     assert item["latest_run"]["pages_crawled"] == 42
-    assert item["latest_run"]["completed_at"] is not None
-    assert item["schedule"] == {
-        "active": True,
-        "interval_minutes": 360,
-        "next_run_at": item["schedule"]["next_run_at"],
-    }
+    assert _parse(item["latest_run"]["started_at"]) == _NOW - timedelta(hours=1)
+    assert _parse(item["latest_run"]["completed_at"]) == _NOW - timedelta(minutes=50)
+
+    # Each field against the value that was seeded. A dict comparison that fills the
+    # timestamp in from the response itself (`"next_run_at": item[...]["next_run_at"]`)
+    # reads like an assertion but compares that field to itself and can never fail.
+    assert item["schedule"]["active"] is True
+    assert item["schedule"]["interval_minutes"] == 360
+    assert _parse(item["schedule"]["next_run_at"]) == next_run_at
 
 
 async def test_a_website_with_no_run_or_schedule_folds_to_nulls(

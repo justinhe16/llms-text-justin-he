@@ -25,9 +25,9 @@ absolute `http`/`https` URL and what its origin is. Reachability is the crawler'
 | `https://EXAMPLE.com` | `https://example.com` | Host is case-insensitive (RFC 3986 §3.2.2) |
 | `https://example.com:443` | `https://example.com` | Default port for the scheme is redundant |
 | `http://example.com:80` | `http://example.com` | Same, for `http` |
-| `https://example.com:8443` | `https://example.com:8443` | A non-default port is part of the identity |
-| `https://example.com/a/b/` | `https://example.com` | An origin has no path — trailing slash included |
-| `https://example.com?q=1#f` | `https://example.com` | Query and fragment are per-request, not per-site |
+| `https://example.com:8443` | `https://example.com:8443` | A non-default port is identity |
+| `https://example.com/a/b/` | `https://example.com` | An origin has no path, slash included |
+| `https://example.com?q=1#f` | `https://example.com` | Query and fragment are per-request |
 | `https://www.example.com` | `https://www.example.com` | **`www.` is KEPT** — see below |
 
 **Why `www.` is kept.** It is tempting to strip it so that `www.example.com` and
