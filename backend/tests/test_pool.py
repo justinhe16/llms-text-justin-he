@@ -110,3 +110,32 @@ def test_get_pool_before_open_pool_raises_a_clear_error() -> None:
 
     with pytest.raises(RuntimeError, match="open_pool"):
         pool_module.get_pool()
+
+
+async def test_open_pool_twice_raises_instead_of_leaking_the_first_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second open_pool() must fail loudly rather than silently orphan the first pool.
+
+    Overwriting the singleton would leave the first pool's connections checked out against
+    Postgres for the life of the process, with nothing referencing them to close. The
+    realistic way that happens is a worker entrypoint copy-pasted from app.main.
+    """
+    pool_module._pool = None
+
+    async def fake_create_pool(**_: object) -> object:
+        return object()
+
+    monkeypatch.setattr("asyncpg.create_pool", fake_create_pool)
+    settings = _settings("postgresql://app:pw@host:5432/postgres")
+
+    try:
+        first = await pool_module.open_pool(settings)
+
+        with pytest.raises(RuntimeError, match="already open"):
+            await pool_module.open_pool(settings)
+
+        # The original pool is still the one on offer — it was not swapped out.
+        assert pool_module.get_pool() is first
+    finally:
+        pool_module._pool = None

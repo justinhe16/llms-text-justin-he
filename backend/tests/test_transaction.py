@@ -6,6 +6,7 @@ asserts it was never written), so these tests can run in any order without one p
 because of another's leftover data.
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -74,4 +75,36 @@ async def test_http_exception_propagates_with_status_and_rolls_back(db_pool: Poo
             raise HTTPException(status_code=409, detail="conflict")
 
     assert exc_info.value.status_code == 409
+    assert not await _row_exists(db_pool, key)
+
+
+async def test_transaction_rolls_back_when_the_caller_is_cancelled(db_pool: Pool) -> None:
+    """Cancellation is an exception too, and must roll back like any other.
+
+    `transaction()` documents rollback on ANY exception, and `asyncio.CancelledError` is
+    the one that arrives without anybody raising it — a client disconnecting mid-request,
+    or a shutdown cancelling in-flight work. It inherits from `BaseException`, not
+    `Exception`, so a handler written in terms of `Exception` would miss it entirely;
+    this asserts the guarantee holds rather than leaving it to inspection.
+    """
+    key = f"cancelled-{uuid.uuid4()}"
+    started = asyncio.Event()
+
+    async def unit_of_work() -> None:
+        async with transaction(db_pool) as conn:
+            await conn.execute(
+                f"INSERT INTO {_SCRATCH_TABLE} (key, value) VALUES ($1, $2)",
+                key,
+                "should-not-land",
+            )
+            started.set()
+            await asyncio.sleep(30)  # cancelled below, mid-transaction
+
+    task = asyncio.create_task(unit_of_work())
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
     assert not await _row_exists(db_pool, key)

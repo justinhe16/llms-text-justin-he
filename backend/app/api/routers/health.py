@@ -25,9 +25,10 @@ _DB_CHECK_TIMEOUT_SECONDS = 1.0
 class HealthResponse(BaseModel):
     """Response body for `GET /health`.
 
-    This DTO lives beside its route rather than in `app/features/`: health is an
-    operational endpoint with no data access, not a product feature with a service, a
-    reader, and a writer.
+    This DTO lives beside its route rather than in `app/features/` because health is an
+    operational endpoint, not a product feature with a service, a reader, and a writer.
+    It does touch Postgres — a bounded `SELECT 1`, see `_check_db` — but that is a
+    liveness probe rather than data access, which is why it has no repository behind it.
 
     `db` is required, never absent, because the check that produces it always runs —
     there is no code path that returns this response without having attempted it.
@@ -44,9 +45,16 @@ def _discard_outcome(probe: asyncio.Task[Any]) -> None:
     Without this callback, a probe that fails (rather than observing its cancellation)
     would surface as a bare "Task exception was never retrieved" traceback at an
     unpredictable later moment, with no indication it came from a health check.
+
+    An abandoned probe that resolves with a real Postgres error rather than its own
+    cancellation is saying something more specific than "timed out", so it is logged at
+    debug rather than dropped silently — without the DSN, as everywhere else.
     """
-    if not probe.cancelled():
-        probe.exception()
+    if probe.cancelled():
+        return
+    error = probe.exception()
+    if error is not None:
+        logger.debug("Health check: abandoned probe finished with %s", type(error).__name__)
 
 
 async def _check_db(pool: Pool) -> Literal["ok", "error", "timeout"]:

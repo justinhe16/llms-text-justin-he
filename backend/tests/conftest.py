@@ -24,6 +24,11 @@ from httpx import ASGITransport, AsyncClient
 # specific settings-backed values opens a real connection — the database fixtures below
 # deliberately use a *different* variable (TEST_DATABASE_URL) for that. The suite decides
 # what app.core.settings sees; the surrounding environment does not.
+#
+# Captured before the override, because CI hands the suite a real, throwaway Postgres in
+# DATABASE_URL — see TEST_DATABASE_URL below.
+_ambient_database_url = os.environ.get("DATABASE_URL", "")
+
 os.environ["ENVIRONMENT"] = "development"
 os.environ["DATABASE_URL"] = "postgresql://localhost:5432/llms_text_test"
 os.environ["REDIS_URL"] = "redis://localhost:6379/0"
@@ -33,13 +38,28 @@ os.environ["SUPABASE_SECRET_KEY"] = "not-a-real-key"
 from app.main import app  # noqa: E402  — must follow the assignments above
 
 
-# A variable distinct from DATABASE_URL above, read from the real environment rather than
-# overwritten with a non-value. That separation is what lets DATABASE_URL's isolation
-# stay absolute — app.core.settings never sees a real database — while still giving the
-# fixtures below a real Postgres to run database-backed tests against. `make test` sets
-# this from the local Supabase stack (see Makefile and scripts/local-env.sh); export it
-# yourself to run these tests with `pytest` directly.
-TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+# Which real Postgres the database-backed fixtures below connect to. Kept distinct from
+# DATABASE_URL above so that isolation stays absolute — app.core.settings never sees a
+# real database — while these fixtures still get something real to run against.
+#
+# Resolution order:
+#   1. TEST_DATABASE_URL, set explicitly. `make test` fills it in from the local Supabase
+#      stack (see the Makefile and scripts/local-env.sh); export it yourself to run these
+#      tests with a bare `pytest`.
+#   2. In CI only, the ambient DATABASE_URL. .github/workflows/ci-backend.yml stands up a
+#      `postgres:16` service container and points DATABASE_URL at it, and without this the
+#      database-backed tests would silently *skip* in CI — a green required check over
+#      commit/rollback guarantees that were never actually exercised.
+#   3. Nothing, in which case those tests skip with a message saying how to enable them.
+#
+# Step 2 is deliberately gated on CI rather than always falling back. Locally, an exported
+# DATABASE_URL is plausibly a real database someone cares about, and these fixtures CREATE
+# and DROP a table; in CI it is a container that is destroyed with the job. The gate is
+# what keeps "run the tests" from ever meaning "write to the database I happen to have
+# exported".
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or (
+    _ambient_database_url if os.environ.get("CI") else ""
+)
 
 # An obviously test-only name for the scratch table tests/test_transaction.py reads and
 # writes. Created and dropped by the db_pool fixture below.
