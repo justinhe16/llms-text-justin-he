@@ -1,0 +1,31 @@
+# EditorConfig — https://editorconfig.org
+# Shared formatting baseline for both stacks. Language formatters (ruff for
+# Python, prettier for TypeScript) are the enforcers; this file keeps editors
+# from fighting them before the formatter runs.
+
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,css,yml,yaml}]
+indent_size = 2
+
+[*.prisma]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+[*.md]
+# Two trailing spaces are a hard line break in Markdown — do not strip them.
+trim_trailing_whitespace = false

@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# Secrets — see the "Secrets Hygiene" section of ARCHITECTURE.md.
+# Real secret values are NEVER committed to this repo, at any point in history.
+# `.env.example` is deliberately NOT ignored: it carries placeholders only.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+service-account*.json
+
+# ---------------------------------------------------------------------------
+# Python — backend/
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# ---------------------------------------------------------------------------
+# Node / Next.js — frontend/ and db/
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+.turbo/
+.vercel/
+next-env.d.ts
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+.fly/
+supabase/.temp/
+supabase/.branches/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
