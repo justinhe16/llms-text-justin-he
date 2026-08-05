@@ -169,6 +169,16 @@ on your own machine, nothing reachable from outside it. **Local sign-in is email
 only.** GitHub OAuth is configured and verified against the production Supabase project;
 it is deliberately left disabled in `supabase/config.toml` for local development.
 
+The frontend reads its Supabase configuration from `frontend/.env.local`, which `make dev`
+generates from the running local stack (`scripts/local-env.sh write-frontend-env`); the
+file is gitignored, and this generation step never overwrites one you have already edited
+by hand. If you run `npm --prefix frontend run dev` directly instead of going through
+`make dev`, run `scripts/local-env.sh write-frontend-env` first, or the frontend's
+Supabase client will throw on its first use. Because GitHub OAuth is disabled locally
+(`[auth.external.github] enabled = false` above), sign in during local development with
+the email/password form rendered on `/` — it only appears in development builds, and it
+signs in as the seeded test user in the table above.
+
 ### Troubleshooting
 
 **A port this stack needs is already in use.** Local Supabase uses 54321 (API/Auth/
