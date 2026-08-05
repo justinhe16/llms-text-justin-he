@@ -59,3 +59,10 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+.vercel
+.env*
+!.env.example
+
+# Agent skills installed locally (upstash/skills et al) — machine-local, not project config
+.agents/
+skills-lock.json

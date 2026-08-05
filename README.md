@@ -105,6 +105,60 @@ Two rules apply now and are not negotiable later:
 
 ---
 
+## Infrastructure
+
+One production environment; no staging. Everything below is provisioned.
+
+| Service | Resource | Purpose |
+| --- | --- | --- |
+| Supabase | `iulfhmykutevtrgcaiec` · us-west-1 | Postgres, GitHub OAuth, private `crawl-payloads` bucket |
+| Upstash | `llms-txt-prod` · us-west-1 | Redis backing the ARQ job queue |
+| Fly.io | `llms-text-justin-he` · org `personal` | FastAPI API + ARQ worker |
+| Vercel | `llms-text-justin-he` · scope `justinhe16s-projects` | Next.js frontend, root directory `frontend/` |
+
+### Where each credential lives
+
+No credential is stored in this repo. Each one lives in exactly one place:
+
+| Name | Stored in | Where it comes from |
+| --- | --- | --- |
+| `DATABASE_URL` | Fly secrets | Supabase → Settings → Database → **Session pooler** |
+| `REDIS_URL` | Fly secrets | `upstash redis get --db-id <id>` |
+| `SUPABASE_URL` | Fly secrets, Vercel env | Supabase → Settings → API → Project URL |
+| `SUPABASE_SECRET_KEY` | Fly secrets | Supabase → Settings → API → secret key |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Vercel env | Supabase → Settings → API → publishable key |
+| `API_URL` | Vercel env | `https://llms-text-justin-he.fly.dev` |
+| `FLY_API_TOKEN` | GitHub Actions secrets | `fly tokens create deploy -a llms-text-justin-he` |
+| `DIRECT_DATABASE_URL` | GitHub Actions secrets | The same string as `DATABASE_URL` |
+
+The Fly deploy token is scoped to this app alone, not the whole account.
+
+### Rotating
+
+- **Supabase keys** — regenerate in the dashboard, then update Fly secrets and Vercel env
+- **Redis** — `upstash redis reset-password --db-id <id>`, then re-set `REDIS_URL`
+- **Fly token** — `fly tokens revoke <id>`, re-create, `gh secret set FLY_API_TOKEN`
+
+Retrieve and pipe in one step so the value never lands in a file or your shell history:
+
+```bash
+upstash redis get --db-id <id> \
+  | jq -r '"rediss://default:\(.password)@\(.endpoint):\(.port)"' \
+  | xargs -I{} fly secrets set REDIS_URL={} --app llms-text-justin-he
+```
+
+### Three things that will trip you up
+
+1. **Use the Supabase session pooler on port 5432.** Not the direct connection (IPv6-only —
+   GitHub runners can't reach it, and it's what makes Supabase offer a paid IPv4 add-on you
+   don't need), and not port 6543 (transaction mode breaks asyncpg's prepared statements).
+2. **The Vercel CLI defaults to the `dori` scope on this machine.** Every `vercel` command
+   touching this project needs `--scope justinhe16s-projects`, or you'll modify the wrong team.
+3. **Fly secrets read `Staged` until the first deploy.** That's expected — they were set with
+   `--stage` and the app has no machines yet. CI's first deploy applies them.
+
+---
+
 ## Deploy
 
 _Forthcoming — filled in by the deploy pipeline ticket, which lands the GitHub Actions
