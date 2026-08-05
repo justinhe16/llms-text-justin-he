@@ -95,7 +95,7 @@ document:
 ## 2. Repo layout
 
 ```
-llms-text/
+llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)

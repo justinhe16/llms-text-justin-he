@@ -48,7 +48,7 @@ migrations, and nothing else — at runtime the backend talks to Postgres over a
 ```
 
 ```
-llms-text/
+llms-text-justin-he/
 ├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
 ├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
 ├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
