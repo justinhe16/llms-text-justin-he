@@ -281,12 +281,19 @@ async def test_a_flood_of_unknown_kids_refetches_once_per_window(
 async def test_a_concurrent_burst_of_unknown_kid_lookups_refetches_once(
     jwks_server: _JwksServer, fake_clock: _FakeClock
 ) -> None:
-    """MEASURED (concurrency): the double-checked lock, not just the timestamp check,
-    is what keeps a burst arriving in the same instant to a single refetch.
+    """MEASURED (concurrency): a burst arriving in the same instant still costs one refetch.
+
+    What actually holds this invariant is `_last_refetch_at` being set *before* the `await`
+    that fetches: the window check and that assignment have no suspension point between
+    them, so on a single-threaded event loop they are atomic and the losing coroutines see
+    a closed window. Verified by mutation — removing `async with self._lock:` leaves this
+    test passing, so it does NOT prove the lock is load-bearing, and this docstring
+    deliberately no longer claims it does. The lock earns its place in the sibling test
+    below (`..._for_a_rotated_kid_all_get_the_new_key`), which does fail without it.
 
     Meaningful only because `_JwksServer.handle()` suspends with `await asyncio.sleep(0)`
     — without that, an `asyncio.gather` burst would run to completion one coroutine at a
-    time on a single-threaded event loop, and this would pass even with the lock removed.
+    time and this would be vacuous.
     """
     cache = JwksCache(jwks_server.client, _JWKS_URL, clock=fake_clock)
     await cache.refresh()
@@ -301,10 +308,14 @@ async def test_a_concurrent_burst_of_unknown_kid_lookups_refetches_once(
 async def test_a_concurrent_burst_for_a_rotated_kid_all_get_the_new_key(
     jwks_server: _JwksServer, fake_clock: _FakeClock, rotated_key: _SigningKey
 ) -> None:
-    """The double-checked-locking payoff: every caller queued behind the winning refetch
-    finds the new key already in the cache instead of being told "unknown" and refetching
-    again itself — otherwise a rotation would look like an outage to every request but the
-    one that won the race.
+    """MEASURED (concurrency): **this is the test that proves the lock is load-bearing.**
+
+    Every caller queued behind the winning refetch finds the new key already in the cache
+    instead of being told "unknown" and refetching again itself — otherwise a rotation
+    would look like an outage to every request but the one that won the race. Verified by
+    mutation: replacing `async with self._lock:` with `if True:` fails this test (the
+    losers get `None`) while leaving the sibling burst test above green, which is why the
+    lock's justification lives here rather than there.
     """
     cache = JwksCache(jwks_server.client, _JWKS_URL, clock=fake_clock)
     await cache.refresh()
