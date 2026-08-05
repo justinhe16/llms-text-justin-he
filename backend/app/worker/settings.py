@@ -112,10 +112,13 @@ async def close_worker_resources(_ctx: dict[Any, Any]) -> None:
 POLL_DELAY_SECONDS = 5
 
 # Concurrent jobs per worker machine. Crawls are I/O heavy, so the ceiling is memory and
-# the shared Postgres connection budget rather than CPU: at `db_pool_max_size = 10` split
-# across both processes, two concurrent crawls each holding a connection is comfortable
-# and ten would not be. Raise this with the machine size and the pool sizing together, or
-# not at all.
+# Postgres connections rather than CPU.
+#
+# Note what `db_pool_max_size` is NOT: a shared budget. The API and the worker each build
+# their own pool from that one setting, so the number Supabase sees is up to
+# `db_pool_max_size` per process — today up to 20, not 10 — and raising it raises both.
+# That is comfortable at two concurrent crawls and would not be at ten. If crawl
+# concurrency ever grows, the pool sizing needs to become per-process before this does.
 MAX_JOBS = 2
 
 # How long one job may run before arq cancels it. Generous against a crawl measured in

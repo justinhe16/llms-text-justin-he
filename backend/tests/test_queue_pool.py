@@ -23,12 +23,19 @@ from app.worker.jobs import noop
 
 
 @pytest.fixture
-def queue_settings() -> Settings:
+def queue_settings(queue_pool: ArqRedis) -> Settings:
     """Settings pointed at the throwaway test Redis, and at nothing else.
 
     Built explicitly rather than reusing `app.core.settings.settings` so that these tests
     cannot connect anywhere a developer's environment happens to point. The other required
     fields are obvious non-values: nothing here opens a Postgres or Supabase connection.
+
+    **Depends on `queue_pool` purely to inherit its skip.** The tests below open pools of
+    their own and never use the fixture's, but without this they are the only ones in the
+    suite that *fail* rather than skip when Redis is unreachable — which breaks the
+    "`make test` works offline" contract every other fixture in conftest.py keeps. Found
+    the honest way: the local container stopped mid-run and these two went red while
+    everything else skipped politely.
     """
     return Settings(
         database_url="postgresql://localhost:5432/unused-by-this-test",

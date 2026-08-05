@@ -46,10 +46,13 @@ class HealthResponse(BaseModel):
     both. `redis` reports `"error"` when the API booted without a queue connection at all,
     which is a startup outcome the lifespan deliberately allows (see `app.main.lifespan`).
 
-    **Field order is part of the contract.** Pydantic serializes in declaration order, and
-    three separate places assert this body as an exact string: the `build-check` job in
-    ci-backend.yml, the `smoke` job in deploy-backend.yml, and tests/test_health.py.
-    Reordering these fields is a breaking change to all three.
+    **Field order is part of the contract**, because Pydantic serializes in declaration
+    order and two places compare this body as an exact string: the `build-check` job in
+    ci-backend.yml, and the one assertion in tests/test_health.py written against the raw
+    response text for precisely this reason. The rest of that suite compares parsed dicts,
+    which is order-independent, and the `smoke` job in deploy-backend.yml reads `db` and
+    `redis` individually with `jq`, which is too — so neither of those would notice a
+    reorder, and it is worth knowing which layer is actually holding this invariant.
     """
 
     status: Literal["ok", "degraded"]

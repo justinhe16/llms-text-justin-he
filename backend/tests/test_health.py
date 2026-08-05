@@ -79,10 +79,16 @@ async def test_health_reports_ok_when_both_dependencies_are_reachable(
 ) -> None:
     """`GET /health` answers 200 with every field `ok` when both probes succeed.
 
-    The exact body matters beyond this test: the `build-check` job in ci-backend.yml and
-    the `smoke` job in deploy-backend.yml both read this response, and Pydantic serializes
-    in field-declaration order. If this assertion needs updating, those two jobs need
-    updating in the same commit.
+    **Asserts the raw response text, and that is the point of this particular case.**
+    `response.json() == {...}` compares dictionaries, and dict equality in Python is
+    order-independent — so reordering the fields on `HealthResponse` leaves every other
+    assertion in this file green while breaking the `build-check` job in ci-backend.yml,
+    which compares the body to a literal string. Byte equality here is what makes that a
+    local `pytest` failure instead of something CI finds after a push.
+
+    The literal below is the same one `build-check` asserts, character for character
+    (Starlette's `JSONResponse` uses no whitespace separators). If it changes, that job
+    changes in the same commit.
     """
     _override(_FakeOkPool(), _FakeOkRedis())
     try:
@@ -92,6 +98,7 @@ async def test_health_reports_ok_when_both_dependencies_are_reachable(
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "db": "ok", "redis": "ok"}
+    assert response.text == '{"status":"ok","db":"ok","redis":"ok"}'
 
 
 async def test_health_stays_200_and_reports_degraded_when_the_database_fails(
