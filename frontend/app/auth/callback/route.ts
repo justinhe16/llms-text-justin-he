@@ -18,6 +18,14 @@ export async function GET(request: NextRequest) {
   // survives Vercel's load balancer: in production `origin` reflects
   // whatever internal host the request reached Next.js on, which is not
   // necessarily the public host the browser used.
+  //
+  // Trusting x-forwarded-host is only safe because of WHERE this runs. Vercel
+  // sets that header at its edge and overwrites any value a client sent, so it
+  // cannot be attacker-controlled here — and this app deploys nowhere else
+  // (ARCHITECTURE.md §1). Put this behind a reverse proxy that forwards the
+  // client's own x-forwarded-host instead, and the line below turns into a
+  // host-header open redirect: validate against an allow-list of known hosts
+  // before doing that.
   const forwardedHost = request.headers.get("x-forwarded-host");
   const base =
     process.env.NODE_ENV === "development"

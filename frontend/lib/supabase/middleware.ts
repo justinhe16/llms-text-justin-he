@@ -27,7 +27,9 @@ export async function updateSession(
     if (!hasWarnedAboutMissingEnv) {
       hasWarnedAboutMissingEnv = true;
       // Variable names only, never values (ARCHITECTURE.md §9.4). Logged once
-      // per isolate: this is a deploy-wide condition, not a per-request one.
+      // per isolate rather than per request — this is a deploy-wide condition.
+      // Isolates are recycled, so this trims the volume without promising a
+      // single line per deploy.
       console.error(
         `middleware: Supabase is not configured (missing ${missingSupabaseEnvNames().join(", ")}) — ` +
           "every request will be treated as signed out. See frontend/.env.example."
