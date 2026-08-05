@@ -6,7 +6,7 @@ import time
 import pytest
 from httpx import AsyncClient
 
-from app.api.deps import get_db_pool
+from app.api.deps import get_db_pool, get_optional_arq_pool
 from app.api.routers import health as health_router
 from app.main import app
 
@@ -41,16 +41,57 @@ class _FakeHangingPool:
         return 1
 
 
-async def test_health_reports_ok_when_the_database_is_reachable(client: AsyncClient) -> None:
-    """`GET /health` answers 200 with `status: ok` and `db: ok` when `SELECT 1` succeeds."""
-    app.dependency_overrides[get_db_pool] = lambda: _FakeOkPool()
+class _FakeOkRedis:
+    """Stands in for an `ArqRedis` that answers `PING`."""
+
+    async def ping(self) -> bool:
+        return True
+
+
+class _FakeFailingRedis:
+    """Stands in for a Redis that refuses the connection or errors on the command."""
+
+    async def ping(self) -> bool:
+        raise ConnectionError("simulated redis failure")
+
+
+class _FakeHangingRedis:
+    """Stands in for an Upstash instance that has stopped answering rather than refusing."""
+
+    async def ping(self) -> bool:
+        await asyncio.sleep(30)
+        return True
+
+
+def _override(db: object, redis: object | None) -> None:
+    """Point both of `/health`'s dependencies at fakes."""
+    app.dependency_overrides[get_db_pool] = lambda: db
+    app.dependency_overrides[get_optional_arq_pool] = lambda: redis
+
+
+def _clear_overrides() -> None:
+    app.dependency_overrides.pop(get_db_pool, None)
+    app.dependency_overrides.pop(get_optional_arq_pool, None)
+
+
+async def test_health_reports_ok_when_both_dependencies_are_reachable(
+    client: AsyncClient,
+) -> None:
+    """`GET /health` answers 200 with every field `ok` when both probes succeed.
+
+    The exact body matters beyond this test: the `build-check` job in ci-backend.yml and
+    the `smoke` job in deploy-backend.yml both read this response, and Pydantic serializes
+    in field-declaration order. If this assertion needs updating, those two jobs need
+    updating in the same commit.
+    """
+    _override(_FakeOkPool(), _FakeOkRedis())
     try:
         response = await client.get("/health")
     finally:
-        del app.dependency_overrides[get_db_pool]
+        _clear_overrides()
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok"}
+    assert response.json() == {"status": "ok", "db": "ok", "redis": "ok"}
 
 
 async def test_health_stays_200_and_reports_degraded_when_the_database_fails(
@@ -64,14 +105,58 @@ async def test_health_stays_200_and_reports_degraded_when_the_database_fails(
     endpoint, but PER-142's original concern — a check that turns one slow dependency into
     a restart loop — still has to hold).
     """
-    app.dependency_overrides[get_db_pool] = lambda: _FakeFailingPool()
+    _override(_FakeFailingPool(), _FakeOkRedis())
     try:
         response = await client.get("/health")
     finally:
-        del app.dependency_overrides[get_db_pool]
+        _clear_overrides()
 
     assert response.status_code == 200
-    assert response.json() == {"status": "degraded", "db": "error"}
+    assert response.json() == {"status": "degraded", "db": "error", "redis": "ok"}
+
+
+async def test_health_stays_200_when_redis_fails_but_the_database_is_fine(
+    client: AsyncClient,
+) -> None:
+    """A queue outage is reported, never fatal. This is the whole point of the field.
+
+    The API only ever *enqueues* — the worker is the consumer — so an unreachable Redis
+    costs it the ability to start a crawl and nothing else. Every read endpoint still
+    works, so a non-200 here would take a serving API down over a dependency it does not
+    need in order to serve reads, which is precisely the flapping-fleet failure the
+    database case above guards against.
+
+    `status` still says `"degraded"`, because it is. What "non-fatal" buys is the 200, not
+    a flattering summary.
+    """
+    _override(_FakeOkPool(), _FakeFailingRedis())
+    try:
+        response = await client.get("/health")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "degraded", "db": "ok", "redis": "error"}
+
+
+async def test_health_reports_redis_error_when_the_pool_was_never_opened(
+    client: AsyncClient,
+) -> None:
+    """`app.main.lifespan` boots the API even when Redis is unreachable at startup.
+
+    In that state `get_optional_arq_pool` yields `None` rather than raising, and `/health`
+    has to report it like any other unreachable Redis. If resolving that dependency ever
+    became an exception, the endpoint would return 500 in exactly the situation it exists
+    to describe.
+    """
+    _override(_FakeOkPool(), None)
+    try:
+        response = await client.get("/health")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "degraded", "db": "ok", "redis": "error"}
 
 
 async def test_health_returns_within_its_budget_when_the_database_hangs(
@@ -89,18 +174,49 @@ async def test_health_returns_within_its_budget_when_the_database_hangs(
     endpoint returns on the order of its budget rather than waiting for the query.
     """
     budget = 0.05
-    monkeypatch.setattr(health_router, "_DB_CHECK_TIMEOUT_SECONDS", budget)
-    app.dependency_overrides[get_db_pool] = lambda: _FakeHangingPool()
+    monkeypatch.setattr(health_router, "_CHECK_TIMEOUT_SECONDS", budget)
+    _override(_FakeHangingPool(), _FakeOkRedis())
 
     started = time.monotonic()
     try:
         response = await client.get("/health")
     finally:
-        del app.dependency_overrides[get_db_pool]
+        _clear_overrides()
     elapsed = time.monotonic() - started
 
     assert response.status_code == 200
-    assert response.json() == {"status": "degraded", "db": "timeout"}
+    assert response.json() == {"status": "degraded", "db": "timeout", "redis": "ok"}
     # Generous relative to a 0.05s budget, but orders of magnitude below the 30s the fake
     # query would take if the endpoint actually waited for it.
     assert elapsed < 5, f"/health took {elapsed:.2f}s, so it waited on the hung query"
+
+
+async def test_health_returns_within_one_budget_when_both_dependencies_hang(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two probes run concurrently, so a second sick dependency costs no extra time.
+
+    Guards the regression that adding the Redis check most obviously invites: awaiting the
+    two probes one after the other. That version passes every other test in this file and
+    shows up only as `/health` taking two budgets instead of one — which, against a Fly
+    `timeout` set above the endpoint's budget but not above twice it, is the difference
+    between a reported degradation and a restarted machine.
+    """
+    budget = 0.05
+    monkeypatch.setattr(health_router, "_CHECK_TIMEOUT_SECONDS", budget)
+    _override(_FakeHangingPool(), _FakeHangingRedis())
+
+    started = time.monotonic()
+    try:
+        response = await client.get("/health")
+    finally:
+        _clear_overrides()
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "degraded", "db": "timeout", "redis": "timeout"}
+    # Two probes at a 0.05s budget each: serial would be ~0.10s, concurrent ~0.05s. The
+    # threshold sits far above both and far below the 30s either fake would take alone, so
+    # this asserts "did not wait on the hung calls" without being timing-flaky.
+    assert elapsed < 5, f"/health took {elapsed:.2f}s, so it waited on the hung probes"
