@@ -23,19 +23,16 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.features.runs.schemas import RunStatusName
 from app.features.websites.internals.url_normalize import MAX_URL_LENGTH, normalize_url
 
 
-# The four values of the `run_status` Postgres enum (db/schema.prisma). Spelled as a
-# `Literal` rather than `str` so the generated OpenAPI schema tells the frontend what it can
-# actually receive, and so adding a fifth status without updating the consumers fails
-# loudly here instead of leaking an unrecognized string into the UI.
-#
-# THIS IS A TEMPORARY HOME. The runs feature owns this vocabulary and will define it in its
-# own `schemas.py`; this is here because `GET /websites?include=latest_run` needs it first
-# and no feature may import another feature's internals. When the runs ticket lands, move
-# this there and import it — do not leave two copies.
-RunStatusName = Literal["pending", "processing", "completed", "failed"]
+# `RunStatusName` is owned by the runs feature (`app.features.runs.schemas`) and imported
+# from there, not redefined here. `GET /websites?include=latest_run` needs the same
+# vocabulary to type `LatestRunSummary.status` below, and a `schemas.py` -> `schemas.py`
+# import between two features is the one cross-feature import ARCHITECTURE.md §3.1 allows
+# — it prohibits reaching into another feature's `internals/`, not its public DTOs. Do not
+# reintroduce a second copy of this Literal here.
 
 # The accepted values of `GET /websites?include=`. A `Literal` rather than a free `str` so
 # that `?include=latest_runs` is a `422` naming the valid values, instead of being silently

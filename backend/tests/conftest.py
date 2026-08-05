@@ -11,10 +11,12 @@ against the real application.
 """
 
 import asyncio
+import json
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final, NoReturn
 from uuid import UUID
 
@@ -545,3 +547,106 @@ async def second_user_client(
     """
     async with _api_client(api_app, _bearer_headers(es256_key, TEST_USER_B_ID)) as ac:
         yield ac
+
+
+# -----------------------------------------------------------------------------------------
+# Seed helpers, shared by every feature suite that writes fixture rows directly against the
+# test database rather than through the API (see `tests/test_websites_api.py`'s module
+# docstring for why: a test that builds its own fixtures by calling `POST /websites` cannot
+# tell "the list query is wrong" apart from "the create endpoint is wrong").
+#
+# Promoted out of `tests/test_websites_api.py` (PER-155) once a second suite,
+# `tests/test_runs_api.py`, needed the same fixtures. Deliberately NOT promoted alongside
+# them: each suite's own `_NOW` time base, which every seeded timestamp below is relative
+# to — sharing one `_NOW` across suites would make a run seeded by one suite sort relative
+# to a website seeded by the other in a way neither test file controls.
+# -----------------------------------------------------------------------------------------
+
+
+async def seed_website(pool: Pool, user_id: UUID, origin: str, url: str | None = None) -> UUID:
+    """Insert a website directly, bypassing the API. See the section docstring above."""
+    website_id: UUID = await pool.fetchval(
+        "INSERT INTO websites (user_id, url, origin) VALUES ($1, $2, $3) RETURNING id",
+        user_id,
+        url or f"{origin}/",
+        origin,
+    )
+    return website_id
+
+
+async def seed_run(
+    pool: Pool,
+    website_id: UUID,
+    *,
+    started_at: datetime,
+    status: str = "completed",
+    trigger: str = "manual",
+    completed_at: datetime | None = None,
+    stats: dict[str, Any] | str | None = None,
+    llms_txt: str | None = None,
+    storage_path: str | None = None,
+    error: str | None = None,
+) -> UUID:
+    """Insert a run directly.
+
+    `stats` is passed as a JSON *string* cast to jsonb: asyncpg encodes and decodes
+    `json`/`jsonb` as `str` and will not accept a Python dict for a jsonb parameter without a
+    custom type codec. It also accepts a raw string, so a test can seed deliberately
+    malformed stats.
+
+    `"trigger"` is quoted because it is a SQL keyword, matching the generated migration.
+    `llms_txt`, `storage_path`, and `error` default to `None`, matching a run that has not
+    (yet, or ever) recorded them; `tests/test_runs_api.py` passes them explicitly to
+    exercise `RunDetailResponse`.
+    """
+    encoded = json.dumps(stats) if isinstance(stats, dict) else stats
+    run_id: UUID = await pool.fetchval(
+        """
+        INSERT INTO runs
+            (website_id, "trigger", status, started_at, completed_at, stats,
+             llms_txt, storage_path, error)
+        VALUES ($1, $2::run_trigger, $3::run_status, $4, $5, $6::jsonb, $7, $8, $9)
+        RETURNING id
+        """,
+        website_id,
+        trigger,
+        status,
+        started_at,
+        completed_at,
+        encoded,
+        llms_txt,
+        storage_path,
+        error,
+    )
+    return run_id
+
+
+async def seed_schedule(
+    pool: Pool,
+    website_id: UUID,
+    *,
+    active: bool = True,
+    interval_minutes: int = 360,
+    next_run_at: datetime | None = None,
+) -> UUID:
+    schedule_id: UUID = await pool.fetchval(
+        """
+        INSERT INTO schedules (website_id, active, interval_minutes, next_run_at)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+        """,
+        website_id,
+        active,
+        interval_minutes,
+        next_run_at,
+    )
+    return schedule_id
+
+
+def parse(timestamp: str) -> datetime:
+    """Parse a timestamp out of a JSON response, for comparison against what was seeded.
+
+    Every column involved is `timestamptz` with microsecond precision, so this round trip is
+    exact — an assertion may compare for equality rather than for approximate closeness.
+    """
+    return datetime.fromisoformat(timestamp)
