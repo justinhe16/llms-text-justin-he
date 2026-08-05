@@ -4,6 +4,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+import { Providers } from "./providers";
 import "./globals.css";
 
 // Both faces are self-hosted by next/font at build time — the browser makes no
@@ -40,8 +41,10 @@ export default function RootLayout({
     // silently fall back to the browser's default serif.
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
       <body className="bg-app-gradient min-h-screen antialiased">
-        <TooltipProvider>{children}</TooltipProvider>
-        <Toaster />
+        <Providers>
+          <TooltipProvider>{children}</TooltipProvider>
+          <Toaster />
+        </Providers>
       </body>
     </html>
   );

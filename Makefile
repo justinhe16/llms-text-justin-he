@@ -26,7 +26,7 @@ WORKER_MODULE ?= app.worker.settings.WorkerSettings
 export VENV_DIR
 export WORKER_MODULE
 
-.PHONY: help setup dev migrate migrate-apply test lint down reset \
+.PHONY: help setup dev migrate migrate-apply test lint openapi down reset \
         check-python check-docker check-supabase check-venv check-db-deps
 
 help: ## Show this help and exit
@@ -118,12 +118,35 @@ test: check-python check-venv ## Run the backend and frontend test suites
 		echo "frontend: skipped — no frontend/ in this checkout"; \
 	fi
 
-lint: check-python check-venv ## Run ruff + mypy on backend/, eslint + tsc on frontend/
+lint: check-python check-venv ## Run ruff + mypy on backend/, eslint + tsc on frontend/, and the OpenAPI drift checks
 	$(VENV_BIN)/ruff check backend
 	$(VENV_BIN)/ruff format --check backend
 	cd backend && $(VENV_BIN)/mypy app
+	bash scripts/export-openapi.sh --check
 	@if [ -f frontend/package.json ]; then \
-		cd frontend && npm run --if-present lint && npm run --if-present typecheck; \
+		cd frontend && \
+		npm run --if-present lint && \
+		npm run --if-present typecheck && \
+		npm run gen:api && \
+		(git diff --exit-code -- lib/api/schema.d.ts || { \
+			echo "lint: frontend/lib/api/schema.d.ts is out of date with lib/api/openapi.json." >&2; \
+			echo "lint: run 'make openapi' and commit the result." >&2; \
+			exit 1; \
+		}); \
+	else \
+		echo "frontend: skipped — no frontend/ in this checkout"; \
+	fi
+
+# Two commands, deliberately kept in this order: export-openapi.sh always runs and always
+# writes frontend/lib/api/openapi.json, since it needs nothing frontend/ provides; gen:api
+# reads that file back in, so it has to run second and only when frontend/ is buildable at
+# all. `make lint` runs both checks in --check form (never writing) — this is their
+# writing counterpart, and the two Makefile recipes are two calls to the exact same
+# scripts on purpose, not a second implementation of what they check.
+openapi: check-python check-venv ## Regenerate the OpenAPI snapshot and the generated TS client types
+	bash scripts/export-openapi.sh
+	@if [ -f frontend/package.json ]; then \
+		cd frontend && npm run gen:api; \
 	else \
 		echo "frontend: skipped — no frontend/ in this checkout"; \
 	fi

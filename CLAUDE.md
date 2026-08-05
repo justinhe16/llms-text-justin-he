@@ -79,6 +79,8 @@ the services in anticipation of a design that does not exist yet.
 
 ```
 frontend/                       Next.js App Router → Vercel
+frontend/lib/api/               generated OpenAPI types + the typed client — never hand-write a request/response shape
+frontend/lib/query/             React Query key factory, polling rules, and hooks (ARCHITECTURE.md §8.6)
 backend/app/api/routers/        thin HTTP handlers
 backend/app/core/auth/          JWKS cache, JWT verification dependencies, require_owner
 backend/app/features/<name>/    schemas.py, service.py, internals/{<name>_reader,<name>_writer}.py
@@ -108,7 +110,8 @@ make dev           # run Supabase, Redis, the API, worker, and frontend locally
 make migrate       # create a migration from schema.prisma (review the SQL, then commit it)
 make migrate-apply # apply pending migrations to the local database
 make test          # backend and frontend test suites
-make lint          # ruff + mypy for backend, eslint + tsc for frontend
+make lint          # ruff + mypy for backend, eslint + tsc for frontend, OpenAPI drift checks
+make openapi       # regenerate the OpenAPI snapshot and the generated TS client types
 make down          # stop the Supabase and Redis containers
 make reset         # recreate the local database, reseed it, replay Prisma migrations
 ```

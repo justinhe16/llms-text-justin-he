@@ -704,6 +704,68 @@ be regenerated.
 If a dark theme is ever wanted, it is a designed feature with its own ticket — not something
 that accumulates one `dark:` class at a time.
 
+### 8.6 Data fetching
+
+**The generated client is the contract.** `frontend/lib/api/openapi.json` is a checked-in
+snapshot of `app.openapi()` — the same document FastAPI builds from the Pydantic models and
+routes already described in §3 — and `frontend/lib/api/schema.d.ts` is generated from that
+snapshot by `openapi-typescript` (`npm run gen:api`, or `make openapi` for both halves at
+once). No frontend code hand-writes a request or response shape: `frontend/lib/api/fetcher.ts`
+exports a small typed client (`api.get`/`api.post`/`api.put`/`api.delete`) generic over the
+generated `paths` type, and every feature-level helper (`frontend/lib/api/websites.ts`,
+`runs.ts`, `schedules.ts`, `health.ts`) calls through it and re-exports readable aliases of
+`components["schemas"][...]`. Calling a path that does not exist, or getting a parameter or a
+body wrong, is a `tsc` error, not a runtime one.
+
+**The drift check has two halves, enforced separately.** `scripts/export-openapi.sh --check`
+(run in `ci-backend.yml`'s `lint` job, and by `make lint`) re-exports the live schema from
+`app.openapi()` and diffs it against the committed `openapi.json` — this is what catches a
+Pydantic model changing without the snapshot being regenerated. `ci-frontend.yml` separately
+regenerates `schema.d.ts` from the committed `openapi.json` and diffs *that* — this is what
+catches a hand-edit of the generated TypeScript, and it needs no Python and no running
+backend, because it only ever reads the JSON already in the repo. Both checks fail with the
+`make` target that fixes them (`make openapi`) named in the error.
+
+**The query key factory.** `frontend/lib/query/query-keys.ts` is the only place a React
+Query cache key is constructed — `queryKeys.websites.all`, `.list(include?)`,
+`.detail(id)`, the mirroring `queryKeys.runs.all`, `.list(websiteId, options?)`,
+`.detail(id)`, and `queryKeys.schedules.detail(websiteId)` — so that invalidating "every
+website" or "this one website" (or "every run" or "this one run", or "this one website's
+schedule") is a call to a function here rather than an array literal a caller has to get
+byte-for-byte right at every call site. `schedules` has no `.all`/`.list` of its own: a
+schedule is 1:1 with a website and has no independent id anywhere in the API surface, so
+`websiteId` alone is both the scope and the whole key, unlike `runs`, which is genuinely a
+collection per website.
+
+**Polling.** A query polls only while something in its data is still in progress, at
+`ACTIVE_POLL_INTERVAL_MS` (3 seconds), and stops the moment it isn't —
+`frontend/lib/query/polling.ts`'s `pollWhileActive` builds a `refetchInterval` callback from
+a predicate over that query's own data, so "is a run still running" is decided in exactly
+one place regardless of which query asks. `frontend/lib/api/run-status.ts`'s
+`isActiveRunStatus` — an exhaustive `Record` over the `runs.status` enum — is that one
+place, and three call sites currently build a `pollWhileActive` predicate on top of it, one
+per response shape that carries a status: `anyWebsiteHasActiveRun` for the websites list
+(`useWebsites`, `GET /websites?include=latest_run`), `anyRunActive` for a website's run
+history (`useRuns`, `GET /websites/{id}/runs`), and `runIsActive` for a single run's own
+detail (`useRun`, `GET /runs/{id}`). A fourth call site means a fourth thin fold over
+`isActiveRunStatus`, never a fresh string comparison. Polling also pauses on a hidden tab
+(`refetchIntervalInBackground: false`, set as a `QueryClient` default in `app/providers.tsx`
+rather than trusted to every `useQuery` call) — a run that takes ten minutes should not poll
+a tab nobody is looking at roughly 200 times. `useWebsite` (`GET /websites/{id}`, a single
+website with no run or schedule information on that endpoint) deliberately does not poll at
+all; a detail screen composes it with `useRuns`/`useRun` instead, which is where the run
+data — and therefore the polling — actually lives. Inventing a poll on `useWebsite` itself
+would be worse than not polling, because it would look like a feature and do nothing.
+`useSchedule` (`GET /websites/{id}/schedule`) does not poll either, for a related but
+distinct reason: a schedule has no in-progress state at all — there is nothing analogous to
+`pending`/`processing` for `pollWhileActive` to key off — so it changes only when a person
+submits `PUT /websites/{id}/schedule`, and `usePutSchedule` already invalidates
+`queryKeys.schedules.detail(websiteId)` (plus `queryKeys.websites.all`, since `GET
+/websites?include=latest_run` folds a `ScheduleSummary` into every row) the moment that
+mutation succeeds. Polling a resource that only a mutation this app already controls can
+change would just be a slower, wasteful copy of the invalidation that already fires
+immediately.
+
 ---
 
 ## 9. Secrets hygiene

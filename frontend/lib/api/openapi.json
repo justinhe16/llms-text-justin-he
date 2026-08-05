@@ -1,0 +1,1206 @@
+{
+  "components": {
+    "schemas": {
+      "CreateWebsiteRequest": {
+        "description": "Body of `POST /websites`.",
+        "properties": {
+          "url": {
+            "description": "An absolute http:// or https:// URL. Stored as submitted; its normalized origin (lowercased scheme and host, default port and path removed) is what deduplicates it against your existing websites.",
+            "examples": [
+              "https://example.com/docs"
+            ],
+            "maxLength": 2048,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "CreateWebsiteRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "description": "Response body for `GET /health`.\n\nThis DTO lives beside its route rather than in `app/features/` because health is an\noperational endpoint, not a product feature with a service, a reader, and a writer.\nIt does touch Postgres and Redis — a bounded `SELECT 1` and a bounded `PING`, see\n`_probe` — but those are liveness probes rather than data access, which is why there is\nno repository behind them.\n\n`db` and `redis` are required, never absent, because the checks that produce them\nalways run — there is no code path that returns this response without having attempted\nboth. `redis` reports `\"error\"` when the API booted without a queue connection at all,\nwhich is a startup outcome the lifespan deliberately allows (see `app.main.lifespan`).\n\n**Field order is part of the contract**, because Pydantic serializes in declaration\norder and two places compare this body as an exact string: the `build-check` job in\nci-backend.yml, and the one assertion in tests/test_health.py written against the raw\nresponse text for precisely this reason. The rest of that suite compares parsed dicts,\nwhich is order-independent, and the `smoke` job in deploy-backend.yml reads `db` and\n`redis` individually with `jq`, which is too — so neither of those would notice a\nreorder, and it is worth knowing which layer is actually holding this invariant.",
+        "properties": {
+          "db": {
+            "enum": [
+              "ok",
+              "error",
+              "timeout"
+            ],
+            "title": "Db",
+            "type": "string"
+          },
+          "redis": {
+            "enum": [
+              "ok",
+              "error",
+              "timeout"
+            ],
+            "title": "Redis",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "degraded"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "db",
+          "redis"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "LatestRunSummary": {
+        "description": "The compact view of a website's most recent run, folded into the list response.\n\nA fragment of `WebsiteListItemResponse`, never an endpoint's response on its own — the\nruns feature owns the full run representation. Only the fields the websites table in the\nUI actually renders are here; anything more would make this a second, competing run DTO.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "pages_crawled": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pages Crawled"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "started_at",
+          "completed_at",
+          "pages_crawled"
+        ],
+        "title": "LatestRunSummary",
+        "type": "object"
+      },
+      "Page_RunListItemResponse_": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RunListItemResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[RunListItemResponse]",
+        "type": "object"
+      },
+      "RunDetailResponse": {
+        "description": "The full body of `GET /runs/{id}` — every list-item field, plus the two that are too\nlarge or too rarely needed for a list view.\n\nA subclass of `RunListItemResponse`, the same relationship `WebsiteListItemResponse`\nhas to `WebsiteResponse`: the detail view is the list item plus more, not an\nindependently maintained sibling that could drift from it field by field.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "llms_txt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llms Txt"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stats"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "storage_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Path"
+          },
+          "trigger": {
+            "enum": [
+              "manual",
+              "scheduled"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "website_id",
+          "status",
+          "trigger",
+          "started_at",
+          "completed_at",
+          "duration_ms",
+          "stats",
+          "error",
+          "llms_txt",
+          "storage_path"
+        ],
+        "title": "RunDetailResponse",
+        "type": "object"
+      },
+      "RunListItemResponse": {
+        "description": "One row of `GET /websites/{id}/runs`.\n\nDeliberately excludes `llms_txt` and `storage_path` — an artifact can be large and no\nlist view renders it; `RunDetailResponse` below is the endpoint that returns them.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stats"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trigger": {
+            "enum": [
+              "manual",
+              "scheduled"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "website_id",
+          "status",
+          "trigger",
+          "started_at",
+          "completed_at",
+          "duration_ms",
+          "stats",
+          "error"
+        ],
+        "title": "RunListItemResponse",
+        "type": "object"
+      },
+      "ScheduleResponse": {
+        "description": "One website's schedule, as both schedules endpoints return it.\n\n**`auto_publish` MUST NOT appear here, in either direction.** The column is reserved and\nunused in this milestone (its comment in `db/schema.prisma` says so directly): no code\nreads or writes it yet, and it exists only so that turning on publish-on-success later is\na behaviour change rather than a migration on a table the cron tick is actively scanning.\nExposing it now — even read-only — would let a client start depending on a value nothing\nin this system ever sets to anything but its default, and would give this API two things\nto keep in sync the day `auto_publish` does become real.\n\n`interval_minutes` here is a plain `int`, **not** `ScheduleIntervalMinutes`. The allowlist\non the request is an input guardrail — \"these are the presets this product offers right\nnow\" — and the ticket that defined it notes arbitrary intervals may be allowed later\nwithout a migration. A response model that re-validated the same allowlist on the way out\nwould turn any row outside it (a legacy value, a hand-seeded row, a future relaxation that\nships before this model is updated) into a `500` on a plain `GET` — the read path failing\nfor a reason that has nothing to do with reading.\n\n`last_run_at` **is** exposed, read-only. It is not one of the two knobs\n`UpsertScheduleRequest` accepts, and this API never writes it — only the cron tick and the\nrun pipeline (neither built yet) ever will. Surfacing it here is what lets a settings page\nshow \"last ran 3 hours ago\" without a second endpoint.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "interval_minutes": {
+            "title": "Interval Minutes",
+            "type": "integer"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          },
+          "next_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run At"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "website_id",
+          "active",
+          "interval_minutes",
+          "next_run_at",
+          "last_run_at"
+        ],
+        "title": "ScheduleResponse",
+        "type": "object"
+      },
+      "ScheduleSummary": {
+        "description": "The compact view of a website's schedule, folded into the list response.\n\nLike `LatestRunSummary`, a fragment: enough to render \"every 6 hours, next at 14:00\" and\nnothing else. The schedules feature owns the full representation and the endpoints that\nchange it.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "interval_minutes": {
+            "title": "Interval Minutes",
+            "type": "integer"
+          },
+          "next_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run At"
+          }
+        },
+        "required": [
+          "active",
+          "interval_minutes",
+          "next_run_at"
+        ],
+        "title": "ScheduleSummary",
+        "type": "object"
+      },
+      "UpsertScheduleRequest": {
+        "description": "Body of `PUT /websites/{id}/schedule`.\n\nBoth fields are required — there is no partial update here. A schedule has exactly two\nknobs a caller controls (`active`, `interval_minutes`); `next_run_at` and `last_run_at`\nare derived or owned elsewhere (see `ScheduleResponse`), so there is nothing left for a\n`PATCH`-style optional field to mean.\n\nDeliberately **not** `model_config = ConfigDict(extra=\"forbid\")` — the rest of this\ncodebase's request models do not set it either. An `auto_publish` key in the body is\nsilently ignored rather than rejected; `tests/test_schedules_api.py` proves that ignoring\nit does not mean writing it — the column this API never touches stays whatever it already\nwas.",
+        "properties": {
+          "active": {
+            "description": "Whether this schedule should run automatically.",
+            "title": "Active",
+            "type": "boolean"
+          },
+          "interval_minutes": {
+            "description": "Minutes between runs. One of the four supported presets: 60 (hourly), 360 (6-hourly), 1440 (daily), or 10080 (weekly).",
+            "enum": [
+              60,
+              360,
+              1440,
+              10080
+            ],
+            "title": "Interval Minutes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "active",
+          "interval_minutes"
+        ],
+        "title": "UpsertScheduleRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WebsiteAlreadyExistsDetail": {
+        "description": "The `detail` of the `409` from `POST /websites`, carrying the id of the existing row.\n\nThe id is the point. Pasting a URL you already added is a normal thing to do from the\nlanding page, and the useful response is \"you already have this, here it is\" — the\nfrontend navigates to `website_id` instead of rendering an error the user cannot act on.\nA bare `409` would turn a one-click flow into a dead end.\n\nA model rather than an ad-hoc dict so the shape appears in the OpenAPI document (see the\nrouter's `responses=`) and the frontend can generate a type for it.",
+        "properties": {
+          "code": {
+            "const": "website_already_exists",
+            "default": "website_already_exists",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "origin": {
+            "title": "Origin",
+            "type": "string"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "website_id",
+          "origin"
+        ],
+        "title": "WebsiteAlreadyExistsDetail",
+        "type": "object"
+      },
+      "WebsiteAlreadyExistsResponse": {
+        "description": "The **whole** `409` body, envelope included.\n\nFastAPI serializes an `HTTPException`'s `detail` as `{\"detail\": <detail>}`, so this\nwrapper — not `WebsiteAlreadyExistsDetail` on its own — is what a client actually\nreceives. Documenting the inner model directly in the route's `responses=` would put a\nschema in the OpenAPI document that no response ever matches, and any client generated\nfrom it would look for `website_id` one level too high.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/WebsiteAlreadyExistsDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "WebsiteAlreadyExistsResponse",
+        "type": "object"
+      },
+      "WebsiteListItemResponse": {
+        "description": "One row of `GET /websites`.\n\n`latest_run` and `schedule` are **always `null` unless `?include=latest_run` was\nrequested**. With it, each is `null` only when the website genuinely has no run / no\nschedule. The two cases are deliberately not distinguished in the payload: a caller that\ndid not ask for the fold has no reason to tell \"not requested\" from \"none exists\", and a\ncaller that did ask knows it asked.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "latest_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LatestRunSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "origin": {
+            "title": "Origin",
+            "type": "string"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "url",
+          "origin",
+          "title",
+          "created_at"
+        ],
+        "title": "WebsiteListItemResponse",
+        "type": "object"
+      },
+      "WebsiteResponse": {
+        "description": "One website, as every endpoint in this feature returns it.\n\nCarries `user_id` because the UI renders the owner and gates the delete control on it —\nand because `require_owner` (`app.core.auth.ownership`) takes the resource, not a bare\nid, so this field is what makes an instance of this model checkable. Exposing it to\nevery signed-in caller is intended: this application is not multi-tenant, and who added\na site is public information within it (ARCHITECTURE.md §4).",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "origin": {
+            "title": "Origin",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "url",
+          "origin",
+          "title",
+          "created_at"
+        ],
+        "title": "WebsiteResponse",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "description": "Supabase access token, verified locally against the project's JWKS.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Backend for llms-text: website registration, crawl runs, llms.txt generation",
+    "title": "llms-text API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/health": {
+      "get": {
+        "description": "Liveness-and-readiness probe, polled by Fly every 10 seconds.\n\n**The HTTP status is always 200 as long as this process is alive — dependency health is\nreported in the body, never the status code.** This is deliberate: restarting a healthy\nweb machine does nothing to fix a Postgres or an Upstash outage, it just adds a flapping\nfleet of machines on top of one. A non-200 here would make Fly do exactly that. The\n`[[http_service.checks]]` block in backend/fly.toml is scoped to the `app` process for\na related reason — the worker serves no HTTP, so a check against it could only ever\nfail.\n\nBoth checks always run, so `db` and `redis` are always present: `\"ok\"` when the probe\nsucceeds, `\"timeout\"` if it exceeds its budget, `\"error\"` for anything else. They run\n**concurrently**, so one slow dependency does not spend the other's budget and the\nendpoint stays inside `_CHECK_TIMEOUT_SECONDS` overall.\n\n`status` is `\"ok\"` only when both are `\"ok\"`; otherwise it's `\"degraded\"`, so a caller\nthat reads only `status` still gets an accurate signal without having to know the\ncomponent values. A degraded queue is a real degradation — the API can still serve every\nread, but it cannot start a crawl — and saying so here is free, precisely because\nnothing restarts a machine over this body. What \"non-fatal\" buys is the 200, not a\nflattering summary.\n\n**Redis is probed on every call, which is not free.** Fly polls this every 10s, so the\ncheck alone costs 6 × 60 × 24 = 8,640 Redis commands a day. That is real, but it is not\nwhere the money is — an idle worker at `poll_delay = 5` spends twice that (see\n`app.worker.settings` for the arithmetic). If it ever needs to come down, cache the\nprobe result for a few seconds here rather than slowing the Fly check, which is also\nthe failure detector.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/runs/{id}": {
+      "get": {
+        "description": "Return one run in full, including `llms_txt` and `storage_path`.\n\nAny signed-in user may read any run (ARCHITECTURE.md §4.1); `user_id` is present only\nto require a token and is deliberately never passed to the service. `404` if `id` names\nno run.",
+        "operationId": "get_run_runs__id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Run",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/websites": {
+      "get": {
+        "description": "List **every** website, from every user, most recently active first.\n\nNot filtered by the caller, on purpose: this application is not multi-tenant and\nbrowsing everyone's sites is the product (ARCHITECTURE.md §4.1). `user_id` is present to\nrequire authentication and is intentionally not passed to the service.",
+        "operationId": "list_websites_websites_get",
+        "parameters": [
+          {
+            "description": "Set to `latest_run` to fold each website's most recent run and its schedule summary into the response. Omitted, both fields are null.",
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "latest_run",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Set to `latest_run` to fold each website's most recent run and its schedule summary into the response. Omitted, both fields are null.",
+              "title": "Include"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WebsiteListItemResponse"
+                  },
+                  "title": "Response List Websites Websites Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Websites",
+        "tags": [
+          "websites"
+        ]
+      },
+      "post": {
+        "description": "Register a website, owned by the caller.\n\nThe URL is validated by `CreateWebsiteRequest` before this runs, so a malformed one is a\n`422` that never reaches the service.",
+        "operationId": "create_website_websites_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWebsiteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsiteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsiteAlreadyExistsResponse"
+                }
+              }
+            },
+            "description": "You have already added a website with this origin. The response carries the existing website's id so the client can navigate to it."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Website",
+        "tags": [
+          "websites"
+        ]
+      }
+    },
+    "/websites/{id}": {
+      "delete": {
+        "description": "Delete a website the caller owns, along with its schedule and runs.\n\n`403`, not `404`, when the caller is not the owner: `GET /websites/{id}` already returns\nthis row to every signed-in user, so hiding its existence here would be inconsistent\nwith the endpoint next to it (ARCHITECTURE.md §4, `app.core.auth.ownership`).\n\nReturns `204` with no body — hence no `response_model` and a `None` return.",
+        "operationId": "delete_website_websites__id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Website",
+        "tags": [
+          "websites"
+        ]
+      },
+      "get": {
+        "description": "Return one website. Any signed-in user may read any website; `404` if unknown.\n\nThe path parameter is `id`, not `website_id`, because the noun is already in the path\n(ARCHITECTURE.md §10.3). It shadows the `id` builtin inside this function body, which is\nthe accepted cost of the route contract — nothing here calls `id()`.",
+        "operationId": "get_website_websites__id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsiteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Website",
+        "tags": [
+          "websites"
+        ]
+      }
+    },
+    "/websites/{id}/runs": {
+      "get": {
+        "description": "List one website's run history, newest first. Any signed-in user, any website.\n\nNot filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to\nrequire authentication and is intentionally not passed to the service. `404` if `id`\nnames no website; see `RunService.list_runs`.\n\nThe path parameter is `id`, not `website_id`, because the noun is already in the path\n(ARCHITECTURE.md §10.3) — it shadows the `id` builtin inside this function body, which\nis the accepted cost of the route contract, matching `websites.get_website`.",
+        "operationId": "list_runs_websites__id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return only runs with this status. An unrecognized value is a 422.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "pending",
+                    "processing",
+                    "completed",
+                    "failed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only runs with this status. An unrecognized value is a 422.",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "Page size. Values above the maximum (100) are silently clamped to it rather than rejected; `<= 0` is a 422.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "description": "Page size. Values above the maximum (100) are silently clamped to it rather than rejected; `<= 0` is a 422.",
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque pagination cursor from a previous page's `next_cursor`. Omit it to fetch the first page. Treat it as a blob — see `Page.next_cursor`.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque pagination cursor from a previous page's `next_cursor`. Omit it to fetch the first page. Treat it as a blob — see `Page.next_cursor`.",
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_RunListItemResponse_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Runs",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/websites/{id}/schedule": {
+      "get": {
+        "description": "Return one website's schedule. Any signed-in user may read any website's schedule.\n\n`200` with a `null` body when the website exists but has no schedule yet — that is a\nnormal state, not an error. `404` is reserved for an unknown *website*; a missing\nschedule never produces one.\n\nThe path parameter is `id`, not `website_id`, because the noun is already in the path\n(ARCHITECTURE.md §10.3), matching `get_website` in `api/routers/websites.py`.",
+        "operationId": "get_schedule_websites__id__schedule_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ScheduleResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Schedule Websites  Id  Schedule Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Schedule",
+        "tags": [
+          "schedules"
+        ]
+      },
+      "put": {
+        "description": "Create or replace the schedule for a website the caller owns.\n\nAlways `200`, never a conditional `201` for the create case. Distinguishing \"this was a\ncreate\" from \"this was an update\" would require a branch in this handler — checking\nwhether a schedule already existed — and CLAUDE.md #6 forbids exactly that: a router\nparses input, calls one service method, and returns. The ticket's own wording (\"200/201\")\npermits either; `200` is the one that keeps this file free of logic.\n\n`403`, not `404`, when the caller is not the website's owner — `GET /websites/{id}`\nalready returns that website to every signed-in user, so hiding its existence here would\nbe inconsistent with the endpoint next to it (ARCHITECTURE.md §4).",
+        "operationId": "upsert_schedule_websites__id__schedule_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Upsert Schedule",
+        "tags": [
+          "schedules"
+        ]
+      }
+    }
+  }
+}

@@ -48,9 +48,18 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           # db/** is here because a schema change must re-run the tests that depend on it.
+          # frontend/lib/api/openapi.json is here because it is the OpenAPI SNAPSHOT this
+          # workflow's `lint` job verifies against the live app (scripts/export-openapi.sh
+          # --check) — a hand-edit of only that one file would otherwise never be compared
+          # against app.openapi() by anything, and ci-frontend.yml's own drift check reads
+          # this file as its input rather than regenerating it.
+          # scripts/** is here because it is where that exporter (export-openapi.sh) and
+          # every other Makefile-invoked shell helper live.
           backend="$(bash .github/scripts/changed-paths.sh \
             'backend/**' \
             'db/**' \
+            'frontend/lib/api/openapi.json' \
+            'scripts/**' \
             '.github/workflows/ci-backend.yml' \
             '.github/scripts/changed-paths.sh' \
             '.github/scripts/changed-paths.test.sh')"
@@ -74,6 +83,19 @@ jobs:
 
       - name: Install backend dependencies
         run: pip install -r backend/requirements-dev.txt
+
+      # Proves frontend/lib/api/openapi.json still matches what `app.openapi()` actually
+      # produces. It lives in `lint`, not a new job, on purpose: this is the one backend
+      # job with no Postgres container and nothing else to wait on, it already has every
+      # dependency this needs (`from app.main import app` is a plain import, no server, no
+      # database — see scripts/export_openapi.py), and running it here is what keeps this
+      # workflow and `make lint` — which runs the exact same script — invoking the exact
+      # same command (CLAUDE.md "Commands"). `scripts/export-openapi.sh` supplies its own
+      # placeholder values for the four settings `app.core.settings` requires at import;
+      # nothing here needs a real DATABASE_URL, REDIS_URL, SUPABASE_URL, or
+      # SUPABASE_SECRET_KEY.
+      - name: OpenAPI snapshot drift check
+        run: bash scripts/export-openapi.sh --check
 
       # The three commands below are exactly what `make lint` runs for the backend, so a
       # green laptop and a green CI mean the same thing. `--preview` is not passed on the
