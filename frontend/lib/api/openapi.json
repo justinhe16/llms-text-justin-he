@@ -34,7 +34,7 @@
         "type": "object"
       },
       "HealthResponse": {
-        "description": "Response body for `GET /health`.\n\nThis DTO lives beside its route rather than in `app/features/` because health is an\noperational endpoint, not a product feature with a service, a reader, and a writer.\nIt does touch Postgres — a bounded `SELECT 1`, see `_check_db` — but that is a\nliveness probe rather than data access, which is why it has no repository behind it.\n\n`db` is required, never absent, because the check that produces it always runs —\nthere is no code path that returns this response without having attempted it.",
+        "description": "Response body for `GET /health`.\n\nThis DTO lives beside its route rather than in `app/features/` because health is an\noperational endpoint, not a product feature with a service, a reader, and a writer.\nIt does touch Postgres and Redis — a bounded `SELECT 1` and a bounded `PING`, see\n`_probe` — but those are liveness probes rather than data access, which is why there is\nno repository behind them.\n\n`db` and `redis` are required, never absent, because the checks that produce them\nalways run — there is no code path that returns this response without having attempted\nboth. `redis` reports `\"error\"` when the API booted without a queue connection at all,\nwhich is a startup outcome the lifespan deliberately allows (see `app.main.lifespan`).\n\n**Field order is part of the contract**, because Pydantic serializes in declaration\norder and two places compare this body as an exact string: the `build-check` job in\nci-backend.yml, and the one assertion in tests/test_health.py written against the raw\nresponse text for precisely this reason. The rest of that suite compares parsed dicts,\nwhich is order-independent, and the `smoke` job in deploy-backend.yml reads `db` and\n`redis` individually with `jq`, which is too — so neither of those would notice a\nreorder, and it is worth knowing which layer is actually holding this invariant.",
         "properties": {
           "db": {
             "enum": [
@@ -43,6 +43,15 @@
               "timeout"
             ],
             "title": "Db",
+            "type": "string"
+          },
+          "redis": {
+            "enum": [
+              "ok",
+              "error",
+              "timeout"
+            ],
+            "title": "Redis",
             "type": "string"
           },
           "status": {
@@ -56,7 +65,8 @@
         },
         "required": [
           "status",
-          "db"
+          "db",
+          "redis"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -615,7 +625,7 @@
   "paths": {
     "/health": {
       "get": {
-        "description": "Liveness-and-readiness probe, polled by Fly every 10 seconds.\n\n**The HTTP status is always 200 as long as this process is alive — database health is\nreported in the body, never the status code.** This is deliberate: restarting a\nhealthy web machine does nothing to fix a Postgres outage, it just adds a flapping\nfleet of machines on top of one. A non-200 here would make Fly do exactly that.\n\nThe database check (`SELECT 1`, budget `_DB_CHECK_TIMEOUT_SECONDS`) always runs, so\n`db` is always present: `\"ok\"` when it succeeds, `\"timeout\"` if it exceeds its budget,\n`\"error\"` for anything else. `status` is `\"ok\"` only when `db` is `\"ok\"`; otherwise\nit's `\"degraded\"`, so a caller that only reads `status` still gets an accurate signal\nwithout having to know `db`'s possible values.",
+        "description": "Liveness-and-readiness probe, polled by Fly every 10 seconds.\n\n**The HTTP status is always 200 as long as this process is alive — dependency health is\nreported in the body, never the status code.** This is deliberate: restarting a healthy\nweb machine does nothing to fix a Postgres or an Upstash outage, it just adds a flapping\nfleet of machines on top of one. A non-200 here would make Fly do exactly that. The\n`[[http_service.checks]]` block in backend/fly.toml is scoped to the `app` process for\na related reason — the worker serves no HTTP, so a check against it could only ever\nfail.\n\nBoth checks always run, so `db` and `redis` are always present: `\"ok\"` when the probe\nsucceeds, `\"timeout\"` if it exceeds its budget, `\"error\"` for anything else. They run\n**concurrently**, so one slow dependency does not spend the other's budget and the\nendpoint stays inside `_CHECK_TIMEOUT_SECONDS` overall.\n\n`status` is `\"ok\"` only when both are `\"ok\"`; otherwise it's `\"degraded\"`, so a caller\nthat reads only `status` still gets an accurate signal without having to know the\ncomponent values. A degraded queue is a real degradation — the API can still serve every\nread, but it cannot start a crawl — and saying so here is free, precisely because\nnothing restarts a machine over this body. What \"non-fatal\" buys is the 200, not a\nflattering summary.\n\n**Redis is probed on every call, which is not free.** Fly polls this every 10s, so the\ncheck alone costs 6 × 60 × 24 = 8,640 Redis commands a day. That is real, but it is not\nwhere the money is — an idle worker at `poll_delay = 5` spends twice that (see\n`app.worker.settings` for the arithmetic). If it ever needs to come down, cache the\nprobe result for a few seconds here rather than slowing the Fly check, which is also\nthe failure detector.",
         "operationId": "health_health_get",
         "responses": {
           "200": {

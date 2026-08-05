@@ -137,6 +137,21 @@ jobs:
           --health-timeout 5s
           --health-retries 12
 
+      # A real Redis, for the same reason the Postgres above is real rather than a mock.
+      # What the queue tests verify is arq's own serialization, its sorted-set queue, and
+      # its signal handling (tests/test_queue_pool.py, tests/test_worker_shutdown.py) — and
+      # a reimplementation of Redis cannot answer a question about arq. Same image as
+      # docker-compose.yml, so CI and `make dev` exercise the same server.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
     env:
       # Throwaway values for a container that is destroyed with the job, and obvious
       # non-values for everything else. app/core/settings.py validates at import, so every
@@ -152,12 +167,18 @@ jobs:
       # production database, which the deploy workflow uses to migrate before deploying.
       # It must never be referenced here. A pull request that ran `prisma migrate deploy`
       # against production would apply an unreviewed migration outside the
-      # migrate -> deploy web -> deploy worker ordering (ARCHITECTURE.md section 7), from
-      # a branch, which is prohibited three separate ways. The literal below is a
-      # container that is created and destroyed inside this job.
+      # migrate -> deploy ordering (ARCHITECTURE.md section 7), from a branch, which is
+      # prohibited three separate ways. (One `flyctl deploy` rolls both the `app` and
+      # `worker` processes, since they are one image — they are not separately gated
+      # steps.) The literal below is a container that is created and destroyed inside this
+      # job.
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/llms_text_test
       DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/llms_text_test
       REDIS_URL: redis://localhost:6379/0
+      # What tests/conftest.py connects the queue fixtures to. Logical database 15, not 0,
+      # and the fixture FLUSHES it — see TEST_REDIS_URL there. Stated explicitly rather
+      # than left to conftest's default so that CI's wiring is readable from the workflow.
+      TEST_REDIS_URL: redis://localhost:6379/15
       SUPABASE_URL: https://ci.example.supabase.co
       SUPABASE_SECRET_KEY: ci-placeholder-not-a-real-key
       ENVIRONMENT: development
@@ -203,6 +224,15 @@ jobs:
       - name: Verify the database is real and reachable
         run: psql "$DATABASE_URL" --set ON_ERROR_STOP=1 -c 'select current_database(), version()'
 
+      # Exactly the same argument as the step above, for the queue. The `queue_pool`
+      # fixture skips when Redis is unreachable so that `make test` works offline, and in
+      # CI that politeness would hide every enqueue and graceful-shutdown test behind a
+      # green check. `redis-cli` is not installed on the runner, so this borrows it from
+      # the same image the service container runs; `--network host` is what lets the
+      # container reach the service's published port.
+      - name: Verify Redis is real and reachable
+        run: docker run --rm --network host redis:7-alpine redis-cli -u "$TEST_REDIS_URL" ping
+
       - name: Install backend dependencies
         run: pip install -r backend/requirements-dev.txt
 
@@ -236,6 +266,24 @@ jobs:
           --health-cmd "pg_isready --username postgres --dbname llms_text_boot"
           --health-interval 5s
           --health-timeout 5s
+          --health-retries 12
+
+      # PER-157 added an ARQ Redis pool to the same lifespan, so "would the image boot"
+      # now also covers "can it reach its queue". Unlike Postgres that one is deliberately
+      # NON-FATAL — the API boots and serves reads with Redis down — which is exactly why
+      # a real Redis belongs here: without it this job would boot into the degraded branch
+      # and pass, and a `requirements.txt` missing `arq` would still be caught, but a
+      # genuinely broken enqueue pool would not be. The complementary case, "does it still
+      # boot when Redis is gone", is asserted in tests/test_health.py where it can be
+      # stated rather than inferred from a job that happens to lack a container.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
           --health-retries 12
 
     env:
@@ -286,12 +334,23 @@ jobs:
           done
 
           echo "GET /health -> ${body:-<no response>}"
-          # PER-145 added the `db` field. Asserting the full body on purpose rather than
-          # grepping for "ok": `db` is exactly the part that would silently read
-          # "degraded"/"timeout" if the pool were misconfigured, and a substring match
-          # would call that a pass.
-          if [ "${body}" != '{"status":"ok","db":"ok"}' ]; then
-            echo "::error::/health did not return {\"status\":\"ok\",\"db\":\"ok\"}"
+          # PER-145 added the `db` field and PER-157 added `redis`. Asserting the full body
+          # on purpose rather than grepping for "ok": those two fields are exactly what
+          # would silently read "degraded"/"timeout" if a pool were misconfigured, and a
+          # substring match would call that a pass.
+          #
+          # This job asserts `redis":"ok"` STRICTLY, while the `smoke` job in
+          # deploy-backend.yml only warns on it. The asymmetry is deliberate. Here both
+          # containers are part of the job and Redis is unambiguously up, so anything other
+          # than "ok" means the code is wrong; there, Redis is Upstash over the internet and
+          # a blip would fail a deploy of a perfectly healthy API — the outcome the
+          # non-fatal design exists to avoid.
+          #
+          # Field order matters: Pydantic serializes in declaration order (see
+          # app/api/routers/health.py).
+          expected='{"status":"ok","db":"ok","redis":"ok"}'
+          if [ "${body}" != "${expected}" ]; then
+            echo "::error::/health returned ${body:-<no response>}, expected ${expected}"
             exit 1
           fi
 

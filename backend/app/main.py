@@ -13,36 +13,30 @@ from fastapi import FastAPI
 
 from app.api.routers import health, runs, websites
 from app.core.auth.jwks import close_jwks_cache, create_jwks_client, open_jwks_cache
+from app.core.logging import configure_logging
 from app.core.settings import settings
 from app.infrastructure.db.pool import close_pool, open_pool
+from app.infrastructure.queue.pool import close_queue_pool, open_queue_pool
 
 
 logger = logging.getLogger(__name__)
-
-
-def _configure_logging() -> None:
-    """Configure root logging from settings.
-
-    Log the environment, never the settings object: it holds credentials, and this
-    repository and its logs are public (ARCHITECTURE.md §9.4).
-    """
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Application startup and shutdown.
 
-    Opens the process-wide Postgres pool via `open_pool()` and the process-wide JWKS cache
-    via `open_jwks_cache()` on startup, and closes both on shutdown — the same factories
-    (`app.infrastructure.db.pool`, `app.core.auth.jwks`) a future ARQ worker startup hook
-    will call, so the API and the worker build them identically. `close_pool()` awaits
-    `pool.close()` rather than dropping the reference, so in-flight connections finish and
-    are released instead of being torn down mid-query. The Redis connection is opened and
-    closed here by its own infrastructure ticket.
+    Opens three process-wide resources and closes them in reverse: the Postgres pool via
+    `open_pool()`, the JWKS cache via `open_jwks_cache()`, and the ARQ Redis pool the API
+    enqueues through via `open_queue_pool()`. Each comes from the same factory the ARQ
+    worker's startup hook uses (`app.infrastructure.db.pool`, `app.core.auth.jwks`,
+    `app.infrastructure.queue.pool`), so the two processes build them identically.
+    `close_pool()` awaits `pool.close()` rather than dropping the reference, so in-flight
+    connections finish and are released instead of being torn down mid-query.
+
+    **Two of the three are deliberately non-fatal, and which is which is the whole design.**
+    Postgres is fatal because nothing works without it. JWKS and Redis are not, because the
+    API keeps serving reads without either — see the comments at each call below.
     """
     logger.info("Starting llms-text API (environment=%s)", settings.environment)
     await open_pool(settings)
@@ -59,9 +53,36 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     jwks_client = create_jwks_client()
     await open_jwks_cache(settings, jwks_client)
 
+    # Non-fatal for the same reason the JWKS cache above is, applied to the queue. THE API
+    # ONLY ENQUEUES — it never consumes — so an unreachable Redis costs it the ability to
+    # start a crawl and nothing else: every read endpoint still works. Refusing to boot
+    # here would convert an Upstash outage into a total outage, and it would do it at the
+    # worst moment, since a deploy is exactly when the app is being restarted anyway.
+    #
+    # This is the same judgement `/health` encodes by keeping its HTTP status at 200 while
+    # reporting `redis` in the body. The two have to agree: an API that refuses to boot
+    # without Redis makes a non-fatal health field meaningless.
+    #
+    # `arq.create_pool` pings before returning and retries `conn_retries` (5) times a
+    # second apart first, so this branch costs up to ~5s of startup when Redis is down —
+    # which is why `grace_period` in backend/fly.toml is set well above it. `get_pool()`
+    # left unset is what `GET /health` reports as `redis: "error"`.
+    try:
+        await open_queue_pool(settings)
+    except Exception:
+        # Never interpolate REDIS_URL or any part of it — it carries the Upstash password
+        # and this repository and its logs are public (ARCHITECTURE.md §9.4).
+        logger.error(
+            "Could not open the ARQ Redis pool. The API is starting anyway and will serve "
+            "reads normally, but enqueuing is unavailable and GET /health will report "
+            'redis: "error" until Redis is reachable and this process restarts.',
+            exc_info=True,
+        )
+
     yield
 
     logger.info("Shutting down llms-text API")
+    await close_queue_pool()
     await close_jwks_cache()
     await jwks_client.aclose()
     await close_pool()
@@ -69,7 +90,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """Build the FastAPI application."""
-    _configure_logging()
+    # Shared with the ARQ worker (app.core.logging), which configures logging for itself
+    # because it never imports this module.
+    configure_logging()
     app = FastAPI(
         title="llms-text API",
         description="Backend for llms-text: website registration, crawl runs, llms.txt generation",

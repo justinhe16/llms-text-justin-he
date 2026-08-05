@@ -15,16 +15,32 @@ export interface paths {
          * Health
          * @description Liveness-and-readiness probe, polled by Fly every 10 seconds.
          *
-         *     **The HTTP status is always 200 as long as this process is alive — database health is
-         *     reported in the body, never the status code.** This is deliberate: restarting a
-         *     healthy web machine does nothing to fix a Postgres outage, it just adds a flapping
-         *     fleet of machines on top of one. A non-200 here would make Fly do exactly that.
+         *     **The HTTP status is always 200 as long as this process is alive — dependency health is
+         *     reported in the body, never the status code.** This is deliberate: restarting a healthy
+         *     web machine does nothing to fix a Postgres or an Upstash outage, it just adds a flapping
+         *     fleet of machines on top of one. A non-200 here would make Fly do exactly that. The
+         *     `[[http_service.checks]]` block in backend/fly.toml is scoped to the `app` process for
+         *     a related reason — the worker serves no HTTP, so a check against it could only ever
+         *     fail.
          *
-         *     The database check (`SELECT 1`, budget `_DB_CHECK_TIMEOUT_SECONDS`) always runs, so
-         *     `db` is always present: `"ok"` when it succeeds, `"timeout"` if it exceeds its budget,
-         *     `"error"` for anything else. `status` is `"ok"` only when `db` is `"ok"`; otherwise
-         *     it's `"degraded"`, so a caller that only reads `status` still gets an accurate signal
-         *     without having to know `db`'s possible values.
+         *     Both checks always run, so `db` and `redis` are always present: `"ok"` when the probe
+         *     succeeds, `"timeout"` if it exceeds its budget, `"error"` for anything else. They run
+         *     **concurrently**, so one slow dependency does not spend the other's budget and the
+         *     endpoint stays inside `_CHECK_TIMEOUT_SECONDS` overall.
+         *
+         *     `status` is `"ok"` only when both are `"ok"`; otherwise it's `"degraded"`, so a caller
+         *     that reads only `status` still gets an accurate signal without having to know the
+         *     component values. A degraded queue is a real degradation — the API can still serve every
+         *     read, but it cannot start a crawl — and saying so here is free, precisely because
+         *     nothing restarts a machine over this body. What "non-fatal" buys is the 200, not a
+         *     flattering summary.
+         *
+         *     **Redis is probed on every call, which is not free.** Fly polls this every 10s, so the
+         *     check alone costs 6 × 60 × 24 = 8,640 Redis commands a day. That is real, but it is not
+         *     where the money is — an idle worker at `poll_delay = 5` spends twice that (see
+         *     `app.worker.settings` for the arithmetic). If it ever needs to come down, cache the
+         *     probe result for a few seconds here rather than slowing the Fly check, which is also
+         *     the failure detector.
          */
         get: operations["health_health_get"];
         put?: never;
@@ -179,11 +195,22 @@ export interface components {
          *
          *     This DTO lives beside its route rather than in `app/features/` because health is an
          *     operational endpoint, not a product feature with a service, a reader, and a writer.
-         *     It does touch Postgres — a bounded `SELECT 1`, see `_check_db` — but that is a
-         *     liveness probe rather than data access, which is why it has no repository behind it.
+         *     It does touch Postgres and Redis — a bounded `SELECT 1` and a bounded `PING`, see
+         *     `_probe` — but those are liveness probes rather than data access, which is why there is
+         *     no repository behind them.
          *
-         *     `db` is required, never absent, because the check that produces it always runs —
-         *     there is no code path that returns this response without having attempted it.
+         *     `db` and `redis` are required, never absent, because the checks that produce them
+         *     always run — there is no code path that returns this response without having attempted
+         *     both. `redis` reports `"error"` when the API booted without a queue connection at all,
+         *     which is a startup outcome the lifespan deliberately allows (see `app.main.lifespan`).
+         *
+         *     **Field order is part of the contract**, because Pydantic serializes in declaration
+         *     order and two places compare this body as an exact string: the `build-check` job in
+         *     ci-backend.yml, and the one assertion in tests/test_health.py written against the raw
+         *     response text for precisely this reason. The rest of that suite compares parsed dicts,
+         *     which is order-independent, and the `smoke` job in deploy-backend.yml reads `db` and
+         *     `redis` individually with `jq`, which is too — so neither of those would notice a
+         *     reorder, and it is worth knowing which layer is actually holding this invariant.
          */
         HealthResponse: {
             /**
@@ -191,6 +218,11 @@ export interface components {
              * @enum {string}
              */
             db: "ok" | "error" | "timeout";
+            /**
+             * Redis
+             * @enum {string}
+             */
+            redis: "ok" | "error" | "timeout";
             /**
              * Status
              * @enum {string}

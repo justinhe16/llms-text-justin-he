@@ -1,6 +1,5 @@
 # Runtime dependencies for the backend image (FastAPI API + ARQ worker).
 # Pinned exactly so the image CI builds is the image that was tested.
-# The Redis/ARQ dependencies land with their own ticket.
 
 # Web framework
 fastapi==0.141.1
@@ -18,6 +17,17 @@ pyjwt[crypto]==2.13.0   # local JWT verification against the Supabase JWKS (app/
 cryptography==50.0.0    # pinned on its own line even though pyjwt[crypto] pulls it in: an
                          # extra alone floats the transitive pin, and this file's policy is
                          # "the image CI builds is the image that was tested"
+
+# Job queue
+arq==0.28.0     # ARQ worker (app/worker/) and the API's enqueue pool. RUNTIME for BOTH
+                # processes, not just the worker: app/main.py's lifespan opens an ArqRedis
+                # pool so routers can enqueue, so the API image needs it too.
+redis==5.3.1    # pinned on its own line even though arq depends on `redis[hiredis]<6,>=4.2.0`:
+                # that range would let a `pip install` months apart produce two different
+                # images from one commit, and this file's policy is "the image CI builds is
+                # the image that was tested". Must stay <6 while arq's pin says so.
+hiredis==3.4.0  # the C parser behind redis's [hiredis] extra, pinned for the same reason
+                # cryptography is below — an extra alone floats the transitive pin
 
 # HTTP client
 httpx==0.28.1   # RUNTIME, not dev: app/core/auth/jwks.py fetches the JWKS document with it.

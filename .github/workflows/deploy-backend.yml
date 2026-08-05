@@ -228,12 +228,12 @@ jobs:
           # transient failure; a machine that is still coming up answers 502, and
           # --retry-connrefused covers the window before it is listening at all.
           #
-          # The budget is ~50s rather than the ~25s the ticket sketched, because
-          # backend/fly.toml carries no Fly health checks yet — PER-157 owns those. Until
-          # it lands, `flyctl deploy` returns once the machine has STARTED, not once it is
-          # serving, so this curl absorbs the whole of uvicorn's boot and the asyncpg
-          # pool's first connection. PER-157 can bring it back down: with health checks in
-          # place, flyctl does that waiting itself.
+          # The budget stays at ~50s even though backend/fly.toml now carries Fly health
+          # checks, so `flyctl deploy` waits for an `app` machine to pass one before it
+          # returns. Two reasons not to trim it: that check has a 20s `grace_period` of its
+          # own, and this job is the pipeline's only verification from outside — a generous
+          # retry budget costs a few seconds on a deploy that was going to fail anyway,
+          # while a tight one costs a red pipeline over a boot that was merely slow.
           body="$(curl --fail --silent --show-error \
             --retry 10 --retry-delay 5 --retry-all-errors --retry-connrefused \
             --connect-timeout 10 \
@@ -247,13 +247,34 @@ jobs:
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
 
-          # THE WHOLE BODY, NOT JUST A 200. /health returns 200 for as long as the process
-          # is alive and reports database health in the body instead — deliberately, since
-          # a non-200 would make Fly restart perfectly healthy machines during a Postgres
+          # THE BODY, NOT JUST A 200. /health returns 200 for as long as the process is
+          # alive and reports dependency health in the body instead — deliberately, since a
+          # non-200 would make Fly restart perfectly healthy machines during a Postgres
           # outage (backend/app/api/routers/health.py). A status-code-only check would
           # therefore go green against an app that cannot reach its database, which is
           # precisely the failure a deploy that just migrated is most likely to cause.
-          if [ "${body}" != '{"status":"ok","db":"ok"}' ]; then
-            echo "::error::/health did not return {\"status\":\"ok\",\"db\":\"ok\"} — the deploy is live but not healthy"
+          #
+          # `db` IS FATAL, `redis` IS NOT, and the split mirrors the endpoint's own
+          # contract rather than inventing a second one. The API cannot serve a single read
+          # without Postgres, so a deploy that leaves `db` unhealthy has failed. It serves
+          # every read without Redis — it only enqueues — which is why app/main.py boots
+          # without a queue and /health keeps answering 200 when Upstash is down. Failing
+          # the deploy on `redis` would contradict all of that, and would turn a transient
+          # Upstash blip into a red pipeline for a release that is fine. It is still
+          # surfaced, loudly, as a warning annotation: shipping a broken queue silently is
+          # the other failure worth avoiding.
+          #
+          # `status` is not asserted directly. It is a summary of the two fields already
+          # checked individually, and it reads "degraded" whenever `redis` does — so
+          # gating on it would smuggle the fatal/non-fatal split back out again.
+          db="$(jq -r '.db // "missing"' <<<"${body}")"
+          redis="$(jq -r '.redis // "missing"' <<<"${body}")"
+
+          if [ "${db}" != "ok" ]; then
+            echo "::error::/health reports db=\"${db}\" — the deploy is live but cannot reach Postgres"
             exit 1
+          fi
+
+          if [ "${redis}" != "ok" ]; then
+            echo "::warning::/health reports redis=\"${redis}\". The API is serving reads, but the queue is unreachable, so no crawl can be enqueued and the worker has nothing to consume. Check the REDIS_URL secret and Upstash, then \`fly logs --app llms-text-justin-he --process worker\`."
           fi

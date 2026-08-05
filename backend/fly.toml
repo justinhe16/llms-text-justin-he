@@ -1,10 +1,21 @@
 # Fly.io configuration for the backend image.
 #
-# SCOPE. This file is the minimum needed for `flyctl deploy` to produce an app that
-# actually serves HTTPS. It deliberately declares NO process groups and NO Fly health
-# checks: PER-157 (the multi-process worker ticket) owns those and will add a `[processes]`
-# block with `web` and `worker`, per-process checks, and a `processes = ["web"]` key on the
-# service below. Do not add them here.
+# SCOPE. One image, two processes, scaled independently with
+# `fly scale count app=1 worker=1`. The API stays responsive while crawls run on a separate
+# machine, and both ship from a single `flyctl deploy` because they are a single artifact
+# (ARCHITECTURE.md §7).
+#
+# ON THE NAME `app`. PER-152 created this file and its comment here reserved the names
+# `web` and `worker` for this ticket. It says `app` instead, deliberately. Fly's implicit
+# process group — the one every machine lands in when a fly.toml declares no `[processes]`
+# block — is called `app`, and this app has been deployed that way since PER-152, so its
+# running machines are already in a group with that name. Declaring `web` would leave the
+# `app` group undeclared, and flyctl destroys machines whose group no longer exists in the
+# config: the first deploy after this change would tear down the running fleet and build a
+# new one instead of rolling it. Keeping `app` makes that deploy an ordinary rolling
+# update. It also matches `fly scale count app=1` in README.md "Rolling back". This is a
+# permanent choice, not a deferral — a rename would cost the same destroy/recreate later,
+# with more traffic to lose. ARCHITECTURE.md §1 and §7 were updated to match.
 #
 # WHY IT EXISTS AT ALL. The app was created with `fly apps create --no-deploy`, so it has no
 # machines — and therefore no remote configuration for flyctl to fall back on when the
@@ -19,6 +30,30 @@
 
 app = "llms-text-justin-he"
 primary_region = "sjc"  # closest region to the Supabase project in AWS us-west-1
+
+# HOW LONG FLY WAITS AFTER SIGTERM BEFORE SENDING SIGKILL. Applies to every machine in the
+# app — `kill_timeout` is a top-level key, not a per-process one — so the API inherits it
+# too. That is harmless (uvicorn drains in well under a second) and the worker is what the
+# number is sized for.
+#
+# It is the outermost of three nested shutdown budgets, and it has to stay the largest or
+# it truncates the ones inside it:
+#
+#   arq job_timeout (180s) < arq job_completion_wait (200s) < kill_timeout (240s) <= 300s
+#
+# The middle value is what actually makes SIGTERM graceful — see app/worker/settings.py.
+# 300s is Fly's ceiling for this key, which is what bounds the whole ladder. If a crawl
+# ever needs longer than 180s, every number here moves together, and the ceiling means the
+# real answer at that point is checkpointing the job, not a bigger timeout.
+kill_timeout = "240s"
+
+# ONE IMAGE, TWO COMMANDS. The Dockerfile sets no ENTRYPOINT, so each line below is the
+# machine's whole command and replaces its CMD. The API's is identical to that CMD on
+# purpose: `docker run` on the image locally and the `app` process in production start the
+# same way, so there is no third startup path that only production exercises.
+[processes]
+  app = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+  worker = "arq app.worker.settings.WorkerSettings"
 
 [build]
   # Relative to this file. The deploy job runs flyctl from backend/, so the build context
@@ -37,17 +72,53 @@ primary_region = "sjc"  # closest region to the Supabase project in AWS us-west-
   internal_port = 8000
   force_https = true
 
+  # THE WORKER IS NOT IN THIS LIST, AND THAT IS THE POINT. It serves no HTTP, so routing to
+  # it would fail and — more importantly — the health check below would fail against it
+  # forever, restart-looping a machine that is doing its job perfectly well.
+  #
+  # Scoping the service here is also what keeps the worker running. Fly's autostop is a
+  # property of a service's proxy: a machine with no service is never stopped for being
+  # idle, and could not be woken by an inbound request if it were, because none arrive. So
+  # the worker needs no `auto_stop_machines = false` of its own — it is exempt structurally
+  # rather than by a flag, which is the stronger guarantee.
+  processes = ["app"]
+
   # The API must answer the deploy's smoke check the moment the deploy returns, so it does
   # not scale to zero. `auto_start_machines` stays on as a safety net rather than as a
-  # scaling strategy. PER-157 revisits this per process — the worker has no HTTP service
-  # and must not inherit these.
+  # scaling strategy. Both apply to the `app` process alone, per the key above.
   auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
 
+# THE FLY-SIDE HEALTH CHECK. Inherits `processes = ["app"]` from the service above, so it
+# is never applied to the worker.
+#
+# `/health` answers 200 for as long as the process is alive and reports dependency health
+# in the body instead, so this check tests "is uvicorn still serving?" and nothing more —
+# deliberately, because restarting a machine cannot fix a Postgres or an Upstash outage and
+# would only add a flapping fleet on top of one. See app/api/routers/health.py, and the
+# `smoke` job in .github/workflows/deploy-backend.yml, which is the check that does read
+# the body.
+#
+# `grace_period` is generous because the lifespan opens three things before uvicorn serves
+# anything, and the Redis pool retries for ~5s before giving up when Upstash is
+# unreachable. A grace period under that would fail the first checks of a boot that is
+# merely slow, not broken.
+[[http_service.checks]]
+  path = "/health"
+  method = "GET"
+  interval = "10s"
+  timeout = "5s"
+  grace_period = "20s"
+
 # Stated rather than left to the platform default, which is 256MB: FastAPI plus an asyncpg
 # pool sits close enough to that ceiling that the first deploy could OOM, and an OOM here
 # looks like a failing smoke check rather than like a memory problem.
+#
+# No `processes` key, so this deliberately covers BOTH groups. The worker runs the same
+# image with the same asyncpg pool and at most `max_jobs = 2` concurrent jobs, so it has no
+# reason to be sized differently today. Split this into two `[[vm]]` blocks when the crawl
+# task makes the worker's memory profile genuinely different from the API's — not before.
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
