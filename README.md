@@ -245,7 +245,7 @@ green laptop and a green pull request mean the same thing.
 | `ci-frontend.yml` | `frontend/**`, the workflow, the path filter | **verify** — `tsc --noEmit`, eslint, `next build`, then a rendered-output smoke test |
 
 `db/**` is on the backend list because a schema change must re-run the tests that depend on
-it. Every job runs in parallel; the whole matrix finishes in about three minutes.
+it. Every job runs in parallel; the whole matrix finishes in a little over a minute.
 
 The `test` job applies migrations with `prisma migrate deploy` — the command the deploy runs,
 never `prisma db push` — against a throwaway Postgres container, so a migration that cannot
