@@ -47,6 +47,13 @@ const runs = {
   detail: (id: string) => ["runs", "detail", id] as const,
 };
 
+// A schedule has no independent id in the API surface — it is 1:1 with a website, reached
+// only via `/websites/{id}/schedule` — so unlike `runs.detail` above, there is no separate
+// `all`/`detail` split to make: `websiteId` alone is both the scope and the whole key.
+const schedules = {
+  detail: (websiteId: string) => ["schedules", "detail", websiteId] as const,
+};
+
 const health = {
   status: ["health"] as const,
 };
@@ -54,5 +61,6 @@ const health = {
 export const queryKeys = {
   websites,
   runs,
+  schedules,
   health,
 };

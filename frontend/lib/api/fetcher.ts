@@ -192,10 +192,11 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 // `lib/api/websites.ts` and friends are the intended call sites, via the exported `api`
 // object at the bottom.
 
-// The three verbs every current caller needs. Widening this list (PATCH lands with the
-// schedules ticket, PUT with nothing planned yet) means adding the verb here once, plus
-// one more method on the `api` object below — everything else generalizes over it already.
-type HttpMethod = "get" | "post" | "delete";
+// The four verbs every current caller needs. PUT landed with the schedules ticket
+// (`PUT /websites/{id}/schedule` upserts a website's schedule) — PATCH is still nothing
+// planned. Widening this list further means adding the verb here once, plus one more
+// method on the `api` object below — everything else generalizes over it already.
+type HttpMethod = "get" | "post" | "put" | "delete";
 
 // The subset of `paths`' keys that actually declare method `M`. openapi-typescript emits
 // every unused method on every path as `{ verb?: never }`, so filtering on "does this
@@ -342,7 +343,7 @@ function buildQueryString(
 }
 
 async function performRequest<T>(
-  method: "GET" | "POST" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   options: RuntimeRequestOptions | undefined
 ): Promise<T> {
@@ -356,8 +357,8 @@ async function performRequest<T>(
 }
 
 /**
- * The typed client. `api.get`, `api.post`, and `api.delete` derive their request and
- * response shapes from `paths` (`./schema.d.ts`), so a call to an endpoint that does not
+ * The typed client. `api.get`, `api.post`, `api.put`, and `api.delete` derive their request
+ * and response shapes from `paths` (`./schema.d.ts`), so a call to an endpoint that does not
  * exist, or one that gets a parameter or a body wrong, fails at `tsc`, not at `fetch`.
  * `lib/api/websites.ts`, `lib/api/health.ts`, and every React Query hook in
  * `lib/query/` call through this object rather than `apiFetch` directly.
@@ -384,6 +385,14 @@ export const api = {
   ): Promise<ResponseFor<P, "post">> {
     const options = args[0] as RuntimeRequestOptions | undefined;
     return performRequest("POST", path, options);
+  },
+
+  put<P extends PathsWithMethod<"put">>(
+    path: P,
+    ...args: OptionsArg<OperationFor<P, "put">>
+  ): Promise<ResponseFor<P, "put">> {
+    const options = args[0] as RuntimeRequestOptions | undefined;
+    return performRequest("PUT", path, options);
   },
 
   delete<P extends PathsWithMethod<"delete">>(

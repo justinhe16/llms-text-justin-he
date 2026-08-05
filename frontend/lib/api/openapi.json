@@ -373,6 +373,63 @@
         "title": "RunListItemResponse",
         "type": "object"
       },
+      "ScheduleResponse": {
+        "description": "One website's schedule, as both schedules endpoints return it.\n\n**`auto_publish` MUST NOT appear here, in either direction.** The column is reserved and\nunused in this milestone (its comment in `db/schema.prisma` says so directly): no code\nreads or writes it yet, and it exists only so that turning on publish-on-success later is\na behaviour change rather than a migration on a table the cron tick is actively scanning.\nExposing it now — even read-only — would let a client start depending on a value nothing\nin this system ever sets to anything but its default, and would give this API two things\nto keep in sync the day `auto_publish` does become real.\n\n`interval_minutes` here is a plain `int`, **not** `ScheduleIntervalMinutes`. The allowlist\non the request is an input guardrail — \"these are the presets this product offers right\nnow\" — and the ticket that defined it notes arbitrary intervals may be allowed later\nwithout a migration. A response model that re-validated the same allowlist on the way out\nwould turn any row outside it (a legacy value, a hand-seeded row, a future relaxation that\nships before this model is updated) into a `500` on a plain `GET` — the read path failing\nfor a reason that has nothing to do with reading.\n\n`last_run_at` **is** exposed, read-only. It is not one of the two knobs\n`UpsertScheduleRequest` accepts, and this API never writes it — only the cron tick and the\nrun pipeline (neither built yet) ever will. Surfacing it here is what lets a settings page\nshow \"last ran 3 hours ago\" without a second endpoint.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "interval_minutes": {
+            "title": "Interval Minutes",
+            "type": "integer"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          },
+          "next_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run At"
+          },
+          "website_id": {
+            "format": "uuid",
+            "title": "Website Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "website_id",
+          "active",
+          "interval_minutes",
+          "next_run_at",
+          "last_run_at"
+        ],
+        "title": "ScheduleResponse",
+        "type": "object"
+      },
       "ScheduleSummary": {
         "description": "The compact view of a website's schedule, folded into the list response.\n\nLike `LatestRunSummary`, a fragment: enough to render \"every 6 hours, next at 14:00\" and\nnothing else. The schedules feature owns the full representation and the endpoints that\nchange it.",
         "properties": {
@@ -403,6 +460,33 @@
           "next_run_at"
         ],
         "title": "ScheduleSummary",
+        "type": "object"
+      },
+      "UpsertScheduleRequest": {
+        "description": "Body of `PUT /websites/{id}/schedule`.\n\nBoth fields are required — there is no partial update here. A schedule has exactly two\nknobs a caller controls (`active`, `interval_minutes`); `next_run_at` and `last_run_at`\nare derived or owned elsewhere (see `ScheduleResponse`), so there is nothing left for a\n`PATCH`-style optional field to mean.\n\nDeliberately **not** `model_config = ConfigDict(extra=\"forbid\")` — the rest of this\ncodebase's request models do not set it either. An `auto_publish` key in the body is\nsilently ignored rather than rejected; `tests/test_schedules_api.py` proves that ignoring\nit does not mean writing it — the column this API never touches stays whatever it already\nwas.",
+        "properties": {
+          "active": {
+            "description": "Whether this schedule should run automatically.",
+            "title": "Active",
+            "type": "boolean"
+          },
+          "interval_minutes": {
+            "description": "Minutes between runs. One of the four supported presets: 60 (hourly), 360 (6-hourly), 1440 (daily), or 10080 (weekly).",
+            "enum": [
+              60,
+              360,
+              1440,
+              10080
+            ],
+            "title": "Interval Minutes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "active",
+          "interval_minutes"
+        ],
+        "title": "UpsertScheduleRequest",
         "type": "object"
       },
       "ValidationError": {
@@ -1001,6 +1085,120 @@
         "summary": "List Runs",
         "tags": [
           "runs"
+        ]
+      }
+    },
+    "/websites/{id}/schedule": {
+      "get": {
+        "description": "Return one website's schedule. Any signed-in user may read any website's schedule.\n\n`200` with a `null` body when the website exists but has no schedule yet — that is a\nnormal state, not an error. `404` is reserved for an unknown *website*; a missing\nschedule never produces one.\n\nThe path parameter is `id`, not `website_id`, because the noun is already in the path\n(ARCHITECTURE.md §10.3), matching `get_website` in `api/routers/websites.py`.",
+        "operationId": "get_schedule_websites__id__schedule_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ScheduleResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Schedule Websites  Id  Schedule Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Schedule",
+        "tags": [
+          "schedules"
+        ]
+      },
+      "put": {
+        "description": "Create or replace the schedule for a website the caller owns.\n\nAlways `200`, never a conditional `201` for the create case. Distinguishing \"this was a\ncreate\" from \"this was an update\" would require a branch in this handler — checking\nwhether a schedule already existed — and CLAUDE.md #6 forbids exactly that: a router\nparses input, calls one service method, and returns. The ticket's own wording (\"200/201\")\npermits either; `200` is the one that keeps this file free of logic.\n\n`403`, not `404`, when the caller is not the website's owner — `GET /websites/{id}`\nalready returns that website to every signed-in user, so hiding its existence here would\nbe inconsistent with the endpoint next to it (ARCHITECTURE.md §4).",
+        "operationId": "upsert_schedule_websites__id__schedule_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Upsert Schedule",
+        "tags": [
+          "schedules"
         ]
       }
     }

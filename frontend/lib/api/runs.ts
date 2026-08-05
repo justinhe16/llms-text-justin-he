@@ -1,19 +1,22 @@
 // Named, feature-level wrappers around `api` (lib/api/fetcher.ts) for `/websites/{id}/runs`
 // and `/runs/{id}`. Every call site in the app — a page, a component, a React Query hook in
 // `lib/query/` — should import from here rather than reaching for `api.get` directly, so the
-// endpoint list in this file, together with lib/api/websites.ts and lib/api/health.ts, is the
-// entire inventory of what the frontend can ask the backend for.
+// endpoint list in this file, together with lib/api/websites.ts, lib/api/schedules.ts, and
+// lib/api/health.ts, is the entire inventory of what the frontend can ask the backend for.
 //
-// A trigger helper (`POST /websites/{id}/runs`), schedules (`GET`/`PUT
-// /websites/{id}/schedule`), and any stats endpoint are deliberately ABSENT. The runs feature
-// (PER-155) shipped only its two read routes — see backend/app/api/routers/runs.py, which
-// declares exactly `GET /websites/{id}/runs` and `GET /runs/{id}` and no more — and the
-// schedules/stats endpoints have not landed on the websites router either. They land with
-// their own tickets, each of which adds its own helpers here or in a sibling file. Writing
-// `triggerRun`/`getSchedule` now, ahead of a real endpoint, would either hand-write a
-// response shape nothing generates or silently point at a path `paths` does not know about —
-// the latter is exactly what `PathsWithMethod` in fetcher.ts turns into a compile error,
-// which is the intended guardrail working correctly, not a gap to work around.
+// A trigger helper (`POST /websites/{id}/runs`) and any stats endpoint are deliberately
+// ABSENT. The runs feature (PER-155) shipped only its two read routes — see
+// backend/app/api/routers/runs.py, which declares exactly `GET /websites/{id}/runs` and `GET
+// /runs/{id}` and no more — and stats (PER-156) has not landed on the websites router either.
+// Schedules are no longer in that list: `GET`/`PUT /websites/{id}/schedule` shipped with
+// PER-154 and live in `lib/api/schedules.ts`, not here or in `lib/api/websites.ts` — the
+// schedules feature owns its own response shapes, the same way this file owns
+// `RunListItemResponse` and friends. The remaining absences land with their own tickets,
+// each of which adds its own helper here or in a sibling file. Writing `triggerRun`/
+// `getStats` now, ahead of a real endpoint, would either hand-write a response shape nothing
+// generates or silently point at a path `paths` does not know about — the latter is exactly
+// what `PathsWithMethod` in fetcher.ts turns into a compile error, which is the intended
+// guardrail working correctly, not a gap to work around.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";

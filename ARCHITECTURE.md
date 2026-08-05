@@ -711,11 +711,11 @@ snapshot of `app.openapi()` — the same document FastAPI builds from the Pydant
 routes already described in §3 — and `frontend/lib/api/schema.d.ts` is generated from that
 snapshot by `openapi-typescript` (`npm run gen:api`, or `make openapi` for both halves at
 once). No frontend code hand-writes a request or response shape: `frontend/lib/api/fetcher.ts`
-exports a small typed client (`api.get`/`api.post`/`api.delete`) generic over the generated
-`paths` type, and every feature-level helper (`frontend/lib/api/websites.ts`, `runs.ts`,
-`health.ts`) calls through it and re-exports readable aliases of `components["schemas"][...]`.
-Calling a path that does not exist, or getting a parameter or a body wrong, is a `tsc` error,
-not a runtime one.
+exports a small typed client (`api.get`/`api.post`/`api.put`/`api.delete`) generic over the
+generated `paths` type, and every feature-level helper (`frontend/lib/api/websites.ts`,
+`runs.ts`, `schedules.ts`, `health.ts`) calls through it and re-exports readable aliases of
+`components["schemas"][...]`. Calling a path that does not exist, or getting a parameter or a
+body wrong, is a `tsc` error, not a runtime one.
 
 **The drift check has two halves, enforced separately.** `scripts/export-openapi.sh --check`
 (run in `ci-backend.yml`'s `lint` job, and by `make lint`) re-exports the live schema from
@@ -728,10 +728,14 @@ backend, because it only ever reads the JSON already in the repo. Both checks fa
 
 **The query key factory.** `frontend/lib/query/query-keys.ts` is the only place a React
 Query cache key is constructed — `queryKeys.websites.all`, `.list(include?)`,
-`.detail(id)`, and the mirroring `queryKeys.runs.all`, `.list(websiteId, options?)`,
-`.detail(id)` — so that invalidating "every website" or "this one website" (or "every run"
-or "this one run") is a call to a function here rather than an array literal a caller has to
-get byte-for-byte right at every call site.
+`.detail(id)`, the mirroring `queryKeys.runs.all`, `.list(websiteId, options?)`,
+`.detail(id)`, and `queryKeys.schedules.detail(websiteId)` — so that invalidating "every
+website" or "this one website" (or "every run" or "this one run", or "this one website's
+schedule") is a call to a function here rather than an array literal a caller has to get
+byte-for-byte right at every call site. `schedules` has no `.all`/`.list` of its own: a
+schedule is 1:1 with a website and has no independent id anywhere in the API surface, so
+`websiteId` alone is both the scope and the whole key, unlike `runs`, which is genuinely a
+collection per website.
 
 **Polling.** A query polls only while something in its data is still in progress, at
 `ACTIVE_POLL_INTERVAL_MS` (3 seconds), and stops the moment it isn't —
@@ -752,6 +756,15 @@ website with no run or schedule information on that endpoint) deliberately does 
 all; a detail screen composes it with `useRuns`/`useRun` instead, which is where the run
 data — and therefore the polling — actually lives. Inventing a poll on `useWebsite` itself
 would be worse than not polling, because it would look like a feature and do nothing.
+`useSchedule` (`GET /websites/{id}/schedule`) does not poll either, for a related but
+distinct reason: a schedule has no in-progress state at all — there is nothing analogous to
+`pending`/`processing` for `pollWhileActive` to key off — so it changes only when a person
+submits `PUT /websites/{id}/schedule`, and `usePutSchedule` already invalidates
+`queryKeys.schedules.detail(websiteId)` (plus `queryKeys.websites.all`, since `GET
+/websites?include=latest_run` folds a `ScheduleSummary` into every row) the moment that
+mutation succeeds. Polling a resource that only a mutation this app already controls can
+change would just be a slower, wasteful copy of the invalidation that already fires
+immediately.
 
 ---
 

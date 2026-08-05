@@ -1,20 +1,21 @@
 // Named, feature-level wrappers around `api` (lib/api/fetcher.ts) for `/websites`. Every
 // call site in the app — a page, a component, a React Query hook in `lib/query/` — should
 // import from here rather than reaching for `api.get`/`api.post`/`api.delete` directly, so
-// the endpoint list in this file, together with `lib/api/runs.ts` and `lib/api/health.ts`,
-// is the entire inventory of what the frontend can ask the backend for.
+// the endpoint list in this file, together with `lib/api/runs.ts`, `lib/api/schedules.ts`,
+// and `lib/api/health.ts`, is the entire inventory of what the frontend can ask the backend
+// for.
 //
-// Read helpers for `GET /websites/{id}/runs` and `GET /runs/{id}` now live in
-// `lib/api/runs.ts`, not here — the runs feature (PER-155) owns its own response shapes, the
-// same way this file owns `WebsiteResponse` and friends. What is still ABSENT, from both
-// files: `POST /websites/{id}/runs` (triggering a run), `GET`/`PUT /websites/{id}/schedule`,
-// and any stats endpoint — see backend/app/api/routers/websites.py and
-// backend/app/api/routers/runs.py, neither of which declares those routes yet. They land
-// with their own tickets, each of which adds its own helpers here or in a sibling file.
-// Writing `triggerRun`/`getSchedule` now, ahead of a real endpoint, would either hand-write a
-// response shape nothing generates or silently point at a path `paths` does not know about —
-// the latter is exactly what `PathsWithMethod` in fetcher.ts turns into a compile error,
-// which is the intended guardrail working correctly, not a gap to work around.
+// Read helpers for `GET /websites/{id}/runs` and `GET /runs/{id}` live in `lib/api/runs.ts`,
+// and `GET`/`PUT /websites/{id}/schedule` live in `lib/api/schedules.ts` — not here. Each
+// feature owns its own response shapes, the same way this file owns `WebsiteResponse` and
+// friends. What is still ABSENT: `POST /websites/{id}/runs` (triggering a run) and any stats
+// endpoint — see backend/app/api/routers/websites.py, which declares no such routes yet.
+// They land with their own tickets (a run trigger, then PER-156's stats), each of which adds
+// its own helper here or in a sibling file. Writing `triggerRun`/`getStats` now, ahead of a
+// real endpoint, would either hand-write a response shape nothing generates or silently
+// point at a path `paths` does not know about — the latter is exactly what `PathsWithMethod`
+// in fetcher.ts turns into a compile error, which is the intended guardrail working
+// correctly, not a gap to work around.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";
@@ -26,7 +27,14 @@ import { api } from "./fetcher";
 export type Website = components["schemas"]["WebsiteResponse"];
 export type WebsiteListItem = components["schemas"]["WebsiteListItemResponse"];
 export type LatestRun = components["schemas"]["LatestRunSummary"];
-export type Schedule = components["schemas"]["ScheduleSummary"];
+// Named `ScheduleSummary`, not `Schedule` — this is the compact fold `GET
+// /websites?include=latest_run` embeds in each row (enough to render "every 6 hours, next
+// at 14:00"), a genuinely smaller type than the full schedule `lib/api/schedules.ts` owns
+// under the name `Schedule`. Two exports named `Schedule` for two different shapes is
+// exactly the drift this ticket's typed-client discipline exists to prevent — the OpenAPI
+// schema itself draws this line (`ScheduleSummary` vs. `ScheduleResponse`), and this alias
+// keeps that distinction visible at the call site instead of erasing it for brevity.
+export type ScheduleSummary = components["schemas"]["ScheduleSummary"];
 export type WebsiteAlreadyExistsDetail = components["schemas"]["WebsiteAlreadyExistsDetail"];
 
 /**

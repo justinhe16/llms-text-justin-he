@@ -20,6 +20,8 @@ import { getHealth, type HealthStatus } from "./health";
 import type { RunStatus } from "./run-status";
 import { getRun, listRuns } from "./runs";
 import type { RunDetail, RunPage } from "./runs";
+import { getSchedule, putSchedule } from "./schedules";
+import type { Schedule } from "./schedules";
 import { createWebsite, deleteWebsite, getWebsite, listWebsites } from "./websites";
 import type { Website, WebsiteListItem } from "./websites";
 
@@ -72,6 +74,23 @@ export type AssertListRunsReturnsRunPage = Expect<
 
 export type AssertGetRunReturnsRunDetail = Expect<
   Equal<Awaited<ReturnType<typeof getRun>>, RunDetail>
+>;
+
+// `getSchedule` resolves `Schedule | null`, and the `| null` is the entire point of this
+// assertion rather than an incidental detail of it. `GET /websites/{id}/schedule` answers
+// `200` with a `null` body when a website simply has no schedule yet — a normal state, not
+// an error (`get_schedule` in backend/app/api/routers/schedules.py reserves `404` for an
+// unknown *website*). `Equal<>` is exact, so this fails just as loudly if the null is ever
+// dropped — leaving call sites to dereference a schedule that isn't there — as it would if
+// a non-nullable response were widened for no reason.
+export type AssertGetScheduleReturnsNullableSchedule = Expect<
+  Equal<Awaited<ReturnType<typeof getSchedule>>, Schedule | null>
+>;
+
+// `putSchedule`, by contrast, is NOT nullable: the upsert always returns the schedule it
+// just wrote, so a caller never has to null-check the thing it just set.
+export type AssertPutScheduleReturnsSchedule = Expect<
+  Equal<Awaited<ReturnType<typeof putSchedule>>, Schedule>
 >;
 
 // --- RunStatus is derived from the generated schema, not hand-copied --------------------
@@ -131,6 +150,27 @@ async function assertInvalidCallsDoNotCompile(): Promise<void> {
 
   // @ts-expect-error "queued" is not a member of RunStatusName
   await api.get("/websites/{id}/runs", { params: { id: "abc" }, query: { status: "queued" } });
+
+  // The two schedule cases below assert through the named helper (`putSchedule`) rather
+  // than `api.put` directly, on two counts. It is the stronger claim — "calling a helper
+  // with a wrong argument type is a compile error" is the acceptance criterion, and the
+  // helper is what call sites actually use. And it keeps each call to a SINGLE LINE, which
+  // this file structurally requires: `@ts-expect-error` suppresses errors on the one line
+  // immediately after it, so a multi-line call whose offending property sits three lines
+  // down leaves the directive inert — reported by tsc as an unused directive — while the
+  // real error escapes underneath it. Every assertion in this function is one line, and the
+  // directive is always the last comment line before the code. Keep it that way.
+
+  // 90 is not one of the four `ScheduleIntervalMinutes` presets. The backend's
+  // `Literal[60, 360, 1440, 10080]` (schedules/schemas.py) renders as an OpenAPI enum, and
+  // this is where a value outside it stops compiling rather than only failing a runtime 422.
+  // @ts-expect-error interval_minutes 90 is outside the four supported presets
+  await putSchedule("abc", { active: true, interval_minutes: 90 });
+
+  // `UpsertScheduleRequest` requires both fields — there is no partial update on this
+  // endpoint (see that type's own docstring for why) — so a body missing one cannot compile.
+  // @ts-expect-error interval_minutes is required and is missing from this body
+  await putSchedule("abc", { active: true });
 }
 
 // Referenced so this is "used" for lint purposes without ever actually being called —
