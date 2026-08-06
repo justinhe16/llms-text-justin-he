@@ -1,10 +1,12 @@
-"""Every write in the runs feature — two write paths, which arrived from two directions.
+"""Every write in the runs feature — three write paths, which arrived from three directions.
 
 `POST /websites/{id}/runs` owns `insert_manual` and `mark_failed`: create a `pending` run,
 and undo it if enqueueing the job afterwards fails. The crawl worker
 (`app.worker.jobs.crawl_task`) owns `claim_pending` and `mark_processing_failed`: take a
 `pending` run atomically, and record a terminal failure if the crawl never produces an
-artifact.
+artifact. The cron tick (`ScheduleService.run_due_schedules`, reached only through
+`RunService.create_scheduled_run` — ARCHITECTURE.md §3.1) owns `insert_scheduled`: the same
+shape as `insert_manual`, with the two differences `_INSERT_SCHEDULED`'s comment names.
 
 **Why there are two "mark this failed" statements rather than one.** They guard on different
 statuses, and that is the whole of the difference: `mark_failed` fires on the enqueue-failure
@@ -59,6 +61,21 @@ from app.infrastructure.db.base_repository import Writer
 _INSERT_MANUAL: Final = """
     INSERT INTO runs (website_id, "trigger", status, schedule_id)
     VALUES ($1, 'manual', 'pending', NULL)
+    RETURNING id, status, started_at
+"""
+
+# The cron tick's insert — same shape as `_INSERT_MANUAL` above, with exactly two deliberate
+# differences: `'scheduled'` rather than `'manual'` for `"trigger"`, and a real `$2` for
+# `schedule_id` rather than an explicit `NULL`, so a scheduled run always records which
+# schedule produced it. That foreign key is `ON DELETE SET NULL` (db/schema.prisma's
+# `Run.schedule`), not `CASCADE`: deleting a schedule must not delete the runs it already
+# produced, only sever the link — run history outlives the schedule that created it.
+# `started_at` is left to the column default for the same reason `_INSERT_MANUAL` leaves it:
+# the database is the only place that value is decided, and `RETURNING` is the only place it
+# can be read back.
+_INSERT_SCHEDULED: Final = """
+    INSERT INTO runs (website_id, "trigger", status, schedule_id)
+    VALUES ($1, 'scheduled', 'pending', $2)
     RETURNING id, status, started_at
 """
 
@@ -140,6 +157,36 @@ class RunsWriter(Writer):
                 `WebsitesWriter.insert` guards the same impossible case.
         """
         row = await self.fetch_one(_INSERT_MANUAL, website_id)
+        if row is None:
+            raise RuntimeError("INSERT INTO runs ... RETURNING produced no row")
+        return row
+
+    async def insert_scheduled(self, website_id: UUID, schedule_id: UUID) -> dict[str, Any]:
+        """Insert one cron-triggered, `pending` run for `website_id` and return it.
+
+        See `_INSERT_SCHEDULED`'s comment for the two ways this differs from `insert_manual`
+        above, and the module docstring for why no ownership check happens here either: the
+        caller is the cron tick, acting on its own behalf, not an HTTP request with a caller
+        to check.
+
+        Args:
+            website_id: The website this run belongs to.
+            schedule_id: The schedule that produced it — always a real id, never `NULL` (that
+                is what distinguishes this INSERT from `insert_manual`'s).
+
+        Returns:
+            A dict with `id`, `status` (always `"pending"`), and `started_at`, matching
+            `insert_manual`'s return shape.
+
+        Raises:
+            asyncpg.ForeignKeyViolationError: if `website_id` or `schedule_id` names a row
+                deleted since the tick locked it — not expected in practice (the tick holds
+                its lock on the `schedules` row across this call), but not caught here either,
+                for the same reason `insert_manual` does not catch its own.
+            RuntimeError: if `RETURNING` somehow produced no row, exactly as `insert_manual`
+                guards the same impossible case.
+        """
+        row = await self.fetch_one(_INSERT_SCHEDULED, website_id, schedule_id)
         if row is None:
             raise RuntimeError("INSERT INTO runs ... RETURNING produced no row")
         return row

@@ -1,22 +1,29 @@
-"""Tests for app.features.schedules.internals.next_run.compute_next_run_at.
+"""Tests for app.features.schedules.internals.next_run.compute_next_run_at and
+advance_next_run_at.
 
 Pure-function tests, no database and no HTTP — in the spirit of
 `tests/test_url_normalize.py`: this module is the one place "what should `next_run_at` become"
 is decided, and it deserves the same exhaustive, no-tolerance treatment url_normalize.py gets.
 
-Every assertion below compares against `_NOW` with `==`, never `pytest.approx` or a delta
-tolerance — a fixed clock passed as `now=` makes every output exact, which is the entire point
-of `compute_next_run_at` taking `now` as a required keyword argument rather than calling
-`datetime.now()` itself.
+Every `compute_next_run_at` assertion below compares against `_NOW` with `==`, never
+`pytest.approx` or a delta tolerance — a fixed clock passed as `now=` makes every output
+exact, which is the entire point of `compute_next_run_at` taking `now` as a required keyword
+argument rather than calling `datetime.now()` itself. `advance_next_run_at`'s own tests, at
+the bottom of this file, are necessarily range assertions instead — jitter is the point of
+that function, so a single exact expected value would defeat what it is testing — but they
+still drive it with a SEEDED `Random`, so a failure is reproducible rather than flaky.
 """
 
 from datetime import UTC, datetime, timedelta
+from random import Random
 
 import pytest
 
 from app.features.schedules.internals.next_run import (
+    MAX_JITTER_FRACTION,
     CurrentSchedule,
     RequestedSchedule,
+    advance_next_run_at,
     compute_next_run_at,
 )
 
@@ -196,5 +203,70 @@ def test_the_result_is_timezone_aware_utc() -> None:
         None, RequestedSchedule(active=True, interval_minutes=60), now=_NOW
     )
     assert result is not None
+    assert result.tzinfo is not None
+    assert result.utcoffset() == timedelta(0)
+
+
+# -----------------------------------------------------------------------------------------
+# advance_next_run_at — the cron tick's own advance. See the pure-function tests above for
+# compute_next_run_at, which this function neither calls nor is called by; the two share only
+# the "now is a required keyword argument" discipline, for the same reason.
+# -----------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "interval_minutes",
+    [
+        pytest.param(60, id="hourly"),
+        pytest.param(360, id="6-hourly"),
+        pytest.param(1440, id="daily"),
+        pytest.param(10080, id="weekly"),
+    ],
+)
+def test_advance_next_run_at_never_leaves_its_five_percent_bound(interval_minutes: int) -> None:
+    """The bound this function promises, checked over many independent seeded draws: every
+    result lands inside `[now + interval * 0.95, now + interval * 1.05]`, inclusive, and the
+    draws are not all identical to each other — a stub that always returned the same offset
+    (including zero) would still pass a test that only checked the bound."""
+    rng = Random(12345)
+    interval = timedelta(minutes=interval_minutes)
+    lower = _NOW + interval * 0.95
+    upper = _NOW + interval * 1.05
+
+    results = [
+        advance_next_run_at(now=_NOW, interval_minutes=interval_minutes, rng=rng)
+        for _ in range(500)
+    ]
+
+    for result in results:
+        assert lower <= result <= upper
+
+    assert len(set(results)) > 1
+
+
+def test_advance_next_run_at_draws_are_reproducible_from_a_seed() -> None:
+    """A seeded `Random` makes this function's output exactly reproducible — the whole point
+    of taking `rng` as a required argument rather than reaching for a module-level source."""
+    first = advance_next_run_at(now=_NOW, interval_minutes=360, rng=Random(42))
+    second = advance_next_run_at(now=_NOW, interval_minutes=360, rng=Random(42))
+    assert first == second
+
+
+def test_advance_next_run_at_offset_respects_the_documented_fraction() -> None:
+    """`MAX_JITTER_FRACTION` is the actual bound this function draws from, not merely a
+    similar-looking constant — this pins the two together directly rather than via a
+    hardcoded `0.05` that could drift from the real constant unnoticed."""
+    rng = Random(7)
+    interval_minutes = 1440
+    max_offset = timedelta(minutes=interval_minutes) * MAX_JITTER_FRACTION
+
+    result = advance_next_run_at(now=_NOW, interval_minutes=interval_minutes, rng=rng)
+
+    plain = _NOW + timedelta(minutes=interval_minutes)
+    assert abs(result - plain) <= max_offset
+
+
+def test_advance_next_run_at_result_is_timezone_aware_utc() -> None:
+    result = advance_next_run_at(now=_NOW, interval_minutes=60, rng=Random(1))
     assert result.tzinfo is not None
     assert result.utcoffset() == timedelta(0)

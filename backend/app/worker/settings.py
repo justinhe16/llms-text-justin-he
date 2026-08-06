@@ -16,12 +16,14 @@ introduce a base class here, and do not set these from a loop or a mixin.
 import logging
 from typing import Any
 
+from arq import cron
+
 from app.core.logging import configure_logging
 from app.core.settings import settings
 from app.features.crawl.http_client import build_crawl_client
 from app.infrastructure.db.pool import close_pool, open_pool
 from app.infrastructure.queue.pool import redis_settings_from_url
-from app.worker.jobs import crawl_task, noop
+from app.worker.jobs import crawl_task, noop, schedule_tick
 
 
 logger = logging.getLogger(__name__)
@@ -154,6 +156,17 @@ JOB_TIMEOUT_SECONDS = 180
 # crawl. 300s is Fly's ceiling for `kill_timeout`, which is what bounds this whole ladder.
 JOB_COMPLETION_WAIT_SECONDS = 200
 
+# How long ONE cron tick may run before arq cancels it — deliberately much tighter than
+# JOB_TIMEOUT_SECONDS above, which governs `crawl_task`. A tick that has not finished in 50s
+# has not finished inside its own 60-second window (`cron_jobs` below fires one every
+# minute), so letting it run all the way to the 180s `job_timeout` would only delay the
+# signal that the tick is saturated — it would already be overdue for its NEXT run before
+# arq ever cancelled it. Cancelling loses nothing correctness-wise: `SchedulesReader.
+# lock_due`'s `FOR UPDATE SKIP LOCKED` makes two overlapping ticks safe rather than
+# corrupting (`schedules/internals/schedules_reader.py`), and an uncommitted transaction
+# simply rolls back, so the next tick redoes whatever work this one did not finish.
+CRON_TICK_TIMEOUT_SECONDS = 50
+
 
 class WorkerSettings:
     """Loaded by `arq app.worker.settings.WorkerSettings`.
@@ -175,6 +188,38 @@ class WorkerSettings:
     # "enqueue -> picked up" an observable event independent of whether a crawl itself
     # succeeds. See jobs.py.
     functions = [noop, crawl_task]
+
+    # THE CRON TICK. Declared directly on the class, like every other setting here — the
+    # module docstring's warning about inherited attributes applies just as much to
+    # `cron_jobs` as to `functions` or `poll_delay`, because `arq.worker.get_kwargs()` reads
+    # `WorkerSettings.__dict__` for this name exactly like every other one.
+    #
+    # `second=0` is what "every 60 seconds" means to arq's cron scheduler: it fires once,
+    # at second 0 of every minute, forever — not a `while True: sleep(60)` loop this process
+    # would have to keep alive itself. That is the whole reason this is a cron job and not a
+    # background task the worker starts by hand: arq's scheduler does not drift the way a
+    # sleep loop measured against its own wall-clock eventually does, and it survives a
+    # worker restart with no state to recover — the next minute boundary just fires it again.
+    #
+    # `max_tries=1`: a tick that raises is retried by the NEXT tick, one minute later,
+    # against WHATEVER STATE IS TRUE THEN — never immediately re-run against the same,
+    # possibly partially-advanced state that made it fail the first time. arq's default
+    # retry behaviour (backoff and re-run the same job) is right for a job with one clear
+    # unit of work to redo; it is wrong for a tick, which would otherwise retry a failure
+    # from a few seconds ago instead of re-evaluating what is due right now.
+    #
+    # `unique=True` (arq's own default, left unset here rather than restated) reduces
+    # duplicate ticks across more than one worker process, but it is NOT what makes this
+    # tick correct — it is a best-effort lock arq keeps in Redis, and this system does not
+    # lean on it. `FOR UPDATE SKIP LOCKED` (`SchedulesReader.lock_due`) is what makes two
+    # ticks running at the same instant, on the same worker or two different ones, safe
+    # rather than a source of duplicate runs — and it has to be, because arq's uniqueness
+    # guarantee is exactly as good as its connection to Redis at the moment it matters.
+    #
+    # `timeout=CRON_TICK_TIMEOUT_SECONDS` — see that constant's own comment.
+    cron_jobs = [
+        cron(schedule_tick, second=0, max_tries=1, timeout=CRON_TICK_TIMEOUT_SECONDS),
+    ]
 
     # Named differently from the settings they land on, rather than the `on_startup =
     # on_startup` the arq README shows: inside a class body that reads as a self-

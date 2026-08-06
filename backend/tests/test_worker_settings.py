@@ -18,7 +18,7 @@ from arq.worker import Worker, get_kwargs
 from app.core.settings import settings
 from app.infrastructure.queue.pool import redis_settings_from_url
 from app.worker import settings as worker_settings
-from app.worker.jobs import crawl_task, noop
+from app.worker.jobs import crawl_task, noop, schedule_tick
 from app.worker.settings import WorkerSettings
 
 
@@ -128,6 +128,12 @@ async def test_the_declared_values_arrive_on_a_constructed_worker() -> None:
 
     The test above proves the names are recognized; this proves the values land. Together
     they cover both halves of "arq is really running with what this file says".
+
+    `worker.functions` includes `"cron:schedule_tick"` alongside the two plain job names:
+    `Worker.__init__` folds every `cron_jobs` entry into the same `functions` dict it builds
+    from `functions=`, keyed by each `CronJob`'s own `.name` (arq's default is
+    `"cron:" + coroutine.__qualname__` — see `test_cron_jobs_registers_the_schedule_tick`
+    below for where that default is pinned rather than assumed here).
     """
     worker = Worker(**{**get_kwargs(WorkerSettings), "handle_signals": False})
     try:
@@ -135,9 +141,34 @@ async def test_the_declared_values_arrive_on_a_constructed_worker() -> None:
         assert worker.max_jobs == WorkerSettings.max_jobs
         assert worker.job_timeout_s == WorkerSettings.job_timeout
         assert worker._job_completion_wait == WorkerSettings.job_completion_wait
-        assert set(worker.functions) == {noop.__qualname__, crawl_task.__qualname__}
+        assert set(worker.functions) == {
+            noop.__qualname__,
+            crawl_task.__qualname__,
+            "cron:schedule_tick",
+        }
+        # The declared `cron_jobs` list itself reached the constructed `Worker`, not merely
+        # its name landing in `functions` above.
+        assert len(worker.cron_jobs) == 1
+        assert worker.cron_jobs[0].coroutine is schedule_tick
     finally:
         await worker.close()
+
+
+def test_cron_jobs_registers_the_schedule_tick() -> None:
+    """`cron_jobs` is non-empty, names the tick, and fires once a minute with one retry.
+
+    `second == 0`, not `{0}`: the installed arq (checked directly with a throwaway `cron()`
+    call, not guessed) stores whatever was passed to `second=` verbatim on the `CronJob`
+    dataclass rather than normalizing it to a set at construction time — normalization
+    happens later, inside `CronJob.calculate_next`, not here.
+    """
+    assert WorkerSettings.cron_jobs
+    (tick,) = WorkerSettings.cron_jobs
+    assert tick.coroutine is schedule_tick
+    assert tick.name == "cron:schedule_tick"
+    assert tick.second == 0
+    assert tick.max_tries == 1
+    assert tick.timeout_s == worker_settings.CRON_TICK_TIMEOUT_SECONDS
 
 
 def test_crawl_task_is_registered_under_the_literal_name_a_sibling_ticket_enqueues() -> None:

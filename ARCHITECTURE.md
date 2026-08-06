@@ -221,7 +221,7 @@ backend/app/worker/
 connection from arq. Nothing in `app/api/` or `app/features/` imports `app/worker/` — the
 dependency runs the other way, so the queue never enters a request path.
 
-Three properties of `WorkerSettings` are load-bearing enough to state here, because each
+Four properties of `WorkerSettings` are load-bearing enough to state here, because each
 fails silently rather than loudly:
 
 - **`poll_delay = 5`, not arq's 0.5.** An idle worker issues one Redis command per poll, and
@@ -232,6 +232,13 @@ fails silently rather than loudly:
   on Fly with no HTTP listener to fail a health check. A no-op job holds the place.
 - **`job_completion_wait` is non-zero.** It is the only thing that makes SIGTERM drain
   rather than cancel, and it has to nest inside `fly.toml`'s `kill_timeout`.
+- **`cron_jobs` registers the schedule tick, once a minute, with `max_tries=1`.** It is the
+  only writer of `schedules.last_run_at` besides the run pipeline itself, and it is the one
+  place in this codebase where more than one worker machine racing the same work is a real
+  scenario rather than a theoretical one. Its correctness under that scenario rests entirely
+  on `SchedulesReader.lock_due`'s `FOR UPDATE SKIP LOCKED`, not on arq's own best-effort
+  `unique=True` — a distinction that is invisible with a single worker and only starts to
+  matter the day a second one is added.
 
 Startup and shutdown hooks (`on_startup`/`on_shutdown`) open and close the asyncpg pool with
 **the same factory the API's lifespan uses**, and publish shared resources on arq's context

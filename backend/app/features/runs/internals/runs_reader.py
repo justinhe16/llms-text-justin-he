@@ -5,9 +5,15 @@ needs.
 
 Nothing below this docstring changed to make room for any of them — every query here is
 still a plain `SELECT`, and this reader knows nothing about `runs_writer.py`. The three
-queries at the bottom of this module do belong to the manual-trigger path even though all
-three are `SELECT`s: the duplicate-run guard and both abuse caps are read-then-decide checks
-the service runs before it opens a transaction, not writes in their own right.
+queries `_ACTIVE_FOR_WEBSITE`, `_COUNT_ACTIVE_MANUAL_FOR_USER`, and
+`_COUNT_AND_OLDEST_SINCE_FOR_USER` belong to the manual-trigger path even though all three are
+`SELECT`s: the duplicate-run guard and both abuse caps are read-then-decide checks the service
+runs before it opens a transaction, not writes in their own right. A fourth,
+`_WEBSITE_IDS_WITH_ACTIVE_RUNS`, belongs to a different write path entirely — the cron tick's
+`ScheduleService.run_due_schedules`, reached only through `RunService.website_ids_with_active_
+runs` (ARCHITECTURE.md §3.1: one feature calls another feature's service, never its reader) —
+and is documented beside `_ACTIVE_FOR_WEBSITE` below because it answers the same underlying
+question in batch rather than one website at a time.
 
 **READS IN THIS FILE ARE INTENTIONALLY NOT SCOPED TO THE CALLER — WITH ONE NAMED EXCEPTION.**
 Same rule as `websites_reader.py` (ARCHITECTURE.md §4.1): `list_by_website` returns a
@@ -130,6 +136,7 @@ started_at)`, but its `SELECT` computes averages, `date_trunc` buckets, and a ze
 aggregate for a computed column to break.
 """
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Final
 from uuid import UUID
@@ -213,6 +220,24 @@ _ACTIVE_FOR_WEBSITE: Final = """
     WHERE website_id = $1 AND status IN ('pending', 'processing')
     ORDER BY started_at DESC, id DESC
     LIMIT 1
+"""
+
+# The cron tick's batch version of the same question `_ACTIVE_FOR_WEBSITE` answers for one
+# website at a time: "of these websites, which already have a run in flight?"
+# `status IN ('pending', 'processing')` is written CHARACTER FOR CHARACTER identical to
+# `_ACTIVE_FOR_WEBSITE`'s own — not merely equivalent to it — because that textual match is
+# what lets the planner recognize this WHERE clause as exactly what `runs_status_active_idx`'s
+# partial predicate answers (see that query's own comment, and this module's docstring, for
+# why a logically-equivalent rewrite is not good enough). One `ANY($1::uuid[])` probe for the
+# whole locked batch, rather than up to `DUE_BATCH_LIMIT` (`schedules/service.py`) separate
+# single-website lookups: the tick holds a transaction open across this call, so 50 round
+# trips instead of one would mean 50x the time a lock (and a pooled connection) stays held for
+# no benefit. `SELECT DISTINCT website_id`, not `id`: the caller only ever asks "is this
+# website blocked", never which run is blocking it.
+_WEBSITE_IDS_WITH_ACTIVE_RUNS: Final = """
+    SELECT DISTINCT website_id
+    FROM runs
+    WHERE website_id = ANY($1::uuid[]) AND status IN ('pending', 'processing')
 """
 
 # The per-user concurrency cap. `trigger = 'manual'` is the one filter that makes this query
@@ -404,6 +429,27 @@ class RunsReader(Reader):
         bare existence check because the `409` this feeds needs the row's `id` and `status`.
         """
         return await self.fetch_one(_ACTIVE_FOR_WEBSITE, website_id)
+
+    async def website_ids_with_active_runs(self, website_ids: Sequence[UUID]) -> set[UUID]:
+        """Return the subset of `website_ids` that already have a `pending`/`processing` run.
+
+        The cron tick's batch probe — see `_WEBSITE_IDS_WITH_ACTIVE_RUNS` above for why this
+        is one query rather than `len(website_ids)` calls to `get_active_for_website`.
+
+        Args:
+            website_ids: The websites behind one tick's locked batch of due schedules. Empty
+                is a legitimate call (a tick that locked nothing): answered without a query,
+                the same early-return `SchedulesWriter`'s batched advances use for the same
+                reason.
+
+        Returns:
+            A `set`, not a `list`: every call site only ever asks "is this website's id a
+            member of the blocked set", an O(1) question a `set` answers and a `list` does not.
+        """
+        if not website_ids:
+            return set()
+        rows = await self.fetch_all(_WEBSITE_IDS_WITH_ACTIVE_RUNS, list(website_ids))
+        return {row["website_id"] for row in rows}
 
     async def count_active_manual_for_user(self, user_id: UUID) -> int:
         """Count `user_id`'s in-flight MANUAL runs, across every website they own.

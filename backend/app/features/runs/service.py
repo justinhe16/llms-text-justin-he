@@ -123,16 +123,38 @@ overshoot of a cap under genuine concurrency (two tabs, two devices, a client re
 its own original request) is an accepted cost of enforcing this in application code rather
 than in the database, and it self-corrects the moment the in-flight run in question finishes
 or the 24h window moves.
+
+## Two methods that take an already-open `Connection`, and why they are the only ones
+
+`create_scheduled_run` and `website_ids_with_active_runs` are shaped differently from every
+other method on this service: they take a `connection: Connection` keyword argument, run one
+reader or writer call on it, and open no transaction of their own. That shape exists for
+exactly one caller — `ScheduleService.run_due_schedules`, the cron tick — and for a reason
+worth spelling out rather than discovering by reading two call sites and wondering why they
+disagree with the rest of this file.
+
+The cron tick has to lock `schedules` rows and insert the `runs` rows they produce in **one**
+transaction (§5: one unit of work), and it has to do it without either feature reaching into
+the other's `internals/` (§3.1). Those two rules can only both hold if the runs SQL stays
+behind `RunService` while executing on the connection the *caller's* `transaction()` opened.
+So these two methods take a `Connection` keyword argument, run one reader/writer call on it,
+and open no transaction of their own — the same relationship a `Writer` already has to the
+connection it is constructed with, lifted one layer up. They are deliberately the only methods
+here shaped that way; every other method on this service owns its own unit of work. The
+alternative — `ScheduleService` importing `RunsWriter` — is the import §3.1 exists to forbid,
+and the other alternative — two transactions — would let a schedule advance without its run,
+or a run exist whose schedule never advanced.
 """
 
 import json
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
 from arq.connections import ArqRedis
-from asyncpg import ForeignKeyViolationError, Pool
+from asyncpg import Connection, ForeignKeyViolationError, Pool
 from fastapi import HTTPException, status
 
 from app.core.auth.ownership import require_owner
@@ -466,7 +488,7 @@ class RunService:
         runs and before the transaction opens — for the same reason
         `ScheduleService.upsert_schedule` captures its own clock in the service rather than
         letting Postgres supply one: the 24h window bound, the reset-time arithmetic in
-        `_enforce_run_caps`, and the `completed_at` `_abandon_unqueued_run` would write on
+        `_enforce_run_caps`, and the `completed_at` `abandon_unqueued_run` would write on
         the failure path all have to agree with each other, and a pure function (or, here,
         several separate queries and a possible later write) cannot be handed `now()` without
         first evaluating it in application code.
@@ -482,7 +504,7 @@ class RunService:
                 `.max_runs_per_day_per_user`). `503` if the job could not be enqueued after
                 the run row was already committed; that row is marked `failed` before this
                 raises, so it is never left `pending` with nothing behind it (barring the
-                second failure `_abandon_unqueued_run`'s own docstring covers).
+                second failure `abandon_unqueued_run`'s own docstring covers).
         """
         website = await self._website_service.get_website(website_id)  # 404
         require_owner(website, user_id)  # 403 — nothing between these two lines
@@ -520,7 +542,7 @@ class RunService:
             logger.error(
                 "Failed to enqueue %s for run %s", CRAWL_TASK_JOB_NAME, run_id, exc_info=True
             )
-            await self._abandon_unqueued_run(run_id, now)
+            await self.abandon_unqueued_run(run_id, now)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_ENQUEUE_FAILED_DETAIL
             ) from None
@@ -565,20 +587,28 @@ class RunService:
             resets_at = window["oldest_started_at"] + timedelta(hours=24)
             raise _daily_limit_exceeded(daily_limit, resets_at, now)
 
-    async def _abandon_unqueued_run(self, run_id: UUID, now: datetime) -> None:
+    async def abandon_unqueued_run(self, run_id: UUID, now: datetime) -> None:
         """Mark `run_id` `failed` after its enqueue failed, so it is not left `pending`
         with nothing acting on it.
 
-        `now` is the SAME instant `trigger_run` captured before opening its insert
-        transaction, passed through rather than re-read, so `started_at` and `completed_at`
-        on the same row cannot disagree about what "now" meant by a few milliseconds.
+        Public — not `_abandon_unqueued_run` — because it is called from two places for the
+        same reason: `trigger_run`'s `503` path below, and `ScheduleService.run_due_schedules`'
+        `_enqueue`, after the cron tick's own insert-then-enqueue ordering hits the same
+        failure mode `trigger_run`'s module docstring argues at length. Both callers need the
+        identical guarantee — a run is never left `pending` with nothing behind it — so this
+        is one method rather than two copies that could drift.
+
+        `now` is the SAME instant the caller captured before opening its insert transaction,
+        passed through rather than re-read, so `started_at` and `completed_at` on the same row
+        cannot disagree about what "now" meant by a few milliseconds.
 
         This is itself wrapped in `try`/`except` because it is the last line of defense:
         if THIS write also fails — the database becoming unreachable at the worst possible
         moment — the run is exactly the orphan a stuck-run reaper (ARCHITECTURE.md §6.4)
-        exists to sweep, and the honest response to the caller is still the `503`
-        `trigger_run` raises immediately after this returns, not a `500` that implies a bug
-        in this service rather than an infrastructure failure it could not route around.
+        exists to sweep, and the honest response to the caller is still whatever failure
+        `trigger_run` or the tick raises/logs immediately after this returns, not a `500`
+        that implies a bug in this service rather than an infrastructure failure it could not
+        route around.
         """
         try:
             async with transaction(self._pool) as tx:
@@ -650,3 +680,48 @@ class RunService:
         """
         async with transaction(self._pool) as tx:
             await RunsWriter(tx).mark_processing_failed(run_id, error)
+
+    async def create_scheduled_run(
+        self, website_id: UUID, schedule_id: UUID, *, connection: Connection
+    ) -> UUID:
+        """Insert one cron-triggered, `pending` run for `website_id` and return its id.
+
+        Called only from `ScheduleService.run_due_schedules`, on the `Connection` that
+        method's own `transaction()` already opened — see the module docstring's "Two
+        methods that take an already-open `Connection`" section for why this method's shape
+        is the exception rather than the rule on this service, and why it opens no
+        transaction of its own.
+
+        Args:
+            website_id: The website to run. Already known to exist and to be active — the
+                tick locked its `schedules` row inside the same transaction this connection
+                belongs to.
+            schedule_id: The schedule that produced this run.
+            connection: The `Connection` the cron tick's own `transaction()` yielded. This
+                method neither commits nor rolls it back.
+
+        Returns:
+            The new run's id.
+        """
+        row = await RunsWriter(connection).insert_scheduled(website_id, schedule_id)
+        run_id: UUID = row["id"]
+        return run_id
+
+    async def website_ids_with_active_runs(
+        self, website_ids: Sequence[UUID], *, connection: Connection
+    ) -> set[UUID]:
+        """Return the subset of `website_ids` that already have a `pending`/`processing` run.
+
+        Called only from `ScheduleService.run_due_schedules`, on the same `Connection` as
+        `create_scheduled_run` above — see that method's docstring and the module docstring's
+        "Two methods that take an already-open `Connection`" section for why.
+
+        Args:
+            website_ids: The websites behind one tick's locked batch of due schedules.
+            connection: The `Connection` the cron tick's own `transaction()` yielded.
+
+        Returns:
+            The subset of `website_ids` blocked by an in-flight run — see
+            `RunsReader.website_ids_with_active_runs` for why this is a `set`.
+        """
+        return await RunsReader(connection).website_ids_with_active_runs(website_ids)
