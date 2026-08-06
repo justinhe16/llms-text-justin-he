@@ -23,6 +23,7 @@ from app.core.settings import settings
 from app.features.crawl.http_client import build_crawl_client
 from app.infrastructure.db.pool import close_pool, open_pool
 from app.infrastructure.queue.pool import redis_settings_from_url
+from app.infrastructure.storage.supabase_storage import build_storage_client, build_supabase_storage
 from app.worker.jobs import crawl_task, noop, schedule_tick
 
 
@@ -60,11 +61,19 @@ async def open_worker_resources(ctx: dict[Any, Any]) -> None:
       receives its pool through FastAPI dependency injection; there is no injector here,
       so `get_pool()` is the equivalent.
     * `ctx["db_pool"]` is arq's own idiom, and it is the pattern this function follows for
-      every other resource it wants to build once instead of per job. `ctx["http_client"]`,
-      added below, is the first of those: the crawl task's shared `httpx.AsyncClient`
-      (`app.features.crawl.http_client.build_crawl_client`), read by `crawl_task`
-      (`jobs.py`) on every call rather than opened fresh per job. One place to add them,
-      one place to close them.
+      every other resource it wants to build once instead of per job. `ctx["http_client"]`
+      (the crawl task's shared `httpx.AsyncClient`,
+      `app.features.crawl.http_client.build_crawl_client`) and `ctx["storage_client"]` /
+      `ctx["storage"]` (Supabase Storage's client and the thin wrapper around it,
+      `app.infrastructure.storage.supabase_storage`), both added below, are the rest of
+      those: every one is read by `crawl_task` (`jobs.py`) on every call rather than opened
+      fresh per job. One place to add them, one place to close them.
+
+    `storage_client` and `storage` are two separate `ctx` keys, deliberately, mirroring the
+    relationship `SupabaseStorage` documents in its own module: `SupabaseStorage` is handed a
+    client and never owns it, so the thing that built the client (`build_storage_client`) is
+    the thing `close_worker_resources` below closes, and the thing built from it
+    (`build_supabase_storage`) is a separate value with nothing of its own to close.
 
     Errors are logged at CRITICAL and re-raised. arq's `Worker.run()` only swallows
     `CancelledError`, so re-raising exits the process with a traceback; the log line above
@@ -85,24 +94,32 @@ async def open_worker_resources(ctx: dict[Any, Any]) -> None:
         raise
     # After the pool, and unguarded: constructing an `httpx.AsyncClient` opens no socket
     # and makes no network call (see `build_crawl_client`'s own docstring), so there is no
-    # way for this line to fail the way the pool open above can.
+    # way for these lines to fail the way the pool open above can.
     ctx["http_client"] = build_crawl_client(settings)
+    ctx["storage_client"] = build_storage_client(settings)
+    ctx["storage"] = build_supabase_storage(ctx["storage_client"], settings)
     logger.info("ARQ worker ready (poll_delay=%ss, max_jobs=%s)", POLL_DELAY_SECONDS, MAX_JOBS)
 
 
 async def close_worker_resources(ctx: dict[Any, Any]) -> None:
-    """Close the shared `httpx.AsyncClient` and the Postgres pool.
+    """Close the shared `httpx.AsyncClient`s and the Postgres pool.
 
     Called by `Worker.close()` after the in-flight jobs have finished or been cancelled,
     and before arq closes its own Redis connection. Safe if `on_startup` never got as far
-    as opening either resource: `ctx.get("http_client")` is `None` and skipped, and
-    `close_pool()` is a no-op when there is nothing to close — both matter because
-    `Worker.run()`'s `finally` calls this even on a failed startup.
+    as opening any of these resources: every `ctx.get(...)` below is `None` and skipped when
+    that is so, and `close_pool()` is a no-op when there is nothing to close — all of that
+    matters because `Worker.run()`'s `finally` calls this even on a failed startup.
+
+    Closes `storage_client`, not `storage` — `SupabaseStorage` never owns the client it is
+    handed (see its own module docstring), so it has nothing to close itself.
     """
     logger.info("ARQ worker shutting down")
     http_client = ctx.get("http_client")
     if http_client is not None:
         await http_client.aclose()
+    storage_client = ctx.get("storage_client")
+    if storage_client is not None:
+        await storage_client.aclose()
     await close_pool()
 
 
@@ -112,11 +129,18 @@ async def close_worker_resources(ctx: dict[Any, Any]) -> None:
 #
 # An idle arq worker issues exactly one command per poll — a single ZRANGEBYSCORE over the
 # queue's sorted set (`Worker._poll_iteration`); the heartbeat beside it early-returns
-# until `health_check_interval` elapses, and there are no cron jobs. So the poll interval
-# alone sets the idle command rate, and Upstash bills per command:
+# until `health_check_interval` elapses. So the poll interval alone sets the idle command
+# rate, and Upstash bills per command:
 #
 #     poll_delay = 0.5 (arq's default)  ->  2 polls/s   x 86,400 s = 172,800 commands/day
 #     poll_delay = 5   (this setting)   ->  0.2 polls/s x 86,400 s =  17,280 commands/day
+#
+# An earlier revision of this comment justified "one command per poll" partly with "and
+# there are no cron jobs". `cron_jobs` below has since added one, and the arithmetic above
+# is unchanged — arq decides whether a cron job is due with local time math inside the same
+# poll iteration and only touches Redis on the minute it actually fires, so the tick adds
+# roughly one enqueue a minute rather than anything per poll. What would invalidate this
+# block is a SECOND cron job on a sub-minute schedule, not this one.
 #
 # Ten times cheaper, for doing nothing at all. What it costs is up to 5 seconds of latency
 # before a queued job starts, which is irrelevant against a crawl measured in tens of

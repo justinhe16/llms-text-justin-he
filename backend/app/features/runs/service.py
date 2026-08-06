@@ -10,13 +10,17 @@ retrofit one into `list_runs` or `get_run`." That is exactly what happened, twic
 
 * `trigger_run` — the HTTP write behind `POST /websites/{id}/runs`, with its abuse caps and
   duplicate-run guard in the private helpers beside it.
-* `claim_for_processing` and `record_failure` — the worker's pair, called from
-  `app.worker.jobs.crawl_task` by way of `app.features.crawl.service.CrawlService`. The
-  first wraps `RunsWriter.claim_pending`, the atomic `pending -> processing` guard the crawl
-  takes before it fetches a single byte; the second wraps
-  `RunsWriter.mark_processing_failed`, for a crawl that never produces an artifact. They are
-  two independent transactions on purpose — the crawl itself happens BETWEEN them, and a
-  network call must never run inside a transaction (ARCHITECTURE.md §5.1).
+* `claim_for_processing`, `record_success`, and `record_failure` — the worker's trio, called
+  from `app.worker.jobs.crawl_task` by way of `app.features.crawl.service.CrawlService`.
+  `claim_for_processing` wraps `RunsWriter.claim_pending`, the atomic `pending -> processing`
+  guard the crawl takes before it fetches a single byte. `record_success` wraps
+  `RunsWriter.mark_processing_completed`, for a crawl whose payload has already been uploaded
+  to Storage. `record_failure` wraps `RunsWriter.mark_processing_failed`, for a crawl that
+  never produces an artifact — whether because the seed never fetched, the crawl itself
+  raised, or the Storage upload after a successful crawl failed. All three are independent
+  transactions on purpose — the crawl, and the Storage upload `record_success` requires to
+  have already happened, both happen BETWEEN them, and a network call must never run inside a
+  transaction (ARCHITECTURE.md §5.1).
 
 `list_runs`, `get_run`, and `get_website_stats` are unchanged by any of it, and open no
 transaction of their own.
@@ -662,7 +666,48 @@ class RunService:
         async with transaction(self._pool) as tx:
             return await RunsWriter(tx).claim_pending(run_id)
 
-    async def record_failure(self, run_id: UUID, error: str) -> None:
+    async def record_success(
+        self, run_id: UUID, *, llms_txt: str, storage_path: str, stats: dict[str, Any]
+    ) -> None:
+        """Record a completed crawl for a run this worker had already claimed.
+
+        **The Storage upload has ALREADY HAPPENED by the time this is called.**
+        `storage_path` is `SupabaseStorage.upload`'s return value, not a location this method
+        is about to write to — `app.features.crawl.service.CrawlService.execute_run` uploads
+        the payload first and calls this only once that upload has succeeded. Reversing that
+        order — opening this transaction and uploading from inside it — is exactly the
+        ordering ARCHITECTURE.md §5.1 forbids: it would hold a database transaction open
+        across a network call whose duration this codebase does not control, and it would let
+        a run be recorded `completed` before the artifact it points at necessarily exists.
+
+        Opens exactly one `transaction(self._pool)` and calls
+        `RunsWriter.mark_processing_completed` inside it. **Nothing else may go in that
+        block** — no network call, no second statement — for the same reason every other
+        transaction in this codebase is kept to one unit of work (ARCHITECTURE.md §5).
+
+        If the writer returns `False`, the row was no longer `processing` — something else
+        (a redelivered job that raced this one, a reaper) already reached a terminal state.
+        That is logged at WARNING, naming `run_id`, rather than raised: the object this run's
+        payload was uploaded to is now an orphan, which is the benign half of the
+        upload-then-write ordering trade — a wasted upload costs a fraction of a cent, while
+        the alternative ordering could have left a `completed` row pointing at nothing. See
+        ARCHITECTURE.md §11 for where that orphan is tracked as known debt.
+        """
+        async with transaction(self._pool) as tx:
+            completed = await RunsWriter(tx).mark_processing_completed(
+                run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
+            )
+        if not completed:
+            logger.warning(
+                "crawl: run %s was no longer processing when its success was recorded; its "
+                "uploaded payload at %s is now orphaned",
+                run_id,
+                storage_path,
+            )
+
+    async def record_failure(
+        self, run_id: UUID, error: str, stats: dict[str, Any] | None = None
+    ) -> None:
         """Record the terminal failure of a run this worker had already claimed.
 
         Calls `RunsWriter.mark_processing_failed`, NOT `mark_failed`. The two are not
@@ -677,9 +722,15 @@ class RunService:
         not inspect, truncate, or otherwise second-guess it, because `runs.error` is
         readable by every signed-in user (ARCHITECTURE.md §4.1) and this feature has no way
         to tell a safe message from an unsafe one after the fact.
+
+        `stats` is threaded straight through to `RunsWriter.mark_processing_failed`, which
+        `COALESCE`s it against whatever is already stored rather than overwriting with `NULL`
+        — this method does not second-guess that either. Pass whatever partial numbers the
+        caller has (`internals/run_stats.py`'s `build_run_stats`, if a `CrawlResult` exists to
+        build it from) or omit it entirely when nothing usable exists yet.
         """
         async with transaction(self._pool) as tx:
-            await RunsWriter(tx).mark_processing_failed(run_id, error)
+            await RunsWriter(tx).mark_processing_failed(run_id, error, stats)
 
     async def create_scheduled_run(
         self, website_id: UUID, schedule_id: UUID, *, connection: Connection

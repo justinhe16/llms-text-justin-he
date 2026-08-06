@@ -8,17 +8,24 @@ in this feature that calls another feature's service.
 `app.api.routers.runs.get_run_service` builds a `WebsiteService` alongside a `RunService` for
 the API.
 
-**The network call happens outside every transaction** (ARCHITECTURE.md §5.1). `crawl_site`
-runs between the atomic claim (`RunService.claim_for_processing`, its own short transaction)
-and whatever happens after it (`RunService.record_failure`, a second, independent
-transaction) — never inside either one. `CrawlService` itself opens no transaction at all;
-both of the ones this method touches belong to `RunService`.
+**The network calls happen outside every transaction** (ARCHITECTURE.md §5.1). `crawl_site`
+and the Storage upload both run between the atomic claim (`RunService.claim_for_processing`,
+its own short transaction) and whatever happens after them (`RunService.record_success` or
+`RunService.record_failure`, a second, independent transaction) — never inside either one.
+`CrawlService` itself opens no transaction at all; every one this method touches belongs to
+`RunService`.
 
-**A successful run is deliberately left `processing`.** Persisting `llms_txt` and flipping
-the row to `completed` needs a `Storage` upload and a third write this ticket does not add —
-that is the next ticket's job. Returning a `CrawlOutcome` without writing it anywhere is the
-honest state of "the crawl half of this pipeline works; the persistence half does not exist
-yet," not an oversight.
+**A successful run uploads its payload, then writes the row — never the other order.** Once
+`generate_llms_txt` has produced an artifact, this method gzips the fetched pages as JSONL
+(`internals/payload.py`), uploads that to Supabase Storage, and only THEN opens the short
+transaction that writes `llms_txt`, `storage_path`, `stats`, and flips the row to `completed`
+(`RunService.record_success`). That order, and not its reverse, is what ARCHITECTURE.md §5.1
+exists to require: uploading first means the worst case of a mid-pipeline failure is an
+orphaned Storage object costing a fraction of a cent, while writing the row first would risk
+a `completed` run whose `storage_path` points at an object that was never actually written —
+a 404 in the UI on a run the database swears succeeded. Nothing about this method holds a
+database transaction open while the upload is in flight; `RunService.record_success` opens
+its own transaction only after `await self._storage.upload(...)` has already returned.
 """
 
 import logging
@@ -30,13 +37,20 @@ from asyncpg import Pool
 from fastapi import HTTPException
 
 from app.core.settings import Settings
-from app.features.crawl.internals.crawler import CrawlLimits, crawl_site
+from app.features.crawl.internals.crawler import CrawlLimits, CrawlResult, crawl_site
 from app.features.crawl.internals.fetcher import ByteBudgetExceededError, FetchError
 from app.features.crawl.internals.llms_txt import generate_llms_txt
+from app.features.crawl.internals.payload import (
+    PAYLOAD_CONTENT_TYPE,
+    payload_object_path,
+    serialize_payload,
+)
+from app.features.crawl.internals.run_stats import build_run_stats
 from app.features.crawl.internals.ssrf import SsrfBlockedError
 from app.features.crawl.schemas import CrawlOutcome
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
+from app.infrastructure.storage.supabase_storage import StorageUploadError, SupabaseStorage
 
 
 logger = logging.getLogger(__name__)
@@ -57,9 +71,19 @@ def _safe_error_message(exc: Exception) -> str:
     curious signed-in user, should never read back out of `runs.error`. `SsrfBlockedError`
     is the one exception whose own message is safe verbatim: it describes the URL the run
     itself is crawling, a fact its owner already knows, never anything about this process.
+
+    `StorageUploadError` gets its own fixed string, same as every other branch below except
+    `SsrfBlockedError` — `SupabaseStorage.upload`'s own message already excludes the service
+    key and the request URL (see that module's docstring), but "already safe" is not the bar
+    this function holds every other exception type to, and there is no reason to make an
+    exception for this one. It is checked before the `httpx` branches for readability only:
+    `StorageUploadError` is this codebase's own type, never an `httpx` one, so there is no
+    overlap between it and the `isinstance` checks that follow.
     """
     if isinstance(exc, SsrfBlockedError):
         message = str(exc)
+    elif isinstance(exc, StorageUploadError):
+        message = "Could not store this run's output."
     elif isinstance(exc, httpx.TimeoutException | TimeoutError):
         # Both spellings, because two different layers time a crawl out and they do not
         # share a base class: httpx raises `httpx.TimeoutException` when one request exceeds
@@ -89,11 +113,13 @@ class CrawlService:
     def __init__(
         self,
         client: httpx.AsyncClient,
+        storage: SupabaseStorage,
         run_service: RunService,
         website_service: WebsiteService,
         settings: Settings,
     ) -> None:
         self._client = client
+        self._storage = storage
         self._runs = run_service
         self._websites = website_service
         self._settings = settings
@@ -113,9 +139,12 @@ class CrawlService:
         than this method racing that same signal to record a failure of its own.
 
         Returns:
-            A `CrawlOutcome` if the seed was fetched and an artifact was generated. The
-            underlying `runs` row is left `processing` even on success — see the module
-            docstring.
+            A `CrawlOutcome` if the seed was fetched, an artifact was generated, it was
+            uploaded to Storage, and the `runs` row was written `completed` — by the time
+            this returns non-`None`, all of that has already happened (see the module
+            docstring). `None` covers every other path, including a Storage upload or a
+            database write that failed after a successful crawl: those are recorded as a
+            `failed` run (see the partial-stats handling below), never left `processing`.
         """
         try:
             run = await self._runs.get_run(run_id)
@@ -135,6 +164,13 @@ class CrawlService:
             logger.info("crawl: run %s lost the claim race to another worker; skipping", run_id)
             return None
 
+        # Hoisted above the `try` so the `except` below can build a partial `stats` dict from
+        # whatever this run actually managed before it failed, rather than reporting nothing
+        # at all. `result` stays `None` for a failure that never got as far as `crawl_site`
+        # returning (e.g. `get_website` raising); `links_emitted` stays 0 for a seed failure,
+        # where `result.stats["pages_crawled"]` is 0 anyway.
+        result: CrawlResult | None = None
+        links_emitted = 0
         try:
             website = await self._websites.get_website(run.website_id)
 
@@ -152,28 +188,55 @@ class CrawlService:
                     message,
                     exc_info=result.seed_error,
                 )
-                await self._runs.record_failure(run_id, message)
+                await self._runs.record_failure(
+                    run_id, message, build_run_stats(result.stats, links_emitted=links_emitted)
+                )
                 return None
 
             llms_txt = generate_llms_txt(result.pages)
+            links_emitted = len(result.pages)
+
+            payload = serialize_payload(result.pages)
+            object_path = payload_object_path(run.website_id, run_id)
+
+            # THE NETWORK CALL. No transaction is open here, and none may be opened around
+            # it (ARCHITECTURE.md §5.1). Upload first: an orphaned object costs a fraction
+            # of a cent, while a committed row pointing at an object that does not exist is
+            # a 404 in the UI on a run the database says succeeded.
+            storage_path = await self._storage.upload(
+                object_path, payload, content_type=PAYLOAD_CONTENT_TYPE
+            )
+
+            stats = build_run_stats(result.stats, links_emitted=links_emitted)
+            await self._runs.record_success(
+                run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
+            )
         except Exception as exc:
             logger.error("crawl: run %s failed unexpectedly", run_id, exc_info=True)
-            await self._runs.record_failure(run_id, _safe_error_message(exc))
+            partial_stats = (
+                build_run_stats(result.stats, links_emitted=links_emitted)
+                if result is not None
+                else None
+            )
+            await self._runs.record_failure(run_id, _safe_error_message(exc), partial_stats)
             return None
 
         logger.info(
-            "crawl: run %s fetched %d page(s) (cap_hit=%s); left `processing` for the "
-            "persistence ticket",
+            "crawl: run %s completed: %d page(s) (cap_hit=%s), storage_path=%s",
             run_id,
             len(result.pages),
             result.stats.get("cap_hit"),
+            storage_path,
         )
-        return CrawlOutcome(llms_txt=llms_txt, stats=result.stats)
+        return CrawlOutcome(llms_txt=llms_txt, stats=stats, storage_path=storage_path)
 
 
-def build_crawl_service(pool: Pool, client: httpx.AsyncClient, settings: Settings) -> CrawlService:
+def build_crawl_service(
+    pool: Pool, client: httpx.AsyncClient, storage: SupabaseStorage, settings: Settings
+) -> CrawlService:
     """Build a `CrawlService` for one job, from the resources `app.worker.jobs.crawl_task`
-    already has on `ctx`: the process-wide pool and the shared crawl `httpx.AsyncClient`.
+    already has on `ctx`: the process-wide pool, the shared crawl `httpx.AsyncClient`, and
+    the shared `SupabaseStorage` client.
 
     Constructs its own `WebsiteService` and `RunService` rather than importing either
     feature's router-level provider function — those are wired for FastAPI's dependency
@@ -185,4 +248,4 @@ def build_crawl_service(pool: Pool, client: httpx.AsyncClient, settings: Setting
     """
     website_service = WebsiteService(pool)
     run_service = RunService(pool, website_service, settings)
-    return CrawlService(client, run_service, website_service, settings)
+    return CrawlService(client, storage, run_service, website_service, settings)

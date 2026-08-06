@@ -302,6 +302,35 @@ local development is a container over plain `redis://`, so a hardcoded `ssl=True
 The same function also turns on the hostname verification arq leaves off by default, so
 there is no route to an unverified TLS connection from this codebase.
 
+### 3.7 The storage infrastructure layer
+
+`backend/app/infrastructure/storage/supabase_storage.py` is the third backing-service
+package, alongside `db/` (§3.5) and `queue/` (§3.6): a pure settings-to-client factory
+(`build_storage_client`) plus a thin wrapper around Supabase Storage's REST upload endpoint
+(`SupabaseStorage`, built by `build_supabase_storage`). It holds no crawl logic and knows
+nothing about runs or websites — it uploads bytes to a path and returns where they landed.
+
+**Deliberately no `open`/`get`/`close` process-wide singleton, unlike `db/` and `queue/`.**
+Both of those exist because FastAPI's request path reaches for a pool built once at API
+startup, through a dependency, shared across requests that did not create it. Nothing under
+`app/api/` ever calls Storage — only `app.features.crawl.service.CrawlService`, built fresh
+per arq job by `app.worker.jobs.crawl_task` from resources `open_worker_resources`
+(`app/worker/settings.py`) already put on that job's `ctx`. There is no second caller and no
+dependency-injection path for a singleton to serve, so this package does not build one; the
+worker's own `ctx` dict already does the "build once per process" job a singleton here would
+duplicate.
+
+**The bucket is private, and its layout is website-scoped.** Every crawl run's raw payload is
+uploaded to `crawl-payloads/{website_id}/{run_id}.jsonl.gz` — gzip-compressed JSONL, one
+fetched page per line (`app.features.crawl.internals.payload`). The bucket name itself is
+configurable (`Settings.supabase_storage_bucket`, default `crawl-payloads`), which is why
+`SupabaseStorage.upload` returns the bucket-qualified path (`f"{bucket}/{object_path}"`)
+rather than the bare object path — the value stored in `runs.storage_path` is self-describing
+regardless of which bucket a deployment configures. The website-scoped prefix is load-bearing
+for the same reason it is documented in `internals/payload.py`: it is what would make "delete
+everything a website ever produced" a single prefix-delete operation, the day that operation
+exists (§11 records that it does not yet).
+
 ---
 
 ## 4. The authorization contract — public read, owner write
@@ -445,6 +474,14 @@ async with self.transaction() as tx:
     await self._writer.set_output(tx, run_id, storage_url, llms_txt)
 ```
 
+This is no longer only illustrative. `app.features.crawl.service.CrawlService.execute_run`
+is the real implementation of the CORRECT shape above: it uploads a run's gzip-compressed
+JSONL payload to Supabase Storage (`app.infrastructure.storage.supabase_storage`), and only
+after that upload has returned does it call `RunService.record_success`, which opens the one
+short `transaction()` that writes `llms_txt`, `storage_path`, `stats`, and `completed_at`.
+Read that method for what this section looks like once a ticket actually builds it, rather
+than treating the snippet above as a hypothetical.
+
 The tradeoff is deliberate: the wrong version risks connection-pool exhaustion and lock
 contention under load, and it makes every remote timeout a database problem. The correct
 version risks an orphaned storage object if the transaction fails afterwards. Orphaned
@@ -556,6 +593,14 @@ rows are the ones that accumulate forever. That index is hand-written in the mig
 Prisma has no syntax for a partial index, and its introspection cannot see one, so it is
 deliberately **not** declared in `schema.prisma` (declaring it makes every later
 `migrate dev` emit a duplicate `CREATE INDEX`).
+
+`llms_txt`, `storage_path`, `stats`, and `completed_at` are no longer merely reserved columns
+waiting for a later ticket — `RunService.record_success` writes all four on every successful
+run (§5.1), and `record_failure` writes `completed_at`, `error`, and whatever partial `stats`
+a crawl produced on every unsuccessful one. `ON DELETE CASCADE` from `websites` reclaims a
+website's `runs` rows the moment the website is deleted, but it reclaims nothing in Storage:
+the payload each completed row's `storage_path` names keeps existing in the `crawl-payloads`
+bucket, orphaned, until something else removes it. Nothing in this milestone does — see §11.
 
 Both `trigger` and `status` are real Postgres enums rather than text with a `CHECK`. The
 worker writes status transitions directly, and a typo should fail at the database instead
@@ -978,6 +1023,17 @@ Deliberately not decided here, and not to be decided by accident in an implement
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**
+- **Cleaning up orphaned Storage objects.** `CrawlService.execute_run` uploads a run's
+  payload to Storage before `RunService.record_success` writes the row that names it (§5.1),
+  and deleting a website cascades its `runs` rows but never touches Storage (§6.4) — both are
+  deliberate, and both leave objects in the `crawl-payloads` bucket that nothing in this
+  codebase ever removes.
+  Two candidate fixes, neither built here: a `DELETE /websites/{id}` hook that removes the
+  website's whole `{website_id}/` prefix at delete time, or a periodic sweep that lists
+  objects with no matching `runs.storage_path`. Whichever a future ticket picks, it needs its
+  own design for how it authenticates to Storage and how it is triggered — this milestone
+  only establishes the layout (`{website_id}/{run_id}.jsonl.gz`) that makes either one cheap
+  to write later.
 
 If you need one of these to finish a ticket, that is a signal to open a ticket, not to
 invent an answer inline.

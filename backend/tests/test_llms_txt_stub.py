@@ -13,7 +13,9 @@ from app.features.crawl.schemas import CrawledPage
 
 
 def _page(url: str) -> CrawledPage:
-    return CrawledPage(url=url, status=200, title=None, content="", fetched_at=datetime.now(UTC))
+    return CrawledPage(
+        url=url, status=200, title=None, content="", fetched_at=datetime.now(UTC), content_bytes=0
+    )
 
 
 def test_the_same_pages_in_a_different_order_produce_byte_identical_output() -> None:

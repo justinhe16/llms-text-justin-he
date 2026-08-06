@@ -105,7 +105,7 @@ class ByteBudget:
         self._used += num_bytes
 
 
-async def _read_body_within_budget(response: httpx.Response, budget: ByteBudget) -> str:
+async def _read_body_within_budget(response: httpx.Response, budget: ByteBudget) -> tuple[str, int]:
     """Stream `response`'s body, charging every chunk against `budget` before keeping it.
 
     Never calls `response.aread()`, `.content`, or `.text` — every one of those buffers the
@@ -113,13 +113,22 @@ async def _read_body_within_budget(response: httpx.Response, budget: ByteBudget)
     "buffered before the cap was consulted" failure the byte cap exists to prevent. Never
     trusts `Content-Length` either: it is advisory, a server can lie about it or omit it
     entirely, and the streamed counter here is correct regardless of what the header says.
+
+    Returns:
+        The decoded body, and the raw byte count actually charged against `budget` for this
+        response — the sum of `len(chunk)` over every chunk kept, before decoding. That
+        second number is `CrawledPage.content_bytes`'s source of truth: it is what came off
+        the wire, which `len(decoded.encode())` cannot reconstruct once `errors="replace"`
+        has had a chance to change the length (see `content_bytes`'s own docstring).
     """
     chunks: list[bytes] = []
+    raw_bytes = 0
     async for chunk in response.aiter_bytes():
         budget.take(len(chunk))
+        raw_bytes += len(chunk)
         chunks.append(chunk)
     encoding = response.encoding or "utf-8"
-    return b"".join(chunks).decode(encoding, errors="replace")
+    return b"".join(chunks).decode(encoding, errors="replace"), raw_bytes
 
 
 async def fetch_page(
@@ -186,13 +195,14 @@ async def fetch_page(
                 current_url = next_url
                 continue
 
-            content = await _read_body_within_budget(response, budget)
+            content, content_bytes = await _read_body_within_budget(response, budget)
             return CrawledPage(
                 url=target.url,
                 status=response.status_code,
                 title=None,
                 content=content,
                 fetched_at=datetime.now(UTC),
+                content_bytes=content_bytes,
             )
 
     raise FetchError(f"exceeded {MAX_REDIRECTS} redirects")
