@@ -52,6 +52,19 @@ export function usePutSchedule(
   return useMutation({
     mutationFn: (input: PutScheduleInput) => putSchedule(input.websiteId, input.body),
     onSuccess: (data, variables, onMutateResult, context) => {
+      // The response *is* the new schedule — `PUT` echoes the row it just wrote, including
+      // the `next_run_at` the server recomputed. Seeding the cache with it before
+      // invalidating closes a window that is short but very visible: `invalidateQueries`
+      // only *marks* the key stale and starts a refetch, so for the round-trip that follows,
+      // any component reading this key still gets the pre-write value. On a panel whose
+      // controls have already moved to the new setting (lib/crawls/use-schedule-editor.ts),
+      // that reads as the toggle snapping back and then forward again.
+      //
+      // The invalidation below is kept rather than replaced. `setQueryData` updates this one
+      // key from one response; the refetch is what reconciles anything the server changed
+      // that the response does not carry, and keeps the "server is the source of truth"
+      // property this codebase relies on everywhere else.
+      queryClient.setQueryData(queryKeys.schedules.detail(variables.websiteId), data);
       queryClient.invalidateQueries({
         queryKey: queryKeys.schedules.detail(variables.websiteId),
       });

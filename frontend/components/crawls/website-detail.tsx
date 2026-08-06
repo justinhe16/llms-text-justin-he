@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowLeft, CalendarClock, ChartLine } from "lucide-react";
+import { ArrowLeft, ChartLine } from "lucide-react";
 import Link from "next/link";
 
 import { Skeleton } from "@/components/ui/skeleton";
@@ -19,6 +19,7 @@ import { PlaceholderTab } from "./placeholder-tab";
 import { RunNowButton } from "./run-now-button";
 import { RunStatusIndicator } from "./run-status-indicator";
 import { RunsTab } from "./runs-tab";
+import { ScheduleTab } from "./schedule-tab";
 
 const TAB_LABELS: Record<DetailTab, string> = {
   runs: "Runs",
@@ -182,12 +183,16 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
               />
             </TabsContent>
 
-            {/* PER-168 replaces this element, and nothing else on the page changes. */}
             <TabsContent value="schedule" className="mt-6 min-w-0">
-              <PlaceholderTab
-                icon={CalendarClock}
-                title="Scheduled crawls"
-                description="Set how often this site is re-crawled, and see when the next run is due."
+              <ScheduleTab
+                websiteId={websiteId}
+                ownerUserId={website?.user_id ?? null}
+                isOwner={isOwner}
+                // The newest run, for the panel's "Last run" line. `ScheduleResponse` carries
+                // a `last_run_at` but no status to go beside it, so the status comes from the
+                // history this page has already fetched — which also keeps the panel and the
+                // header from ever disagreeing about how the last run went.
+                latestRun={runs[0] ?? null}
               />
             </TabsContent>
 

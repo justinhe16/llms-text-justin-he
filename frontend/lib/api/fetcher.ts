@@ -122,12 +122,26 @@ function extractErrorMessage(status: number, body: unknown): string {
   return `Request failed with status ${status}`;
 }
 
+// "The response had no body at all" and "the response body was literally `null`" are two
+// different facts, and this sentinel is what keeps them apart. Returning `null` for both —
+// which this function used to do — makes them indistinguishable one line later, and
+// `apiFetch` resolves the empty case to `undefined`. That is correct for a `204` and wrong
+// for `GET /websites/{id}/schedule`, whose documented "no schedule configured" answer is a
+// `200` carrying the four characters `null` (see `getSchedule` in lib/api/schedules.ts).
+//
+// The symptom was not a type error anywhere — `getSchedule` still declared `Promise<Schedule
+// | null>` and still compiled — but a runtime "Query data cannot be undefined" thrown by
+// React Query the first time a component actually read that endpoint. A symbol is the right
+// sentinel here precisely because it is not a value `JSON.parse` can ever produce, so no
+// real response body can be mistaken for it.
+const EMPTY_BODY = Symbol("empty-body");
+
 // Parsing must never throw: a response is JSON when its content-type says so, otherwise
 // raw text, and malformed JSON despite that header falls back to the text rather than
 // blowing up a call site that only wanted to know a request failed.
 async function parseResponseBody(response: Response): Promise<unknown> {
   const text = await response.text();
-  if (!text) return null;
+  if (!text) return EMPTY_BODY;
 
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) return text;
@@ -160,16 +174,23 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   }
 
   const response = await fetch(url, { ...init, headers });
-  const body = await parseResponseBody(response);
+  const parsed = await parseResponseBody(response);
+
+  // The sentinel never escapes this function: everything downstream — `ApiError.body`, the
+  // value handed to a caller — sees `null` for "there was no body", which is the shape those
+  // consumers already expect.
+  const body = parsed === EMPTY_BODY ? null : parsed;
 
   if (!response.ok) {
     throw new ApiError(response.status, body, extractErrorMessage(response.status, body));
   }
 
-  // A 2xx with nothing to read — 204 is the common case, but any empty 2xx body parses to
-  // `null` above — has nothing to cast to `T`. Callers ask for this explicitly with
-  // `apiFetch<void>`.
-  if (body === null) return undefined as T;
+  // A 2xx with nothing to read — 204 is the common case, but any empty 2xx body qualifies —
+  // has nothing to cast to `T`. Callers ask for this explicitly with `apiFetch<void>`. Note
+  // this tests the sentinel, not `body`: a `200` whose body is the JSON literal `null` is a
+  // response that genuinely said "null", and it must resolve to `null` rather than being
+  // rewritten to `undefined` on the way out.
+  if (parsed === EMPTY_BODY) return undefined as T;
 
   return body as T;
 }
