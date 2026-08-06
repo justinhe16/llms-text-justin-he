@@ -251,11 +251,30 @@ class CrawlService:
           `job_completion_wait` expired. **This is now caught, acted on, and re-raised**,
           where it used to propagate untouched. Catching it does not race the signal the way
           the old docstring feared: the recovery write is one short, guarded statement, and
-          if it does not land the stuck-run reaper still sweeps the row minutes later. What
-          it buys is the difference between a deploy costing a user five minutes and a deploy
-          costing them nothing they can see. Re-raising is what lets arq do its own
-          bookkeeping — for a cancellation it re-queues the job, which is exactly the
-          redelivery the run has just been made ready for.
+          if it does not land the stuck-run reaper still sweeps the row minutes later.
+
+          **The two causes are NOT redelivered the same way, and the difference is arq's, not
+          this method's.** `arq.worker.Worker.run_job` runs the job as
+          `await asyncio.wait_for(task, timeout_s)`, and it retries only on `Retry`,
+          `RetryJob`, and `CancelledError`:
+
+          - **SIGTERM** cancels `run_job`'s own frame, so arq sees `CancelledError`, logs
+            "cancelled, will be run again", and re-queues the job under the same id. The run
+            is `pending` and the redelivery is immediate — which is the difference between a
+            deploy costing a user five minutes and costing them nothing they can see.
+          - **`job_timeout`** cancels the INNER task, and `asyncio.wait_for` converts that
+            into `TimeoutError` at its own call site once the coroutine finishes unwinding.
+            `TimeoutError` is not in arq's retry set, so arq records the job as failed and
+            does NOT redeliver it. The run is still left correctly `pending` by the recovery
+            below — what picks it up is the reaper's ORPHAN sweep, within
+            `REAPER_INTERVAL_MINUTES`, not arq.
+
+          Either way the database ends in a state something acts on, which is the property
+          that matters; the second path is simply slower. It is also the rarer one by
+          construction — `job_timeout` (600s) sits above the crawl's own 300s cap, so a
+          normal slow crawl fails through `TransientCrawlError` long before arq's timeout is
+          reachable at all. `tests/test_crawl_retry.py` pins arq's actual behaviour here
+          against a real `Worker` rather than assuming it.
 
         Args:
             run_id: The run to crawl.

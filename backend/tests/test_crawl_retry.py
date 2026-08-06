@@ -27,13 +27,15 @@ attempts it did not care about.
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import httpx
 import pytest
-from arq.worker import Retry
+from arq.connections import ArqRedis
+from arq.worker import Retry, Worker
 from asyncpg import Pool
-from conftest import TEST_USER_A_ID, FakeStorage, seed_run, seed_website
+from conftest import TEST_QUEUE_NAME, TEST_USER_A_ID, FakeStorage, seed_run, seed_website
 
 import app.features.crawl.service as crawl_service
 from app.features.crawl.internals.crawler import CrawlResult
@@ -319,9 +321,16 @@ async def _cancel_mid_crawl(pool: Pool, run_id: UUID) -> None:
 async def test_a_cancelled_run_with_budget_left_goes_back_to_the_queue(
     websites_db: Pool,
 ) -> None:
-    """A deploy is not a failed attempt. The run is handed back to `pending`, and arq's own
-    retry-on-cancellation puts the job back behind it — so the user waits seconds rather than
-    the fifteen minutes the reaper would take."""
+    """A deploy is not a failed attempt: the run is handed back to `pending`, claimable
+    again, rather than written off as `failed`.
+
+    What picks it back up depends on which cancellation this was, and the assertion here is
+    deliberately only about the ROW. Under SIGTERM arq re-queues the job itself and the
+    redelivery is immediate; under `job_timeout` — the mechanism `_cancel_mid_crawl`
+    reproduces — arq does not, and the reaper's orphan sweep is what re-enqueues it. Both
+    leave the same row. `test_arq_does_not_redeliver_a_job_its_own_timeout_cancelled` below
+    pins that difference against a real `Worker` instead of asserting it in prose.
+    """
     run_id = await _seed(websites_db, "cancel-with-budget")
 
     await _cancel_mid_crawl(websites_db, run_id)
@@ -382,3 +391,92 @@ async def test_a_cancelled_run_whose_recovery_write_also_fails_is_left_for_the_r
     row = await _row(websites_db, run_id)
     assert row["status"] == "processing"
     assert row["claimed_at"] is not None
+
+
+# -----------------------------------------------------------------------------------------
+# 5. What arq ACTUALLY does with a cancelled job — pinned against a real Worker, not assumed.
+# -----------------------------------------------------------------------------------------
+
+
+_CLEANUP_KEY = "per_166_cancelled_cleanup_count"
+
+
+async def _job_that_cleans_up_on_cancellation(ctx: dict[str, Any]) -> str:
+    """`crawl_task`'s cancellation shape, reduced to its essentials.
+
+    Sleeps past the worker's `job_timeout`, catches the `CancelledError` that arrives, does
+    one `await` of recovery work — standing in for `_recover_cancelled_attempt`'s guarded
+    UPDATE — and re-raises. That last detail is the one under test: a coroutine that awaits
+    inside its cancellation handler is exactly what changes what `asyncio.wait_for` reports
+    to arq.
+    """
+    redis = ctx["redis"]
+    try:
+        await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        await redis.incr(_CLEANUP_KEY)
+        raise
+    raise AssertionError("unreachable — the worker's job_timeout must fire first")
+
+
+async def test_arq_does_not_redeliver_a_job_its_own_timeout_cancelled(
+    queue_pool: ArqRedis,
+) -> None:
+    """A LIBRARY-BEHAVIOUR TEST, and the reason `CrawlService.execute_run`'s docstring
+    distinguishes two cancellation causes that look identical from inside the coroutine.
+
+    `arq.worker.Worker.run_job` runs each job as `await asyncio.wait_for(task, timeout_s)` and
+    retries only on `Retry`, `RetryJob`, and `CancelledError`. When the JOB TIMEOUT is what
+    cancels, `wait_for` converts the outcome into `TimeoutError` at its own call site once the
+    coroutine has finished unwinding — and `TimeoutError` is not in that set, so arq records
+    the job as failed and never redelivers it. A deploy's SIGTERM is the opposite case: it
+    cancels `run_job`'s own frame, arq really does see `CancelledError`, and the job is
+    re-queued.
+
+    That distinction is load-bearing for this ticket and completely invisible from inside
+    `execute_run`, which sees `CancelledError` either way. It is also not something to take on
+    faith from a changelog: it depends on `asyncio.wait_for`'s unwinding semantics AND on
+    arq's exception triage, either of which could change under a dependency bump. So it is
+    pinned here against a real `Worker` in burst mode.
+
+    **The cleanup assertion is the half that matters for correctness.** Whatever arq decides
+    afterwards, the coroutine's cancellation handler must run to completion — that is what
+    writes the run back to `pending`, and a version of `asyncio` or `arq` that killed the task
+    before its `except` block finished would silently strand every cancelled run. Asserting
+    the counter is exactly one proves both that the recovery ran and that it ran only once.
+
+    `handle_signals=False` for the reason tests/test_worker_shutdown.py documents: arq
+    otherwise installs SIGINT/SIGTERM handlers on pytest's loop and never removes them.
+    """
+    await queue_pool.delete(_CLEANUP_KEY)
+    worker = Worker(
+        functions=[_job_that_cleans_up_on_cancellation],
+        redis_pool=queue_pool,
+        queue_name=TEST_QUEUE_NAME,
+        # Far shorter than the job's own sleep, so the timeout is unambiguously what fires.
+        job_timeout=0.25,
+        # Deliberately ABOVE 1: if arq were going to redeliver this job, a ceiling of 1 would
+        # hide it behind "max retries exceeded" and the test would pass for the wrong reason.
+        max_tries=3,
+        retry_jobs=True,
+        poll_delay=0.05,
+        burst=True,
+        handle_signals=False,
+    )
+    try:
+        await queue_pool.enqueue_job(
+            _job_that_cleans_up_on_cancellation.__qualname__, _queue_name=TEST_QUEUE_NAME
+        )
+        await asyncio.wait_for(worker.async_run(), timeout=30)
+
+        # The cancellation handler ran, exactly once, all the way through its own `await`.
+        assert await queue_pool.get(_CLEANUP_KEY) == b"1"
+
+        # And arq treated it as terminal rather than retrying it — which is precisely why a
+        # run left `pending` by a `job_timeout` needs the reaper's orphan sweep and does not
+        # simply reappear on the queue.
+        assert worker.jobs_failed == 1
+        assert worker.jobs_retried == 0
+        assert worker.jobs_complete == 0
+    finally:
+        await queue_pool.delete(_CLEANUP_KEY)

@@ -152,8 +152,15 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
         asyncio.CancelledError: arq's job timeout, or SIGTERM. Not caught here.
             `CrawlService.execute_run` catches it one layer down, hands the run back to the
             queue (or fails it, if the budget is spent), and re-raises — so by the time it
-            reaches this frame the database already reflects what happened, and letting it
-            propagate is what lets arq re-queue the job.
+            reaches this frame the database already reflects what happened.
+
+            Whether arq then redelivers depends on WHICH cancellation it was, and only
+            SIGTERM is redelivered: it cancels `run_job`'s own frame, so arq sees
+            `CancelledError` and re-queues. A `job_timeout` cancels the inner task, and
+            `asyncio.wait_for` hands arq a `TimeoutError` instead, which is not in its retry
+            set — that run waits for the reaper's orphan sweep. See
+            `CrawlService.execute_run`'s docstring for the full argument, and
+            `tests/test_crawl_retry.py` for the test that pins it.
     """
     try:
         parsed_run_id = UUID(str(run_id))
