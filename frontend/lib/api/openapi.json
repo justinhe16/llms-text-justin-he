@@ -155,6 +155,56 @@
         "title": "Page[RunListItemResponse]",
         "type": "object"
       },
+      "RunAlreadyInFlightDetail": {
+        "description": "The `detail` of the `409` from `POST /websites/{id}/runs` when that website already\nhas a run in progress.\n\nCarries the existing run's id and status, the same shape `WebsiteAlreadyExistsDetail`\n(`app.features.websites.schemas`) carries the existing website's id: a 409 that hands\nback nothing actionable makes the client build a second request just to find out what it\ncollided with.",
+        "properties": {
+          "code": {
+            "const": "run_already_in_flight",
+            "default": "run_already_in_flight",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "run_id",
+          "status"
+        ],
+        "title": "RunAlreadyInFlightDetail",
+        "type": "object"
+      },
+      "RunAlreadyInFlightResponse": {
+        "description": "The **whole** `409` body, envelope included — see `WebsiteAlreadyExistsResponse` for\nwhy the envelope is a separate model from its `detail` (FastAPI wraps `detail` in a JSON\nobject, so documenting the inner model directly in `responses=` would describe a shape no\nactual response has).",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/RunAlreadyInFlightDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "RunAlreadyInFlightResponse",
+        "type": "object"
+      },
       "RunDetailResponse": {
         "description": "The full body of `GET /runs/{id}` — every list-item field, plus the two that are too\nlarge or too rarely needed for a list view.\n\nA subclass of `RunListItemResponse`, the same relationship `WebsiteListItemResponse`\nhas to `WebsiteResponse`: the detail view is the list item plus more, not an\nindependently maintained sibling that could drift from it field by field.",
         "properties": {
@@ -274,6 +324,66 @@
           "storage_path"
         ],
         "title": "RunDetailResponse",
+        "type": "object"
+      },
+      "RunLimitExceededDetail": {
+        "description": "The `detail` of the `429` from `POST /websites/{id}/runs` — either abuse cap.\n\n`scope` is the discriminator a client branches on; `message` is prose for a human and is\nfree to be reworded without breaking a client that reads `scope` and `limit` instead.",
+        "properties": {
+          "code": {
+            "const": "run_limit_exceeded",
+            "default": "run_limit_exceeded",
+            "title": "Code",
+            "type": "string"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "resets_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resets At"
+          },
+          "scope": {
+            "enum": [
+              "concurrent",
+              "daily"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "message",
+          "limit",
+          "resets_at"
+        ],
+        "title": "RunLimitExceededDetail",
+        "type": "object"
+      },
+      "RunLimitExceededResponse": {
+        "description": "The **whole** `429` body, envelope included — same reasoning as\n`RunAlreadyInFlightResponse` above.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/RunLimitExceededDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "RunLimitExceededResponse",
         "type": "object"
       },
       "RunListItemResponse": {
@@ -559,6 +669,38 @@
           "next_run_at"
         ],
         "title": "ScheduleSummary",
+        "type": "object"
+      },
+      "TriggerRunResponse": {
+        "description": "The body of `POST /websites/{id}/runs` on success.\n\nDeliberately not `RunListItemResponse` or a slice of it: a just-triggered run has no\n`completed_at`, `duration_ms`, `stats`, or `error` worth returning, and reusing that\nmodel would mean either faking those fields or making them optional on a response that\nis supposed to be the simplest one this feature has.\n\nStatus `202 Accepted`, not `201 Created` (see the router): the row this describes has\nbeen written, but the crawl it names has only been queued, not completed — `201` would\nclaim more than is true the instant this response leaves the server.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "started_at"
+        ],
+        "title": "TriggerRunResponse",
         "type": "object"
       },
       "UpsertScheduleRequest": {
@@ -1222,6 +1364,73 @@
           }
         ],
         "summary": "List Runs",
+        "tags": [
+          "runs"
+        ]
+      },
+      "post": {
+        "description": "Start a manual crawl of one website. Owner-only — unlike this module's two reads.\n\n`202 Accepted`, not `201 Created`: the body describes a `pending` run that has been\nqueued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and\n`get_run`, `user_id` IS passed to the service here, because this is the one write in\nthis router and writes are ownership-checked (ARCHITECTURE.md §4.2).\n\nFour things can stop this short of a `202`: `404` if `id` names no website; `403` if the\ncaller does not own it; `409` if that website already has a run in flight; `429` if the\ncaller is over their concurrent- or daily-run cap. A `503` is also possible, if the run\nwas created but could not be queued — see `RunService.trigger_run` for exactly which\ncheck produces which, and `require_queue_pool` above for the one `503` this router\nitself can raise before the service even runs.",
+        "operationId": "trigger_run_websites__id__runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerRunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunAlreadyInFlightResponse"
+                }
+              }
+            },
+            "description": "This website already has a pending or processing run — of any trigger, manual or scheduled. The response carries that run's id and status."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunLimitExceededResponse"
+                }
+              }
+            },
+            "description": "The caller is over their concurrent- or daily-run cap. `detail.scope` says which; `detail.resets_at` is set only for the daily cap."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Trigger Run",
         "tags": [
           "runs"
         ]

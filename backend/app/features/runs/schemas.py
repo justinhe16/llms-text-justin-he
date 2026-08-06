@@ -84,6 +84,104 @@ class RunDetailResponse(RunListItemResponse):
     storage_path: str | None
 
 
+class TriggerRunResponse(BaseModel):
+    """The body of `POST /websites/{id}/runs` on success.
+
+    Deliberately not `RunListItemResponse` or a slice of it: a just-triggered run has no
+    `completed_at`, `duration_ms`, `stats`, or `error` worth returning, and reusing that
+    model would mean either faking those fields or making them optional on a response that
+    is supposed to be the simplest one this feature has.
+
+    Status `202 Accepted`, not `201 Created` (see the router): the row this describes has
+    been written, but the crawl it names has only been queued, not completed — `201` would
+    claim more than is true the instant this response leaves the server.
+    """
+
+    id: UUID
+    status: RunStatusName
+    """Always `"pending"` on this path — `RunsWriter.insert_manual` inserts with that status
+    literally, and nothing between the insert and this response could have changed it. It is
+    still a field, and still typed as the full `RunStatusName` rather than
+    `Literal["pending"]`, for two reasons: `RunStatusName` is the one vocabulary this feature
+    owns for the column (the module docstring above is explicit that there must never be a
+    second copy of it), and the client renders this row into the same list `GET
+    /websites/{id}/runs` returns, then lets polling take over from there — a component that
+    already knows how to render every `RunStatusName` needs no special case for "the one
+    value this particular response can have."""
+
+    started_at: datetime
+    """The database's `CURRENT_TIMESTAMP`, read back through `RETURNING` — see
+    `internals/runs_writer.py` for why this is the only place that value exists."""
+
+
+class RunAlreadyInFlightDetail(BaseModel):
+    """The `detail` of the `409` from `POST /websites/{id}/runs` when that website already
+    has a run in progress.
+
+    Carries the existing run's id and status, the same shape `WebsiteAlreadyExistsDetail`
+    (`app.features.websites.schemas`) carries the existing website's id: a 409 that hands
+    back nothing actionable makes the client build a second request just to find out what it
+    collided with.
+    """
+
+    code: Literal["run_already_in_flight"] = "run_already_in_flight"
+    """A stable machine-readable discriminator. The frontend branches on this, never on
+    `message`, which is free to be reworded."""
+
+    message: str
+    run_id: UUID
+    status: RunStatusName
+    """`"pending"` or `"processing"` — never anything else, since this is only ever built
+    from `RunsReader.get_active_for_website`'s result, which is scoped to those two values.
+    Lets the UI say which: a run still `pending` has not started crawling yet, and a caller
+    deciding whether to keep waiting cares about the difference."""
+
+
+class RunAlreadyInFlightResponse(BaseModel):
+    """The **whole** `409` body, envelope included — see `WebsiteAlreadyExistsResponse` for
+    why the envelope is a separate model from its `detail` (FastAPI wraps `detail` in a JSON
+    object, so documenting the inner model directly in `responses=` would describe a shape no
+    actual response has)."""
+
+    detail: RunAlreadyInFlightDetail
+
+
+class RunLimitExceededDetail(BaseModel):
+    """The `detail` of the `429` from `POST /websites/{id}/runs` — either abuse cap.
+
+    `scope` is the discriminator a client branches on; `message` is prose for a human and is
+    free to be reworded without breaking a client that reads `scope` and `limit` instead.
+    """
+
+    code: Literal["run_limit_exceeded"] = "run_limit_exceeded"
+    scope: Literal["concurrent", "daily"]
+    """Which of the two caps in `app.core.settings.Settings` was hit —
+    `max_concurrent_runs_per_user` or `max_runs_per_day_per_user`. Never inferred from
+    `message`'s wording, which `run_limits.py`'s docstring reserves the right to reword."""
+
+    message: str
+    limit: int
+    resets_at: datetime | None
+    """The instant the cap is expected to free a slot, or `None` for the concurrency cap.
+
+    The two caps are not symmetric here, and that asymmetry is the point rather than an
+    oversight. The daily cap has a real, computable instant: the oldest run inside the
+    rolling 24h window ages out of it at a specific time, and `RunService` derives
+    `resets_at` from exactly that row. The concurrency cap has no such instant — it frees
+    the moment any of the caller's in-flight manual runs completes, and nothing in this
+    codebase can predict when a crawl in progress will finish. Inventing a `resets_at` for
+    that case would be a more misleading answer than admitting there is none, so it is
+    `None` there and nowhere else. See `run_limits.concurrency_limit_message`.
+    """
+
+
+class RunLimitExceededResponse(BaseModel):
+    """The **whole** `429` body, envelope included — same reasoning as
+    `RunAlreadyInFlightResponse` above."""
+
+    detail: RunLimitExceededDetail
+
+
 class RunStatsPoint(BaseModel):
     """One bucket of `GET /websites/{id}/stats`'s `series`.
 
