@@ -91,6 +91,7 @@ backend/app/features/<name>/    schemas.py, service.py, internals/{<name>_reader
                                 websites/ is the reference implementation — read it first
 backend/app/infrastructure/db/  asyncpg pool factory, base Reader/Writer, transaction()
 backend/app/infrastructure/queue/  ARQ Redis pool factory; the only place TLS is decided
+backend/app/infrastructure/storage/  Supabase Storage client; no singleton (ARCHITECTURE.md §3.7)
 backend/app/worker/             settings.py (WorkerSettings) + jobs.py — thin, call services
 db/schema.prisma                the schema, and the only source of truth for it
 db/migrations/                  reviewed, committed SQL

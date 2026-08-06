@@ -116,6 +116,26 @@ class Settings(BaseSettings):
     max_concurrent_runs_per_user: int = Field(default=2, ge=1)
     max_runs_per_day_per_user: int = Field(default=50, ge=1)
 
+    # Where a completed run's gzip-compressed JSONL payload is uploaded
+    # (app.infrastructure.storage.supabase_storage, read by the worker only — the API never
+    # touches Storage). Not a secret, so it is not in validate_required_secrets() below:
+    # a wrong bucket name fails loudly the first time an upload 404s, which is close enough
+    # to "fails at boot" for a value that is otherwise just a path prefix.
+    supabase_storage_bucket: str = Field(default="crawl-payloads", min_length=1)
+
+    # The Storage upload's own timeout — deliberately NOT `crawl_request_timeout_s`, and
+    # deliberately BELOW `WorkerSettings.JOB_TIMEOUT_SECONDS` (180s, app/worker/settings.py).
+    # A crawl fetch is one page; an upload can be a multi-megabyte compressed payload, so it
+    # gets its own, larger budget. Sitting below the job timeout is what decides which of two
+    # things happens to a hung upload: below 180s, `SupabaseStorage.upload` raises its own
+    # `StorageUploadError` first, `CrawlService` catches it, and the run ends `failed` with a
+    # sanitized message. At or above 180s, arq's job timeout fires first instead, which
+    # delivers a bare `CancelledError` that `CrawlService.execute_run` deliberately does not
+    # catch (see that module's docstring) — the run is left `processing` for the stuck-run
+    # reaper rather than recorded as a clean failure. 120s leaves 60s of headroom under that
+    # line without eating meaningfully into the budget a real upload needs.
+    storage_upload_timeout_s: float = Field(default=120.0, gt=0)
+
     def validate_required_secrets(self) -> None:
         """Fail loudly if any required variable is unset, naming every one of them.
 

@@ -762,3 +762,40 @@ def plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
     for child in plan.get("Plans", []):
         nodes.extend(plan_nodes(child))
     return nodes
+
+
+# -----------------------------------------------------------------------------------------
+# FakeStorage, shared by tests/test_crawl_task.py and tests/test_run_persistence.py — both
+# drive `app.features.crawl.service.CrawlService.execute_run` end to end and need something
+# to hand it as `storage`, without opening a second `httpx.MockTransport` for the Storage
+# upload on top of the one `test_crawl_task.py`'s module docstring already sets up for the
+# crawl fetch itself. `CrawlService` calls exactly two methods on whatever it is given —
+# `.bucket` and `await .upload(...)` — so a structural stand-in with the same shape as
+# `app.infrastructure.storage.supabase_storage.SupabaseStorage` is a complete substitute,
+# with no `httpx.AsyncClient` anywhere behind it.
+# -----------------------------------------------------------------------------------------
+
+
+class FakeStorage:
+    """Records every `upload()` call it receives, in order, and can be told to fail instead.
+
+    `fail`, given at construction, is raised on every call rather than recording it — the
+    shape a real `SupabaseStorage.upload` failure arrives in (`StorageUploadError`, or
+    anything else a test wants `CrawlService` to react to), for suites that need to see the
+    failure path rather than the success path.
+    """
+
+    def __init__(self, *, bucket: str = "crawl-payloads", fail: Exception | None = None) -> None:
+        self._bucket = bucket
+        self.fail = fail
+        self.calls: list[tuple[str, bytes, str]] = []
+
+    @property
+    def bucket(self) -> str:
+        return self._bucket
+
+    async def upload(self, object_path: str, data: bytes, *, content_type: str) -> str:
+        if self.fail is not None:
+            raise self.fail
+        self.calls.append((object_path, data, content_type))
+        return f"{self._bucket}/{object_path}"

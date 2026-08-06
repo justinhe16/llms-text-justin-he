@@ -230,3 +230,37 @@ def test_startup_and_shutdown_hooks_are_registered() -> None:
     """
     assert WorkerSettings.on_startup is worker_settings.open_worker_resources
     assert WorkerSettings.on_shutdown is worker_settings.close_worker_resources
+
+
+class _SpyClient:
+    """A stand-in for `httpx.AsyncClient` that only records whether `aclose()` ran."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_close_worker_resources_closes_the_http_client_and_the_storage_client() -> None:
+    """PER-163 added a second `httpx.AsyncClient` (`ctx["storage_client"]`, built by
+    `build_storage_client` for `SupabaseStorage`) beside the crawl task's own
+    `ctx["http_client"]`. Both must actually be closed on shutdown — `close_pool()` closing
+    the Postgres pool says nothing about either of these, and a client left open leaks a
+    connection pool every deploy.
+    """
+    http_client = _SpyClient()
+    storage_client = _SpyClient()
+    ctx: dict[object, object] = {"http_client": http_client, "storage_client": storage_client}
+
+    await worker_settings.close_worker_resources(ctx)
+
+    assert http_client.closed
+    assert storage_client.closed
+
+
+async def test_close_worker_resources_tolerates_a_startup_that_never_opened_anything() -> None:
+    """`Worker.run()`'s `finally` calls `close_worker_resources` even when `on_startup`
+    failed before it got as far as opening either client — every `ctx.get(...)` inside it
+    must be `None` and skipped rather than raising `KeyError`."""
+    await worker_settings.close_worker_resources({})

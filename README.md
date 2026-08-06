@@ -264,6 +264,28 @@ upstash redis get --db-id <id> \
   | xargs -I{} fly secrets set REDIS_URL={} --app llms-text-justin-he
 ```
 
+### The `crawl-payloads` bucket
+
+A completed run's gzip-compressed JSONL payload is uploaded to a private Supabase Storage
+bucket named `crawl-payloads` (`app.infrastructure.storage.supabase_storage`,
+ARCHITECTURE.md §3.7). Locally, `supabase/config.toml` already declares
+`[storage.buckets.crawl-payloads] public = false`, so `make dev` provisions it automatically
+— there is nothing to do by hand on a fresh checkout.
+
+**In production, it is not provisioned by anything automated.** Nothing in CI and nothing in
+the deploy pipeline creates it, so it is a **manual bootstrap step, once, on a new Supabase
+project**: Supabase dashboard → Storage → New bucket → name it `crawl-payloads` → **Public:
+off**. Until that bucket exists, every run's worker job fails its upload and the run ends
+`failed` with a sanitized error — nothing crashes louder than that, so verify the bucket
+exists (Storage → the bucket should be listed and marked private) after standing up a new
+environment, before assuming a failed run is a code problem.
+
+**Known debt: deleting a website does not delete its Storage objects.** `runs` rows cascade
+from `websites` on delete (`db/schema.prisma`), but nothing walks the corresponding
+`{website_id}/` prefix in `crawl-payloads` and removes it — a deleted website's payloads sit
+in the bucket, orphaned, indefinitely. ARCHITECTURE.md §11 records the two candidate fixes
+(a delete hook, or a periodic sweep); neither is built yet.
+
 ### Three things that will trip you up
 
 1. **Use the Supabase session pooler on port 5432.** Not the direct connection (IPv6-only —
