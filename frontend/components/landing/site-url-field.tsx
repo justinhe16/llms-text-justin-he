@@ -56,13 +56,21 @@ export function SiteUrlField({
 
   // "Input enabled and focused on load." The focus cannot be a plain `autoFocus`: at mount
   // `useUser()` is still resolving and the input is disabled, and a disabled input cannot
-  // take focus. This runs the moment it becomes enabled, once — never stealing focus back
-  // from a user who has since clicked something else.
+  // take focus. This runs the moment it becomes enabled, and the ref makes it happen at
+  // most once per mount rather than on every re-render that flips `isSignedIn`.
   useEffect(() => {
     if (hasAutoFocused.current || !isSignedIn) return;
     hasAutoFocused.current = true;
     inputRef.current?.focus();
   }, [isSignedIn]);
+
+  // Submitting disables the field, which drops focus to `<body>`. When the sequence ends in
+  // an inline message instead of a navigation, focus goes back to the field the message is
+  // about — otherwise a keyboard user is silently left at the top of the document, with the
+  // error they just caused somewhere below them.
+  useEffect(() => {
+    if (error && !isBusy) inputRef.current?.focus();
+  }, [error, isBusy]);
 
   const isDisabled = !isSignedIn || isBusy || isAuthLoading;
 
@@ -97,7 +105,15 @@ export function SiteUrlField({
             setValue(event.target.value);
             if (error) onClearError();
           }}
-          className="h-12 rounded-full pr-12 pl-5 font-mono text-sm shadow-none"
+          // `disabled:opacity-100` overrides the primitive's default halving, and the fill
+          // becomes the "this is inert" signal instead. The default stacks
+          // `placeholder:text-muted-foreground` inside `disabled:opacity-50`, which put the
+          // signed-out placeholder at 1.85:1 against the page. That text is not decoration:
+          // it is the only thing telling a signed-out visitor why the field is inert and
+          // what to do about it. WCAG's exemption for disabled controls does not cover it
+          // either, because this control is not inactive — the overlay below makes it a live
+          // sign-in affordance. `text-foreground/70` measures ~5:1 in both states.
+          className="h-12 rounded-full pr-12 pl-5 font-mono text-sm shadow-none placeholder:text-foreground/70 disabled:bg-muted disabled:opacity-100"
         />
 
         <button
@@ -107,7 +123,7 @@ export function SiteUrlField({
           // typed produces "Enter a website URL." under the field, which is an answer.
           disabled={isDisabled}
           aria-label={isBusy ? "Adding site" : "Add site"}
-          className="absolute top-1/2 right-1.5 flex size-9 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-40"
+          className="absolute top-1/2 right-1.5 flex size-9 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:text-foreground/40"
         >
           {isBusy ? (
             <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />

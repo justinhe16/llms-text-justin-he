@@ -43,6 +43,14 @@ export function useMDXComponents(components: MDXComponents): MDXComponents {
       <strong className="font-medium text-foreground">{children}</strong>
     ),
     hr: () => <hr className="my-10 border-border" />,
+    // The status callout. One element that carries "this part is not finished yet", so the
+    // caveat is visibly separate from the prose describing how the product works, instead
+    // of every other sentence growing a hedge.
+    blockquote: ({ children }) => (
+      <blockquote className="my-6 rounded-lg border border-border bg-card px-4 py-1 [&_p]:text-foreground">
+        {children}
+      </blockquote>
+    ),
     // Inline code. A `<code>` inside a `<pre>` is handled by the `pre` rule below, which
     // sets its own colours on the block; this styling is what an identifier in a sentence
     // gets.

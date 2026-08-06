@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { usePathname, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
 
 import { isRunAlreadyInFlight, isWebsiteAlreadyExists } from "@/lib/api/errors";
 import { ApiError } from "@/lib/api/fetcher";
@@ -37,12 +37,21 @@ export type AddSiteError = {
   retryable: boolean;
 };
 
+/**
+ * How long to wait for `router.push` to actually take this page away before concluding it
+ * never will (see the watchdog in `useAddSite`). Generous on purpose: the destination is a
+ * dynamic route that fetches on navigate, and firing this while a slow-but-working
+ * navigation is still in flight would replace a correct spinner with a wrong error.
+ */
+const NAVIGATION_WATCHDOG_MS = 15_000;
+
 /** Turns a caught error into the two fields above that are not the id. */
 function describeFailure(error: unknown): { message: string; retryable: boolean } {
   if (error instanceof ApiError) {
-    // 5xx (including the 503 handled explicitly below) is the server's problem, not the
-    // input's. 4xx — 401, 403, 422, and the 429 cap — is not fixed by pressing the button
-    // again, so offering a retry would be a lie.
+    // 5xx — including the queue's 503 — is the server's problem, not the input's, and is
+    // the one class of failure where pressing the button again can genuinely work. 4xx
+    // (401, 403, 422, and the 429 cap) is not fixed by retrying, so offering a retry there
+    // would be a lie. There is no separate 503 branch: it wants exactly this treatment.
     return { message: error.message, retryable: error.status >= 500 };
   }
   // `apiFetch` only raises `ApiError` for a non-2xx *response*; a genuine network failure
@@ -106,22 +115,36 @@ export function useAddSite(): {
   // back — the field may have been cleared or edited in between.
   const lastUrl = useRef<string | null>(null);
 
-  // `isNavigating` is a one-way latch, and the thing that normally clears it is this
-  // component unmounting as the new route takes over. Nothing *guarantees* that unmount,
-  // though — a client Router Cache hit on Back, or a bfcache restore after an external
-  // round trip, can bring this tree back with its state intact — and if it ever does, the
-  // field stays disabled behind a spinner with no error and no way out but a reload. This
-  // clears the latch whenever this page is the current route again, which makes the unmount
-  // an optimization rather than the only thing standing between the user and a dead form.
-  // (Measured on Next 15.5.22: Back does remount, so today this never fires. It costs three
-  // lines and removes the whole failure mode.) The route is captured at mount rather than
-  // compared against a literal "/" so this stays correct if the form is ever mounted
-  // elsewhere.
-  const pathname = usePathname();
-  const mountedAt = useRef(pathname);
+  // The website the pending `router.push` is heading for, so the watchdog below can still
+  // point at it if that push never lands.
+  const pendingWebsiteId = useRef<string | null>(null);
+
+  // The watchdog on `isNavigating`.
+  //
+  // That flag is a one-way latch: it disables the field until the new route takes over, and
+  // what normally clears it is this component unmounting. Nothing guarantees that unmount.
+  // `middleware.ts` can bounce `/crawls/{id}` straight back to `/` (a server session that
+  // lapsed between the POST and the push), the router can restore this page from its cache,
+  // or the push can simply not land — and in every one of those cases the field would sit
+  // frozen behind a spinner with no error and no way out but a reload.
+  //
+  // A route-change check does not catch that: the redirect case starts and ends on `/`, so
+  // `usePathname()` never changes and an effect keyed on it never re-runs. Elapsed time is
+  // the only signal that covers all of them, because the thing being detected is precisely
+  // "the navigation we expected did not happen". If the push works, this component is gone
+  // long before the timer fires and the cleanup cancels it.
   useEffect(() => {
-    if (pathname === mountedAt.current) setIsNavigating(false);
-  }, [pathname]);
+    if (!isNavigating) return;
+    const timer = setTimeout(() => {
+      setIsNavigating(false);
+      setError({
+        message: "That took longer than expected — the site was added, but the page didn't move.",
+        websiteId: pendingWebsiteId.current,
+        retryable: false,
+      });
+    }, NAVIGATION_WATCHDOG_MS);
+    return () => clearTimeout(timer);
+  }, [isNavigating]);
 
   const createWebsiteMutation = useCreateWebsite({ toastOnError: false });
   const triggerRunMutation = useTriggerRun({ toastOnError: false });
@@ -131,6 +154,7 @@ export function useAddSite(): {
 
   const navigate = useCallback(
     (websiteId: string) => {
+      pendingWebsiteId.current = websiteId;
       setIsNavigating(true);
       router.push(`/crawls/${websiteId}`);
     },
@@ -139,23 +163,31 @@ export function useAddSite(): {
 
   const startRun = useCallback(
     async (websiteId: string): Promise<void> => {
+      let triggered: boolean;
       try {
         await triggerRun(websiteId);
-        navigate(websiteId);
+        triggered = true;
       } catch (caught) {
         // `409` — this website already has a run going. That run is what the user came to
         // see, so this is a redirect with a message attached, not a failure.
         if (isRunAlreadyInFlight(caught)) {
-          navigate(websiteId);
-          return;
+          triggered = true;
+        } else {
+          // Everything else stays on this page. `503` is the one worth naming: the queue
+          // could not be reached, and `RunService._abandon_unqueued_run` has already marked
+          // the row `failed` before answering — so there is no run in flight to go and
+          // watch, and sending the user to a detail page to look at a run that never
+          // started would be worse than saying so here and offering the retry that can
+          // actually work.
+          const { message, retryable } = describeFailure(caught);
+          setError({ message, websiteId, retryable });
+          triggered = false;
         }
-        // `503` — the queue is unreachable. Deliberately *not* a navigation: the detail
-        // page would show a `pending` run that nothing is ever going to pick up. Same
-        // distinction `TriggerRunFailure.queueUnavailable` draws in `use-trigger-run.ts`.
-        // It falls out of `describeFailure` as retryable, which is the right advice.
-        const { message, retryable } = describeFailure(caught);
-        setError({ message, websiteId, retryable });
       }
+
+      // Outside the `try`, so a throw from `router.push` is never caught above and
+      // mis-reported as "Couldn't reach the server."
+      if (triggered) navigate(websiteId);
     },
     [navigate, triggerRun]
   );
