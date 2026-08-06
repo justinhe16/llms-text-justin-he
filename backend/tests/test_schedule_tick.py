@@ -63,6 +63,7 @@ from conftest import (
 
 from app.core.settings import settings
 from app.features.runs.service import CRAWL_TASK_JOB_NAME
+from app.features.schedules.internals.schedules_reader import SchedulesReader
 from app.features.schedules.service import DUE_BATCH_LIMIT, ScheduleService, build_schedule_service
 
 
@@ -697,3 +698,23 @@ async def test_the_summary_log_contains_all_five_numbers(
     assert f"skipped_active={summary.skipped_active}" in tick_log
     assert f"enqueue_failures={summary.enqueue_failures}" in tick_log
     assert f"limit_reached={summary.limit_reached}" in tick_log
+
+
+# -----------------------------------------------------------------------------------------
+# 14. The Pool guard on the locking read — the one defensive check that cannot self-verify.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_lock_due_refuses_to_run_on_a_pool(websites_db: Pool) -> None:
+    """`SchedulesReader(pool).lock_due(...)` raises rather than silently taking useless locks.
+
+    This is the one check in the tick's path that no other test can reach, precisely because
+    every caller does the right thing: `run_due_schedules` always constructs its reader from
+    the `Connection` a `transaction()` yields. Left untested, the guard could be deleted or
+    inverted and the whole suite would stay green — while production quietly went back to
+    acquiring a connection, taking row locks, and handing both back to the pool before the
+    caller saw a single row. That failure has no symptom until a second worker machine exists,
+    which is the same reason `SKIP LOCKED` itself needs its own test.
+    """
+    with pytest.raises(RuntimeError, match="Pool"):
+        await SchedulesReader(websites_db).lock_due(now=datetime.now(UTC), limit=DUE_BATCH_LIMIT)

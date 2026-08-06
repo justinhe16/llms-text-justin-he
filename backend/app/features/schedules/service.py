@@ -189,6 +189,32 @@ class ScheduleService:
         minute minimum interval, and the value is always timezone-aware UTC, so there is no
         naive-timestamp hazard the way there would be for a wall-clock string built by hand.
 
+        **One accepted race, named here rather than left to be discovered** — the same
+        convention `runs/service.py`'s "The races, documented honestly" section follows. The
+        `get_by_website_id` read above is unlocked and happens outside the transaction below,
+        so a no-op `PUT` (identical `active` and `interval_minutes`) can interleave with the
+        cron tick like this:
+
+        1. `run_due_schedules` locks the schedule with `FOR UPDATE` and starts its work.
+        2. This method's read observes the row as it was BEFORE that tick — `next_run_at`
+           still in the past — and `compute_next_run_at` row 5 keeps it, which is exactly
+           right for the no-op case it was written for.
+        3. `SchedulesWriter.upsert` blocks on the tick's row lock.
+        4. The tick commits, having created a run and advanced `next_run_at` into the future.
+        5. This method's `ON CONFLICT DO UPDATE` unblocks and writes the stale value back.
+
+        The schedule is then due again immediately and fires one extra, out-of-cadence run on
+        the next tick. It is not corruption and it does not compound: the next tick advances
+        `next_run_at` properly, and the tick's own "skip a website that already has a run in
+        flight" guard usually absorbs the extra run before it becomes a second crawl.
+
+        Closing it would mean a compare-and-swap on `_UPSERT`'s `DO UPDATE` (`... WHERE
+        schedules.next_run_at IS NOT DISTINCT FROM $5`) plus a re-read path for the zero-rows
+        case — new write semantics on a shipped endpoint, to buy back one extra crawl of one
+        website in a window a few milliseconds wide, once per interval at worst. That is a
+        deliberate trade, not an oversight; if the cadence guarantee ever needs to be exact,
+        the CAS is the fix and this paragraph is the ticket.
+
         Raises:
             HTTPException: `404` if there is no website with that id — including the rare
                 race where it existed at the fetch above but was deleted before the INSERT

@@ -133,6 +133,14 @@ POLL_DELAY_SECONDS = 5
 # `db_pool_max_size` per process — today up to 20, not 10 — and raising it raises both.
 # That is comfortable at two concurrent crawls and would not be at ten. If crawl
 # concurrency ever grows, the pool sizing needs to become per-process before this does.
+#
+# `schedule_tick` (the cron job below) draws from this same budget — arq runs cron jobs
+# through the same concurrency semaphore as queued ones. Two crawls already in flight
+# therefore DELAY a tick's execution rather than skipping it, by up to
+# JOB_TIMEOUT_SECONDS in the worst case. That is bounded and self-recovering (the crawl's
+# own hard caps end it, and the tick's work is idempotent — the schedules it did not get
+# to are still due), which is why this number does not need to grow to accommodate a job
+# that runs for milliseconds once a minute.
 MAX_JOBS = 2
 
 # How long one job may run before arq cancels it. Generous against a crawl measured in
