@@ -2,12 +2,17 @@
 
 Everything llms-text does, in one page.
 
-> **Where this is up to.** llms-text is being built in the open, and the part that turns a
-> site into a useful index is the part that is not finished. A run fetches **only the URL you
-> gave it** — following links to the rest of the site is not built yet — and writes a
-> **placeholder** `llms.txt` that lists what it fetched rather than a written summary of it.
-> Everything around that works today: adding a site, running a crawl, watching it, and
-> collecting the file it produced. Each section below says where its own part stands.
+{/* This page describes what the product DOES, in the present tense. It deliberately does not
+    describe build state — no "not built yet", no "coming soon", no naming of milestones. A
+    public page written against a roadmap goes stale the moment an unrelated change merges,
+    and nobody remembers to come back and fix it. Describe a capability and the sentence stays
+    true or gets edited by the change that alters the behaviour, which is the only edit anyone
+    will reliably make. */}
+
+> **What a run produces.** A run fetches the URL you give it and writes an `llms.txt` that
+> lists what it fetched. It does not follow links to the rest of the site, and the file is a
+> plain listing rather than a written summary — useful as a starting point, not as something
+> to publish unedited.
 
 ## What is llms.txt
 
@@ -20,10 +25,10 @@ navigation, cookie banners, footers and duplicated boilerplate along with the co
 to guess what matters. A hand-written index of the pages that do matter is smaller, cheaper to
 read, and says what the site's author would have said if asked.
 
-llms-text is being built to write that file for you. Today it fetches the URL you give it and
-produces a placeholder `llms.txt` naming what it fetched. The two parts that would make the
-file worth publishing — discovering the rest of the site's pages, and reading them to work out
-which carry the content — are the next milestone and are not built yet.
+llms-text writes a first draft of that file for you. Point it at a URL and it fetches that
+page and writes an `llms.txt` naming what it found. Turning that draft into the curated index
+above — deciding which of a site's pages carry the content, and describing them — is still
+yours to do.
 
 ## Adding a site
 
@@ -42,22 +47,23 @@ Two people can each add the same site; one person cannot add it twice.
 A **run** is one crawl of one site. A run is either manual or scheduled, and both produce the
 same thing.
 
-**Manual runs work today.** The **Run now** button on a site's page starts one. Adding a site
-starts one too. Use it after you have changed the site and want the file regenerated.
+**Manual.** The **Run now** button on a site's page starts a run, and adding a site starts one
+too. Use it after you have changed the site and want the file regenerated.
 
-**Scheduled runs work too, but there is no screen for them yet.** A schedule repeats a run at
-a fixed interval, and there are four intervals — these are the only four:
+**Scheduled.** A schedule repeats a run on its own, at one of four intervals — these are the
+only four:
 
 - **Hourly** — a site that changes through the day: a changelog, a status page.
 - **Every 6 hours** — an active documentation site.
 - **Daily** — most sites.
 - **Weekly** — a site that rarely changes: a marketing site, a personal page.
 
-The API accepts a schedule and a timer fires the due ones, so a schedule set through the API
-does run. What is missing is the **Schedule** tab that would let you set one without touching
-the API — until it lands, that tab is a placeholder. A schedule can be switched off without
-being deleted, its run history outlives it, and its runs count against the daily limit below
-exactly as manual ones do.
+A site has at most one schedule, set through `PUT /websites/{id}/schedule` — see **API** at
+the end of this page. Runs do not fire on the exact interval: each one is nudged by up to ±5% —
+about ±3 minutes on an hourly schedule, ±72 on a daily one — so that a batch of sites added
+in the same sitting does not settle into crawling in the same second forever. A schedule can
+be switched off without being deleted, its run history outlives it, and its runs count against
+the daily limit below exactly as manual ones do.
 
 ## Reading the output
 
@@ -68,8 +74,8 @@ it to `llms.txt` when you publish it.
 
 Publish it at the root of your site, so it answers at `https://your-site.com/llms.txt` as
 plain text. Where the file goes depends on your host — a `public/` or `static/` directory for
-most frameworks, the site root for anything served from disk. Bear in mind what the callout at
-the top says: what a run writes today is a placeholder, not an index worth serving.
+most frameworks, the site root for anything served from disk. As the note at the top says,
+what a run writes is a listing rather than a curated index, so read it before you publish it.
 
 Runs are kept, so you can open an older one from the **Runs** tab and see what the file looked
 like before a change.
@@ -86,16 +92,14 @@ are listed here so nobody has to discover one by hitting it.
 - **3 minutes** — how long a run gets. The crawler's own budget is 5 minutes, but the job
   runner stops a job at 3, so 3 is the number that actually bites.
 
-The page cap is a budget rather than a failure: reaching it ends the run with the pages it
-already had, so a large site yields a partial file instead of no file at all. It is also the
-one cap you cannot reach today — a run fetches a single page — so it is really the ceiling
-that starts applying once link discovery lands.
+The page and size caps are budgets, not errors: reaching one part-way through a crawl ends the
+run with whatever it already collected, so a big site gives you a partial file rather than no
+file.
 
-The other two are blunt, and worth knowing about before you meet one. Going over 50 MiB
-**fails** the run right now, with "The site's response was too large": a run fetches one page,
-and when the only page is the one that overran there is nothing partial left to keep. (Once a
-run fetches many pages, busting the budget partway through will stop it the way the page cap
-does.) And a run stopped at 3 minutes is cut off mid-flight rather than wrapped up neatly.
+Two cases have nothing to salvage and so fail the run outright — when the very first page
+cannot be fetched, and when that page is itself over the size cap, which reports "The site's
+response was too large." The time limit is blunt in the same way: a run stopped at 3 minutes is
+cut off mid-flight rather than wrapped up neatly.
 
 **Per account**
 
