@@ -2,9 +2,11 @@
 // node_modules/lucide-react/dist/esm/icons — there is no github.* file there), so the mark
 // is inlined rather than guessed at.
 //
-// Its own file because two buttons now render it: `github-sign-in-button.tsx` and the
-// landing page's primary `ShimmerButton`. A `<path>` this long copied into a second file is
-// a copy nobody would ever notice diverging.
+// Its own file rather than inlined into the one component that renders it today (the
+// landing page's primary `ShimmerButton`): a `<path>` this long is not markup anyone reads,
+// and keeping it out of the way is what lets `components/landing/landing-form.tsx` stay
+// mostly markup — ARCHITECTURE.md §8.4. The next sign-in surface reuses it instead of
+// pasting a second copy nobody would notice diverging.
 export function GithubMark({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>

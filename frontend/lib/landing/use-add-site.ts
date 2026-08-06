@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 
 import { isRunAlreadyInFlight, isWebsiteAlreadyExists } from "@/lib/api/errors";
 import { ApiError } from "@/lib/api/fetcher";
@@ -105,6 +105,23 @@ export function useAddSite(): {
   // What was last submitted, so `retry()` can resend it without the field having to hand it
   // back — the field may have been cleared or edited in between.
   const lastUrl = useRef<string | null>(null);
+
+  // `isNavigating` is a one-way latch, and the thing that normally clears it is this
+  // component unmounting as the new route takes over. Nothing *guarantees* that unmount,
+  // though — a client Router Cache hit on Back, or a bfcache restore after an external
+  // round trip, can bring this tree back with its state intact — and if it ever does, the
+  // field stays disabled behind a spinner with no error and no way out but a reload. This
+  // clears the latch whenever this page is the current route again, which makes the unmount
+  // an optimization rather than the only thing standing between the user and a dead form.
+  // (Measured on Next 15.5.22: Back does remount, so today this never fires. It costs three
+  // lines and removes the whole failure mode.) The route is captured at mount rather than
+  // compared against a literal "/" so this stays correct if the form is ever mounted
+  // elsewhere.
+  const pathname = usePathname();
+  const mountedAt = useRef(pathname);
+  useEffect(() => {
+    if (pathname === mountedAt.current) setIsNavigating(false);
+  }, [pathname]);
 
   const createWebsiteMutation = useCreateWebsite({ toastOnError: false });
   const triggerRunMutation = useTriggerRun({ toastOnError: false });

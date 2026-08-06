@@ -30,20 +30,25 @@ Two people can each add the same site; one person cannot add it twice.
 
 ## Manual vs scheduled runs
 
-A **run** is one crawl of one site. Every run is either manual or scheduled, and both produce
-the same thing.
+A **run** is one crawl of one site. A run is either manual or scheduled, and both produce the
+same thing.
 
-- **Manual** — the **Run now** button on a site's page. Use it after you have changed the site
-  and want the file regenerated before the next scheduled run would do it.
-- **Scheduled** — a repeating run, configured on a site's **Schedule** tab. Four intervals are
-  available, and they are the only four:
-  - **Hourly** — a site that changes through the day: a changelog, a status page.
-  - **Every 6 hours** — an active documentation site.
-  - **Daily** — most sites.
-  - **Weekly** — a site that rarely changes: a marketing site, a personal page.
+**Manual runs work today.** The **Run now** button on a site's page starts one. Adding a site
+starts one too. Use it after you have changed the site and want the file regenerated.
 
-A schedule can be turned off without being deleted, and its run history outlives it. Scheduled
-runs count against the daily limit below in exactly the same way manual ones do.
+**Scheduled runs are not finished yet.** Every run you see today is one somebody started by
+hand. The design is fixed and the API already accepts it — four intervals, and these are the
+only four:
+
+- **Hourly** — a site that changes through the day: a changelog, a status page.
+- **Every 6 hours** — an active documentation site.
+- **Daily** — most sites.
+- **Weekly** — a site that rarely changes: a marketing site, a personal page.
+
+What is still missing is the tab that configures a schedule and the timer that fires it, so
+setting one has no effect for now. When they land, a schedule will be switchable off without
+being deleted, its run history will outlive it, and its runs will count against the daily
+limit below exactly as manual ones do.
 
 ## Reading the output
 
@@ -66,7 +71,7 @@ are listed here so nobody has to discover one by hitting it.
 
 - **100 pages** — the most a single run will fetch.
 - **5 minutes** — the wall-clock budget for a run.
-- **50 MB** — the total downloaded across the whole run.
+- **50 MiB** — the total downloaded across the whole run (52,428,800 bytes).
 
 Reaching one of these ends the run **successfully**, with whatever pages it had collected by
 then. It is a budget, not a failure: a 400-page site produces an `llms.txt` built from the
