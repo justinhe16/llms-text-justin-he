@@ -213,15 +213,23 @@ arguments only (ids and primitives, never ORM objects or Pydantic models).
 ```
 backend/app/worker/
 ├── settings.py   WorkerSettings — what `arq app.worker.settings.WorkerSettings` loads
+├── policy.py     the numbers: poll delay, timeouts, the retry ladder, the reaper thresholds
 └── jobs.py       the job functions themselves
 ```
+
+`policy.py` exists because the stuck-run reaper's staleness threshold is **derived** from
+`job_timeout`, and the job that applies it is imported by `settings.py` — leaving the constant
+in `settings.py` would have made that derivation a circular import, and restating it in
+`jobs.py` with a "keep these in sync" comment is the drift the reaper cleans up after. Every
+setting arq reads is still **assigned directly** in the `WorkerSettings` class body; only the
+values on the right-hand side moved.
 
 **The API enqueues; the worker consumes. Neither does the other.** The API opens an
 `ArqRedis` pool in its lifespan and exposes it as a dependency; the worker gets its own
 connection from arq. Nothing in `app/api/` or `app/features/` imports `app/worker/` — the
 dependency runs the other way, so the queue never enters a request path.
 
-Four properties of `WorkerSettings` are load-bearing enough to state here, because each
+Six properties of `WorkerSettings` are load-bearing enough to state here, because each
 fails silently rather than loudly:
 
 - **`poll_delay = 5`, not arq's 0.5.** An idle worker issues one Redis command per poll, and
@@ -232,13 +240,25 @@ fails silently rather than loudly:
   on Fly with no HTTP listener to fail a health check. A no-op job holds the place.
 - **`job_completion_wait` is non-zero.** It is the only thing that makes SIGTERM drain
   rather than cancel, and it has to nest inside `fly.toml`'s `kill_timeout`.
-- **`cron_jobs` registers the schedule tick, once a minute, with `max_tries=1`.** It is the
-  only writer of `schedules.last_run_at` besides the run pipeline itself, and it is the one
-  place in this codebase where more than one worker machine racing the same work is a real
-  scenario rather than a theoretical one. Its correctness under that scenario rests entirely
-  on `SchedulesReader.lock_due`'s `FOR UPDATE SKIP LOCKED`, not on arq's own best-effort
-  `unique=True` — a distinction that is invisible with a single worker and only starts to
-  matter the day a second one is added.
+- **`cron_jobs` registers two jobs: the schedule tick every minute and the stuck-run reaper
+  every five, both with `max_tries=1`.** A tick that raises is not re-run against the state
+  it half-left; the next one re-evaluates from the database. Both are places where more than
+  one worker machine racing the same work is a real scenario rather than a theoretical one,
+  and the correctness of both rests on `FOR UPDATE SKIP LOCKED` — `SchedulesReader.lock_due`
+  and `RunsReader.lock_reapable` — not on arq's best-effort `unique=True`. For the reaper,
+  `SKIP LOCKED` is doing a second job as well: it scans a table crawl workers lock rows in
+  constantly, and a plain `FOR UPDATE` would queue behind whichever write it happened to meet.
+- **`job_timeout` (600s) sits ABOVE the crawl's own wall-clock cap (300s), not below it.**
+  The application-level cap is what should end a long crawl, with a message saying so; arq's
+  cancellation is the outer backstop for a job wedged somewhere that cap does not cover. It is
+  deliberately **not** ordered against `job_completion_wait`: Fly caps `kill_timeout` at 300s,
+  so a drain budget can never contain a job timeout set above a 300s crawl cap, and the two
+  constraints are unsatisfiable together. See `app/worker/policy.py`, which argues this at
+  length, and `tests/test_worker_settings.py`, which asserts the replacement invariants.
+- **`max_tries` is arq's ceiling, not the retry policy.** The policy is counted against
+  `runs.attempts`, incremented by `claim_pending` inside the atomic claim, because that is the
+  only counter a reaper in another process can read. arq's `job_try` resets whenever a run is
+  re-enqueued under a new job id; the run's own counter does not.
 
 Startup and shutdown hooks (`on_startup`/`on_shutdown`) open and close the asyncpg pool with
 **the same factory the API's lifespan uses**, and publish shared resources on arq's context
@@ -660,6 +680,21 @@ rows are the ones that accumulate forever. That index is hand-written in the mig
 Prisma has no syntax for a partial index, and its introspection cannot see one, so it is
 deliberately **not** declared in `schema.prisma` (declaring it makes every later
 `migrate dev` emit a duplicate `CREATE INDEX`).
+
+`attempts` and `claimed_at` are the retry policy's and the reaper's two columns (PER-166).
+`attempts` counts claims, not enqueues: it is incremented by `claim_pending` inside the atomic
+`pending -> processing` UPDATE, so it measures attempts that actually STARTED and cannot be
+inflated by a redelivered job that lost the claim race. It is never decremented — a run handed
+back to the queue keeps the attempt it spent, which is what bounds retrying. `claimed_at`
+stamps the same UPDATE and is cleared when a run is returned to `pending`.
+
+**`claimed_at`, and not `started_at`, is the reaper's staleness clock**, which is the one
+detail here worth stating rather than discovering. `started_at` is set at INSERT — when the run
+was enqueued — and with `max_jobs = 2` against a batch of scheduled runs a row can sit
+`pending` for an hour before a worker touches it. A reaper measuring from `started_at` would
+reap such a run moments after it was finally claimed, producing a duplicate crawl, which is the
+one outcome the threshold exists to avoid. The scan reads `COALESCE(claimed_at, started_at)` so
+that rows claimed before the column existed stay reachable.
 
 `llms_txt`, `storage_path`, `stats`, and `completed_at` are no longer merely reserved columns
 waiting for a later ticket — `RunService.record_success` writes all four on every successful

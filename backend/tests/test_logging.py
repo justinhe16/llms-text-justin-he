@@ -563,7 +563,7 @@ async def test_crawl_task_binds_run_id_for_everything_it_calls(
     deep_logger = logging.getLogger("app.features.crawl.internals.fetcher")
 
     class _Service:
-        async def execute_run(self, requested: UUID) -> None:
+        async def execute_run(self, requested: UUID, *, max_attempts: int) -> None:
             # Stands in for every module under CrawlService that logs without ever being
             # handed a run id.
             deep_logger.debug("fetched a page", extra={"status": 200})

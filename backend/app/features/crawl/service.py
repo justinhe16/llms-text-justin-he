@@ -28,8 +28,9 @@ database transaction open while the upload is in flight; `RunService.record_succ
 its own transaction only after `await self._storage.upload(...)` has already returned.
 """
 
+import asyncio
 import logging
-from typing import Final
+from typing import Any, Final
 from uuid import UUID
 
 import httpx
@@ -61,6 +62,112 @@ logger = logging.getLogger(__name__)
 # bounding what a future exception type could accidentally leak if someone adds one to
 # `_safe_error_message` without thinking about its `str()`.
 _MAX_ERROR_LENGTH: Final = 500
+
+# What `runs.error` says when a run is cancelled on its LAST attempt — arq's `job_timeout`
+# fired, or a deploy's SIGTERM landed after `job_completion_wait` expired, and there is no
+# budget left to try again. Deliberately says what happened rather than blaming the site: the
+# site may have been perfectly fine, and telling a user their crawl timed out when in fact we
+# redeployed underneath it would be a lie they could act on.
+_CANCELLED_MESSAGE: Final = "The run was interrupted before it could finish."
+
+
+class TransientCrawlError(Exception):
+    """Raised by `CrawlService.execute_run` when this attempt failed transiently and the run
+    has budget left — the run is ALREADY back in `pending` by the time this leaves the
+    service, and the only thing left to arrange is a redelivery.
+
+    **`app.worker.jobs.crawl_task` translates this into `arq.worker.Retry`, and that
+    translation is the job's, not this service's.** Deciding *whether* an attempt deserves
+    another go is a fact about crawling; deciding *how long to wait* and *how to tell the
+    queue* are facts about arq, and `app/features/` may not import `app/worker/`
+    (ARCHITECTURE.md §3.3). The exception is the seam between the two, exactly as a router
+    turning a service's return value into a status code is.
+
+    This is the inverse of the shape PER-166's ticket describes ("raise a distinct exception
+    type for permanent failures"), and deliberately so: arq 0.28 does **not** retry on an
+    arbitrary exception — `Worker.run_job` retries only on `Retry`, `RetryJob`, or
+    `CancelledError`, and treats everything else as a terminal job failure. So in this
+    library a permanent failure is the one that needs no exception at all, and a retryable
+    one is the case that has to say so out loud.
+    """
+
+    def __init__(self, message: str, attempts: int) -> None:
+        super().__init__(message)
+        # The run's `runs.attempts` value for the attempt that just failed. Carried on the
+        # exception so `crawl_task` can size the backoff from the RUN's counter rather than
+        # from arq's `ctx["job_try"]`: the reaper re-enqueues runs under fresh job ids, which
+        # resets `job_try` to 1 and would restart the backoff ladder from ten seconds on a
+        # run that has already been failing for an hour.
+        self.attempts = attempts
+
+
+# Exception types a second attempt could plausibly answer differently. Anything not on this
+# list is permanent — see `_is_retryable`.
+_RETRYABLE_EXCEPTIONS: Final = (
+    # Both spellings of "too slow", for the reason `_safe_error_message` gives below: httpx
+    # times out one request, `crawl_site`'s outer `asyncio.timeout` times out the whole run
+    # and raises the builtin.
+    httpx.TimeoutException,
+    TimeoutError,
+    # `ConnectError` is also what a DNS resolution failure surfaces as (httpx wraps
+    # `socket.gaierror`), which the ticket names separately but which has no separate type.
+    # `TransportError` is its parent and catches the rest of the transport layer — read
+    # errors, protocol errors, and the TLS failures httpx has no dedicated class for.
+    httpx.TransportError,
+    # Supabase Storage being briefly unavailable says nothing about whether this site can be
+    # crawled. The crawl itself already succeeded when this fires.
+    StorageUploadError,
+)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Would waiting and trying again plausibly produce a different outcome?
+
+    **Retryable** is the narrow, enumerated set above: the network was uncooperative, or
+    Storage was. **Permanent** is everything else, and the defaulting direction is the whole
+    point of the function. Three of the failures this crawler can actually produce are
+    permanent by construction and would be pure latency to retry:
+
+    * `SsrfBlockedError` — the URL resolves somewhere it is not allowed to. It will resolve
+      there again in ten seconds, and again in sixty. The ticket's headline example.
+    * `FetchError` — a redirect loop, or a redirect this crawler refuses to follow. A
+      property of the site's configuration, not of this moment.
+    * `ByteBudgetExceededError` — the site is bigger than `crawl_max_bytes`. It will still be.
+
+    An exception this function has never heard of is treated as permanent too. That is the
+    conservative choice in the direction that matters: an unrecognized exception is far more
+    likely to be a bug in this codebase than a blip on the network, and retrying a bug three
+    times over five minutes delays an honest `failed` row by five minutes to reach the
+    identical outcome. The cost of getting it wrong in this direction is a run that fails
+    once when it might have succeeded on a second try; the cost of the other direction is
+    every bug in the crawl path becoming a five-minute-slow bug.
+
+    **A 4xx or 5xx from the target site is not on either list, because it is not an exception
+    here at all.** `internals/fetcher.py` returns a `CrawledPage` carrying `status` rather
+    than raising for a non-2xx response, so "404 on the seed URL" and "5xx from the target
+    site" — which the ticket classifies as permanent and retryable respectively — currently
+    reach this service as a *successful* crawl of a page. Turning them into failures at all
+    is a crawler-pipeline decision, and that milestone is not designed (CLAUDE.md #9,
+    ARCHITECTURE.md §3.4). When it is, the classification belongs here, in this function.
+    """
+    return isinstance(exc, _RETRYABLE_EXCEPTIONS)
+
+
+def _attempt_message(message: str, attempts: int) -> str:
+    """Prefix a terminal failure with the attempt count, once there is more than one.
+
+    "Failed after 3 attempts: The site took too long to respond." reads very differently from
+    the same sentence on its own, and that difference is the point — it is what lets the UI,
+    and whoever is reading the row, tell a site that is genuinely down apart from a one-off
+    blip. A first-and-only attempt gets no prefix: "Failed after 1 attempts" would be noise
+    on every permanent failure, which is most of them.
+
+    Truncated to `_MAX_ERROR_LENGTH` after the prefix is applied, never before, so the bound
+    on what reaches `runs.error` holds for the string actually stored.
+    """
+    if attempts <= 1:
+        return message[:_MAX_ERROR_LENGTH]
+    return f"Failed after {attempts} attempts: {message}"[:_MAX_ERROR_LENGTH]
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -124,27 +231,68 @@ class CrawlService:
         self._websites = website_service
         self._settings = settings
 
-    async def execute_run(self, run_id: UUID) -> CrawlOutcome | None:
+    async def execute_run(self, run_id: UUID, *, max_attempts: int) -> CrawlOutcome | None:
         """Crawl the website behind `run_id`, and return what it produced — or `None`.
 
         `None` covers every path that is not "a crawl actually ran and produced an
         outcome": the run no longer exists, it was not `pending`, another worker already
-        claimed it, or something failed. A worker's job function
+        claimed it, or something failed terminally. A worker's job function
         (`app.worker.jobs.crawl_task`) never raises an `HTTPException` at arq, so every one
         of those paths is logged here and turned into a plain return instead.
 
-        Deliberately does not catch `asyncio.CancelledError` — arq's own job timeout or a
-        SIGTERM delivers exactly that, and letting it propagate is what leaves the run in
-        `processing` for the stuck-run reaper (a later, reliability ticket) to find, rather
-        than this method racing that same signal to record a failure of its own.
+        **Two exceptions now leave this method, and neither is an application error.**
+        PER-166 amended the older "a worker must not raise at arq" contract, which was
+        written when a raise had nowhere useful to go:
+
+        * `TransientCrawlError` — a transient failure with attempts left on the run's budget. The run
+          is already back in `pending` before this is raised; `crawl_task` turns it into
+          `arq.worker.Retry`, which is the only way to ask arq 0.28 for a redelivery.
+        * `asyncio.CancelledError` — arq's `job_timeout`, or a deploy's SIGTERM landing after
+          `job_completion_wait` expired. **This is now caught, acted on, and re-raised**,
+          where it used to propagate untouched. Catching it does not race the signal the way
+          the old docstring feared: the recovery write is one short, guarded statement, and
+          if it does not land the stuck-run reaper still sweeps the row minutes later.
+
+          **The two causes are NOT redelivered the same way, and the difference is arq's, not
+          this method's.** `arq.worker.Worker.run_job` runs the job as
+          `await asyncio.wait_for(task, timeout_s)`, and it retries only on `Retry`,
+          `RetryJob`, and `CancelledError`:
+
+          - **SIGTERM** cancels `run_job`'s own frame, so arq sees `CancelledError`, logs
+            "cancelled, will be run again", and re-queues the job under the same id. The run
+            is `pending` and the redelivery is immediate — which is the difference between a
+            deploy costing a user five minutes and costing them nothing they can see.
+          - **`job_timeout`** cancels the INNER task, and `asyncio.wait_for` converts that
+            into `TimeoutError` at its own call site once the coroutine finishes unwinding.
+            `TimeoutError` is not in arq's retry set, so arq records the job as failed and
+            does NOT redeliver it. The run is still left correctly `pending` by the recovery
+            below — what picks it up is the reaper's ORPHAN sweep, within
+            `REAPER_INTERVAL_MINUTES`, not arq.
+
+          Either way the database ends in a state something acts on, which is the property
+          that matters; the second path is simply slower. It is also the rarer one by
+          construction — `job_timeout` (600s) sits above the crawl's own 300s cap, so a
+          normal slow crawl fails through `TransientCrawlError` long before arq's timeout is
+          reachable at all. `tests/test_crawl_retry.py` pins arq's actual behaviour here
+          against a real `Worker` rather than assuming it.
+
+        Args:
+            run_id: The run to crawl.
+            max_attempts: The retry budget, `MAX_ATTEMPTS` from `app/worker/policy.py`,
+                passed in by the job. Not imported: nothing under `app/features/` may import
+                `app/worker/` (ARCHITECTURE.md §3.3), and a test wants to set it to 1.
 
         Returns:
             A `CrawlOutcome` if the seed was fetched, an artifact was generated, it was
             uploaded to Storage, and the `runs` row was written `completed` — by the time
             this returns non-`None`, all of that has already happened (see the module
             docstring). `None` covers every other path, including a Storage upload or a
-            database write that failed after a successful crawl: those are recorded as a
-            `failed` run (see the partial-stats handling below), never left `processing`.
+            database write that failed terminally after a successful crawl.
+
+        Raises:
+            TransientCrawlError: transient failure, attempts remaining, run already returned to
+                `pending`.
+            asyncio.CancelledError: re-raised after the run has been handed back or failed.
         """
         try:
             run = await self._runs.get_run(run_id)
@@ -153,6 +301,9 @@ class CrawlService:
             # this method: `crawl_task` binds it with `run_id_context` around this entire
             # call, so `app.core.logging.JsonFormatter` already attaches it to every line —
             # repeating it in the message text would just be `jq`-unfriendly duplication.
+            #
+            # Permanent, and not merely by classification: there is no row left to record a
+            # failure against, which is why this returns before anything is claimed.
             logger.warning("crawl: run no longer exists; skipping")
             return None
 
@@ -164,8 +315,13 @@ class CrawlService:
             logger.info("crawl: run is not pending; skipping", extra={"status": run.status})
             return None
 
-        claimed = await self._runs.claim_for_processing(run_id)
-        if not claimed:
+        # THE ATTEMPT NUMBER COMES FROM THE DATABASE, not from arq's `ctx["job_try"]`. The
+        # claim increments `runs.attempts` inside the same atomic UPDATE that wins the race
+        # (`RunsWriter._CLAIM_PENDING`), so this number is the run's own, is visible to the
+        # reaper running in another process, and cannot be inflated by a job that lost the
+        # race. See `MAX_ATTEMPTS` in app/worker/policy.py for the full argument.
+        attempts = await self._runs.claim_for_processing(run_id)
+        if attempts is None:
             logger.info("crawl: lost the claim race to another worker; skipping")
             return None
 
@@ -176,6 +332,13 @@ class CrawlService:
         # where `result.stats["pages_crawled"]` is 0 anyway.
         result: CrawlResult | None = None
         links_emitted = 0
+        outcome: CrawlOutcome | None = None
+        # Set by the failure paths below when the attempt should be retried, and raised
+        # AFTER the `try` rather than from inside it. Raising `TransientCrawlError` from within the
+        # `try` would be caught by this method's own `except Exception` and turned into a
+        # terminal failure — the retry would quietly become the very thing it exists to
+        # avoid.
+        pending_retry: TransientCrawlError | None = None
         try:
             website = await self._websites.get_website(run.website_id)
 
@@ -191,6 +354,8 @@ class CrawlService:
                     "max_pages": limits.max_pages,
                     "max_bytes": limits.max_bytes,
                     "max_wall_clock_s": limits.max_wall_clock_s,
+                    "attempt": attempts,
+                    "max_attempts": max_attempts,
                 },
             )
 
@@ -199,43 +364,68 @@ class CrawlService:
             result = await crawl_site(self._client, website.url, limits=limits)
 
             if result.seed_error is not None:
-                message = _safe_error_message(result.seed_error)
+                # WARNING, not ERROR, and a message of its own: a site that is down is an
+                # ordinary outcome of crawling the internet, not an incident. It goes through
+                # the same `_finish_failed_attempt` as an unexpected exception because the
+                # retry decision is identical — only the log line differs.
                 logger.warning(
                     "crawl: could not fetch its seed URL (%s)",
-                    message,
+                    _safe_error_message(result.seed_error),
                     exc_info=result.seed_error,
                 )
-                await self._runs.record_failure(
-                    run_id, message, build_run_stats(result.stats, links_emitted=links_emitted)
+                pending_retry = await self._finish_failed_attempt(
+                    run_id,
+                    result.seed_error,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                    stats=build_run_stats(result.stats, links_emitted=links_emitted),
                 )
-                return None
+            else:
+                llms_txt = generate_llms_txt(result.pages)
+                links_emitted = len(result.pages)
 
-            llms_txt = generate_llms_txt(result.pages)
-            links_emitted = len(result.pages)
+                payload = serialize_payload(result.pages)
+                object_path = payload_object_path(run.website_id, run_id)
 
-            payload = serialize_payload(result.pages)
-            object_path = payload_object_path(run.website_id, run_id)
+                # THE NETWORK CALL. No transaction is open here, and none may be opened
+                # around it (ARCHITECTURE.md §5.1). Upload first: an orphaned object costs a
+                # fraction of a cent, while a committed row pointing at an object that does
+                # not exist is a 404 in the UI on a run the database swears succeeded.
+                storage_path = await self._storage.upload(
+                    object_path, payload, content_type=PAYLOAD_CONTENT_TYPE
+                )
+                # `len(payload)` is a number already sitting in hand, not a re-derivation —
+                # this stays cheap. The payload itself is never logged: it is every fetched
+                # page's content, gzip-compressed, and a page's content has no business
+                # appearing in `fly logs`, which every signed-in user's crawl targets share.
+                logger.info(
+                    "crawl: uploaded payload to storage",
+                    extra={"bytes": len(payload), "storage_path": storage_path},
+                )
 
-            # THE NETWORK CALL. No transaction is open here, and none may be opened around
-            # it (ARCHITECTURE.md §5.1). Upload first: an orphaned object costs a fraction
-            # of a cent, while a committed row pointing at an object that does not exist is
-            # a 404 in the UI on a run the database says succeeded.
-            storage_path = await self._storage.upload(
-                object_path, payload, content_type=PAYLOAD_CONTENT_TYPE
+                stats = build_run_stats(result.stats, links_emitted=links_emitted)
+                await self._runs.record_success(
+                    run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
+                )
+
+                # `result.stats` already has exactly the five keys `runs.stats` wants named
+                # (`pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`,
+                # `cap_hit`) — spread rather than restated by hand, so this line can never
+                # drift from the shape `internals/crawler.py` actually produces.
+                # `storage_path` is the one field that is not already on it.
+                logger.info(
+                    "crawl: completed", extra={**result.stats, "storage_path": storage_path}
+                )
+                outcome = CrawlOutcome(llms_txt=llms_txt, stats=stats, storage_path=storage_path)
+        except asyncio.CancelledError:
+            # arq's `job_timeout`, or SIGTERM after the drain budget expired. Handled and
+            # RE-RAISED — see the method docstring. `_recover_cancelled_attempt` never
+            # raises, so nothing here can mask the cancellation or replace it with a
+            # different exception on the way out.
+            await self._recover_cancelled_attempt(
+                run_id, attempts=attempts, max_attempts=max_attempts
             )
-            # `len(payload)` is a number already sitting in hand, not a re-derivation — this
-            # stays cheap. The payload itself is never logged: it is every fetched page's
-            # content, gzip-compressed, and a page's content has no business appearing in
-            # `fly logs`, which every signed-in user's crawl targets share.
-            logger.info(
-                "crawl: uploaded payload to storage",
-                extra={"bytes": len(payload), "storage_path": storage_path},
-            )
-
-            stats = build_run_stats(result.stats, links_emitted=links_emitted)
-            await self._runs.record_success(
-                run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
-            )
+            raise
         except Exception as exc:
             # `exc_info=True` stays: `fly logs` is the only log surface this system has and
             # there is no error-tracking service on either side of it holding a second copy
@@ -247,16 +437,119 @@ class CrawlService:
                 if result is not None
                 else None
             )
-            await self._runs.record_failure(run_id, _safe_error_message(exc), partial_stats)
-            return None
+            pending_retry = await self._finish_failed_attempt(
+                run_id, exc, attempts=attempts, max_attempts=max_attempts, stats=partial_stats
+            )
 
-        # `result.stats` already has exactly the five keys `runs.stats` wants named
-        # (`pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`, `cap_hit`) —
-        # spread rather than restated by hand, so this line can never drift from the shape
-        # `internals/crawler.py` actually produces. `storage_path` is the one field that
-        # isn't already on it.
-        logger.info("crawl: completed", extra={**result.stats, "storage_path": storage_path})
-        return CrawlOutcome(llms_txt=llms_txt, stats=stats, storage_path=storage_path)
+        if pending_retry is not None:
+            raise pending_retry
+        return outcome
+
+    async def _finish_failed_attempt(
+        self,
+        run_id: UUID,
+        exc: Exception,
+        *,
+        attempts: int,
+        max_attempts: int,
+        stats: dict[str, Any] | None,
+    ) -> TransientCrawlError | None:
+        """Record a failed attempt, and say whether it should be retried.
+
+        The single decision point for every non-cancellation failure in `execute_run`, so
+        that the seed-failure path and the unexpected-exception path cannot drift apart in
+        how they classify, how they count, or what they leave in the database.
+
+        Returns:
+            A `TransientCrawlError` for the caller to raise once it is safely outside its own
+            `except Exception` — the run has been handed back to `pending` and wants
+            redelivering. `None` when the failure was terminal and `runs` now says so.
+        """
+        message = _safe_error_message(exc)
+        retryable = _is_retryable(exc)
+
+        if retryable and attempts < max_attempts:
+            # Back to `pending` FIRST, then ask for a redelivery. The order matters: the
+            # redelivered job's `claim_pending` matches only a `pending` row, so a retry
+            # requested against a row still marked `processing` would arrive, find nothing to
+            # claim, log "not pending; skipping", and quietly burn the attempt.
+            await self._runs.release_claim(run_id)
+            logger.warning(
+                "crawl: attempt %d of %d failed transiently (%s); returning the run to the "
+                "queue for another attempt",
+                attempts,
+                max_attempts,
+                message,
+                extra={"attempt": attempts, "max_attempts": max_attempts, "retryable": True},
+            )
+            return TransientCrawlError(message, attempts)
+
+        # Terminal: either the failure is permanent, or the budget is gone. `stats` is
+        # whatever partial numbers this attempt produced, threaded through unchanged —
+        # `RunsWriter.mark_processing_failed` COALESCEs `None` against what is already
+        # stored rather than blanking it.
+        await self._runs.record_failure(run_id, _attempt_message(message, attempts), stats)
+        # ERROR, and this is the line PER-166 asks for. A terminal failure IS the incident
+        # record, because there is no error-tracking service holding a second copy
+        # (ARCHITECTURE.md §3.8) — and it is an ERROR rather than a WARNING precisely because
+        # nothing else will ever say this run stopped for good. `run_id` is already bound as
+        # a correlation id by `crawl_task`, so it is not repeated in the message text.
+        logger.error(
+            "crawl: run failed terminally after %d attempt(s) (%s)",
+            attempts,
+            message,
+            extra={"attempt": attempts, "max_attempts": max_attempts, "retryable": retryable},
+        )
+        return None
+
+    async def _recover_cancelled_attempt(
+        self, run_id: UUID, *, attempts: int, max_attempts: int
+    ) -> None:
+        """Leave a cancelled run in a state something can act on. **Never raises.**
+
+        Called from `execute_run`'s `except asyncio.CancelledError` handler, on the way back
+        out. A cancellation is not a failure of the site being crawled — it is this process
+        being told to stop — so a run with budget left goes back to `pending` rather than to
+        `failed`, and arq's own retry-on-cancellation puts the job back on the queue behind
+        it. A run with no budget left is failed here rather than five minutes later by the
+        reaper, which is the "terminal state is written even on an arq timeout" half of the
+        ticket.
+
+        **Every exception is swallowed, deliberately.** This runs inside a coroutine that has
+        already been cancelled, on its way to re-raising; an exception escaping here would
+        replace the `CancelledError` with something arq treats completely differently — a
+        cancellation is re-queued, an ordinary exception is not. And the failure mode of
+        swallowing is already covered: a run left `processing` because this write did not
+        land is exactly what the stuck-run reaper sweeps, the same backstop
+        `RunService.record_failure`'s own unguarded write has always relied on.
+        """
+        try:
+            if attempts >= max_attempts:
+                await self._runs.record_failure(
+                    run_id, _attempt_message(_CANCELLED_MESSAGE, attempts)
+                )
+                logger.error(
+                    "crawl: cancelled on attempt %d of %d with no budget left; recorded a "
+                    "terminal failure",
+                    attempts,
+                    max_attempts,
+                    extra={"attempt": attempts, "max_attempts": max_attempts},
+                )
+            else:
+                await self._runs.release_claim(run_id)
+                logger.warning(
+                    "crawl: cancelled on attempt %d of %d (a deploy, or arq's job timeout); "
+                    "returned the run to the queue",
+                    attempts,
+                    max_attempts,
+                    extra={"attempt": attempts, "max_attempts": max_attempts},
+                )
+        except Exception:
+            logger.error(
+                "crawl: could not record the outcome of a cancelled run; leaving it for the "
+                "stuck-run reaper to sweep",
+                exc_info=True,
+            )
 
 
 def build_crawl_service(

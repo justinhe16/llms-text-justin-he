@@ -22,9 +22,24 @@ parameter.
 `run_id` arrives as a `str`, not a `UUID`: arq serializes job arguments with msgpack, which a
 `UUID` does not survive, and ARCHITECTURE.md §3.3 says jobs take "ids and primitives" for
 exactly this reason. `crawl_task` accepts `str | UUID` and coerces with `UUID(str(run_id))`;
-a malformed id is logged and the job returns rather than raising — the same "a worker must
-not raise at arq" contract `CrawlService.execute_run` itself follows for every other failure
-mode.
+a malformed id is logged and the job returns rather than raising.
+
+**"A worker must not raise at arq" now has exactly one exception, and PER-166 added it
+deliberately.** `crawl_task` raises `arq.worker.Retry` — and only that — when
+`CrawlService` reports a transient failure with attempts left on the run's budget. The old
+contract was written when a raise had nowhere useful to go: arq 0.28 retries only on `Retry`,
+`RetryJob`, and `CancelledError`, and turns every other exception into a terminal job
+failure, so raising an application error at arq really would have accomplished nothing but a
+noisier log. Asking for a redelivery is the one thing a raise can accomplish, and it is the
+one thing this file raises for. Every other failure — a bad `run_id`, a missing run, a lost
+claim race, a permanent crawl failure, an exhausted retry budget — is still logged and
+returned as a string.
+
+**The retry policy lives in `app/worker/policy.py`, and the number of attempts lives in the
+database.** `runs.attempts`, incremented by the claim, is what decides whether there is
+budget left; `policy.retry_delay_seconds` turns that number into a backoff. Neither is
+`ctx["job_try"]`, which counts deliveries of one arq job id and resets whenever the reaper
+re-enqueues a run under a new one.
 
 **Each job binds its own correlation id, and that is the one thing a job does that is not
 "call one service method".** `crawl_task` opens `run_id_context(...)` around its body and
@@ -41,16 +56,31 @@ enqueued by anything — arq's own cron scheduler calls it once a minute (`app/w
 settings.py`'s `cron_jobs`), which is what makes it a cron job rather than a task something
 else enqueues. It builds a `ScheduleService` from `ctx["db_pool"]` and the module `settings`
 and calls `ScheduleService.run_due_schedules`, exactly as thin as `crawl_task` above.
+
+**`reaper_tick` is the third, and the second cron job.** Same shape as `schedule_tick`, a
+different cadence (every five minutes) and a different service method
+(`RunService.reap_stuck_runs`). Both bind `tick_id_context`; see `reaper_tick`'s own
+docstring for why they share that contextvar rather than introducing a second one.
 """
 
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from arq.worker import Retry
+
 from app.core.logging import run_id_context, tick_id_context
 from app.core.settings import settings
-from app.features.crawl.service import build_crawl_service
+from app.features.crawl.service import TransientCrawlError, build_crawl_service
+from app.features.runs.service import build_run_service
 from app.features.schedules.service import build_schedule_service
+from app.worker.policy import (
+    MAX_ATTEMPTS,
+    ORPHANED_PENDING_AFTER_SECONDS,
+    STUCK_AFTER_SECONDS,
+    retry_delay_seconds,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -111,12 +141,26 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
 
     Returns:
         A short, human-readable outcome string for arq's job result — never anything a
-        caller is expected to parse. Never raises for an application-level failure: a bad
-        `run_id`, a missing run, a lost claim race, and a failed crawl (including a failed
-        Storage upload or database write) are all logged and returned, matching
-        `CrawlService.execute_run`'s own "never raise HTTPException at arq" contract.
-        `asyncio.CancelledError` (arq's job timeout, or SIGTERM) is not caught here either,
-        for the same reason `execute_run` does not catch it.
+        caller is expected to parse. A bad `run_id`, a missing run, a lost claim race, and a
+        terminally failed crawl (including a failed Storage upload or database write) are all
+        logged and returned rather than raised.
+
+    Raises:
+        arq.worker.Retry: the one deliberate exception to "a worker must not raise at arq" —
+            see the module docstring. The run is already back in `pending` when this is
+            raised, so the redelivered job has something to claim.
+        asyncio.CancelledError: arq's job timeout, or SIGTERM. Not caught here.
+            `CrawlService.execute_run` catches it one layer down, hands the run back to the
+            queue (or fails it, if the budget is spent), and re-raises — so by the time it
+            reaches this frame the database already reflects what happened.
+
+            Whether arq then redelivers depends on WHICH cancellation it was, and only
+            SIGTERM is redelivered: it cancels `run_job`'s own frame, so arq sees
+            `CancelledError` and re-queues. A `job_timeout` cancels the inner task, and
+            `asyncio.wait_for` hands arq a `TimeoutError` instead, which is not in its retry
+            set — that run waits for the reaper's orphan sweep. See
+            `CrawlService.execute_run`'s docstring for the full argument, and
+            `tests/test_crawl_retry.py` for the test that pins it.
     """
     try:
         parsed_run_id = UUID(str(run_id))
@@ -131,7 +175,32 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
     # (`max_jobs = 2`) can never show each other's id. See app/core/logging.py.
     with run_id_context(str(parsed_run_id)):
         service = build_crawl_service(ctx["db_pool"], ctx["http_client"], ctx["storage"], settings)
-        outcome = await service.execute_run(parsed_run_id)
+        try:
+            outcome = await service.execute_run(parsed_run_id, max_attempts=MAX_ATTEMPTS)
+        except TransientCrawlError as retry:
+            # THE ONE PLACE THIS CODEBASE ASKS ARQ FOR A REDELIVERY, and the reason
+            # `CrawlService` raises its own exception type rather than `arq.worker.Retry`
+            # directly: `app/features/` may not import `app/worker/`, and arq is a queue
+            # detail the crawl feature has no business knowing about (ARCHITECTURE.md §3.3).
+            # The service decided THAT this attempt deserves another go; this line decides
+            # HOW LONG to wait and says so in arq's own vocabulary.
+            #
+            # `defer` is sized from `retry.attempts` — the run's own counter — not from
+            # `ctx["job_try"]`. See `TransientCrawlError.__init__` and `app/worker/policy.py`.
+            #
+            # The run is already back in `pending` by the time this runs, so the redelivered
+            # job has something to claim. Raising `Retry` is what arq 0.28 requires: it
+            # retries on `Retry`, `RetryJob`, and `CancelledError`, and treats every other
+            # exception as a terminal job failure.
+            defer_seconds = retry_delay_seconds(retry.attempts)
+            logger.warning(
+                "crawl_task: asking arq to retry in %ds (attempt %d of %d)",
+                defer_seconds,
+                retry.attempts,
+                MAX_ATTEMPTS,
+                extra={"defer_seconds": defer_seconds, "attempt": retry.attempts},
+            )
+            raise Retry(defer=defer_seconds) from None
 
         if outcome is None:
             logger.info("crawl_task: no outcome; see CrawlService's own logs for why")
@@ -192,4 +261,67 @@ async def schedule_tick(ctx: dict[Any, Any]) -> str:
             f"skipped_active={summary.skipped_active} "
             f"enqueue_failures={summary.enqueue_failures} "
             f"limit_reached={summary.limit_reached}"
+        )
+
+
+async def reaper_tick(ctx: dict[str, Any]) -> str:
+    """Run one pass of the stuck-run reaper. Thin by contract — see the module docstring.
+
+    The second cron job, fired every `REAPER_INTERVAL_MINUTES` by arq's own scheduler
+    (`app/worker/settings.py`'s `cron_jobs`), and shaped exactly like `schedule_tick` above:
+    mint a correlation id, build one service, call one method, answer with a string.
+
+    **It is the only thing in this system that can un-stick a run**, which is why it is a
+    cron job rather than something a request path could trigger. Every other actor that could
+    have recorded an outcome for a stranded run is, by definition, gone — the worker was OOM
+    killed, the machine restarted, or `RunService.record_failure`'s own write hit an
+    unreachable Postgres and took the only in-process record of the failure down with it. The
+    reaper reads the database and nothing else, which is what makes it able to rescue cases
+    no amount of in-process error handling can.
+
+    **Both thresholds are computed here, from ONE `now`.** They are worker policy
+    (`app/worker/policy.py`), and `app/features/` may not import `app/worker/`
+    (ARCHITECTURE.md §3.3), so the job resolves them into absolute instants and hands those
+    to the service — the same relationship `ScheduleService.run_due_schedules` has with the
+    clock it captures once and threads through every query in the pass.
+
+    **Binds a `tick_id`, sharing `tick_id_context` with `schedule_tick`.** Both are cron
+    passes with no id of their own, and the field means "which pass of a cron job was this";
+    the `logger` name and the message text are what say which cron job. A third contextvar
+    for the second cron job would make `jq 'select(.tick_id == "…")'` a question you have to
+    ask twice.
+
+    **Never raises**, exactly like `schedule_tick`, and registered with the same
+    `max_tries=1`: a pass that fails is not re-run immediately against whatever partial state
+    it left behind — the next pass, five minutes later, re-evaluates from the database.
+    `asyncio.CancelledError` is not caught here either, for the same reason it is not there:
+    a plain `except Exception` already lets it propagate.
+
+    Returns:
+        A short, human-readable outcome string for arq's job result, built from the pass's
+        `ReaperSummary` — never anything a caller is expected to parse.
+    """
+    with tick_id_context(str(uuid4())):
+        try:
+            # One clock for the whole pass, for the reason every other multi-query unit of
+            # work in this codebase captures one: two thresholds derived from two different
+            # `datetime.now()` calls could disagree about which side of a boundary a row
+            # falls on, and the disagreement would be invisible.
+            now = datetime.now(UTC)
+            service = build_run_service(ctx["db_pool"], settings)
+            summary = await service.reap_stuck_runs(
+                ctx["redis"],
+                stuck_before=now - timedelta(seconds=STUCK_AFTER_SECONDS),
+                orphaned_before=now - timedelta(seconds=ORPHANED_PENDING_AFTER_SECONDS),
+                max_attempts=MAX_ATTEMPTS,
+            )
+        except Exception:
+            logger.error("reaper_tick: reaper pass failed", exc_info=True)
+            return "failed"
+
+        return (
+            f"examined={summary.examined} requeued={summary.requeued} "
+            f"orphans_swept={summary.orphans_swept} failed={summary.failed} "
+            f"enqueued={summary.enqueued} already_queued={summary.already_queued} "
+            f"enqueue_failures={summary.enqueue_failures}"
         )

@@ -24,7 +24,17 @@ from app.features.crawl.http_client import build_crawl_client
 from app.infrastructure.db.pool import close_pool, open_pool
 from app.infrastructure.queue.pool import redis_settings_from_url
 from app.infrastructure.storage.supabase_storage import build_storage_client, build_supabase_storage
-from app.worker.jobs import crawl_task, noop, schedule_tick
+from app.worker.jobs import crawl_task, noop, reaper_tick, schedule_tick
+from app.worker.policy import (
+    CRON_TICK_TIMEOUT_SECONDS,
+    JOB_COMPLETION_WAIT_SECONDS,
+    JOB_TIMEOUT_SECONDS,
+    MAX_ATTEMPTS,
+    MAX_JOBS,
+    POLL_DELAY_SECONDS,
+    REAPER_INTERVAL_MINUTES,
+    REAPER_TIMEOUT_SECONDS,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -149,81 +159,21 @@ async def close_worker_resources(ctx: dict[Any, Any]) -> None:
     await close_pool()
 
 
-# --- the numbers, and why they are these numbers --------------------------------------
+# --- the numbers, and where they live now ----------------------------------------------
 
-# HOW OFTEN THE WORKER ASKS REDIS FOR WORK. THIS IS NOT A TUNING PREFERENCE.
+# EVERY TUNABLE THIS FILE USED TO DECLARE NOW LIVES IN `app/worker/policy.py`, imported
+# above and re-exported by nothing — the names below are the same names, with the same
+# values and the same arguments attached to them, in a module `app/worker/jobs.py` can also
+# import. PER-166 moved them because the stuck-run reaper's staleness threshold is derived
+# from `JOB_TIMEOUT_SECONDS`, and the job that applies it is imported BY this module: leaving
+# the constant here would have made that derivation a circular import, and restating the
+# number in `jobs.py` with a "keep these in sync" comment is exactly the drift the reaper
+# spends its life cleaning up after.
 #
-# An idle arq worker issues exactly one command per poll — a single ZRANGEBYSCORE over the
-# queue's sorted set (`Worker._poll_iteration`); the heartbeat beside it early-returns
-# until `health_check_interval` elapses. So the poll interval alone sets the idle command
-# rate, and Upstash bills per command:
-#
-#     poll_delay = 0.5 (arq's default)  ->  2 polls/s   x 86,400 s = 172,800 commands/day
-#     poll_delay = 5   (this setting)   ->  0.2 polls/s x 86,400 s =  17,280 commands/day
-#
-# An earlier revision of this comment justified "one command per poll" partly with "and
-# there are no cron jobs". `cron_jobs` below has since added one, and the arithmetic above
-# is unchanged — arq decides whether a cron job is due with local time math inside the same
-# poll iteration and only touches Redis on the minute it actually fires, so the tick adds
-# roughly one enqueue a minute rather than anything per poll. What would invalidate this
-# block is a SECOND cron job on a sub-minute schedule, not this one.
-#
-# Ten times cheaper, for doing nothing at all. What it costs is up to 5 seconds of latency
-# before a queued job starts, which is irrelevant against a crawl measured in tens of
-# seconds. Anyone tempted to lower this for snappier local development should set it in
-# their own environment, not here — tests/test_worker_settings.py asserts this exact value
-# because regressing it is silent and shows up as a bill.
-POLL_DELAY_SECONDS = 5
-
-# Concurrent jobs per worker machine. Crawls are I/O heavy, so the ceiling is memory and
-# Postgres connections rather than CPU.
-#
-# Note what `db_pool_max_size` is NOT: a shared budget. The API and the worker each build
-# their own pool from that one setting, so the number Supabase sees is up to
-# `db_pool_max_size` per process — today up to 20, not 10 — and raising it raises both.
-# That is comfortable at two concurrent crawls and would not be at ten. If crawl
-# concurrency ever grows, the pool sizing needs to become per-process before this does.
-#
-# `schedule_tick` (the cron job below) draws from this same budget — arq runs cron jobs
-# through the same concurrency semaphore as queued ones. Two crawls already in flight
-# therefore DELAY a tick's execution rather than skipping it, by up to
-# JOB_TIMEOUT_SECONDS in the worst case. That is bounded and self-recovering (the crawl's
-# own hard caps end it, and the tick's work is idempotent — the schedules it did not get
-# to are still due), which is why this number does not need to grow to accommodate a job
-# that runs for milliseconds once a minute.
-MAX_JOBS = 2
-
-# How long one job may run before arq cancels it. Generous against a crawl measured in
-# tens of seconds, and the first half of the shutdown budget below.
-JOB_TIMEOUT_SECONDS = 180
-
-# GRACEFUL SHUTDOWN, AND THE ORDERING THAT MAKES IT WORK.
-#
-# Fly sends SIGTERM on every deploy. arq's DEFAULT signal handler cancels in-flight jobs
-# immediately; setting `job_completion_wait` to a non-zero value swaps in
-# `handle_sig_wait_for_completion`, which instead stops claiming new work
-# (`allow_pick_jobs = False`) and waits this long for what is already running to finish.
-#
-# Three timeouts have to be ordered, or the outermost one truncates the ones inside it:
-#
-#     JOB_TIMEOUT_SECONDS (180)  <  this (200)  <  fly.toml kill_timeout (240s)  <=  300s
-#
-# 200 rather than 180 so a job that runs its timeout out still gets a moment to record its
-# own failure. `kill_timeout` then sits above both, so Fly's SIGKILL lands after arq has
-# finished waiting and `on_shutdown` has closed the pool — not through the middle of a
-# crawl. 300s is Fly's ceiling for `kill_timeout`, which is what bounds this whole ladder.
-JOB_COMPLETION_WAIT_SECONDS = 200
-
-# How long ONE cron tick may run before arq cancels it — deliberately much tighter than
-# JOB_TIMEOUT_SECONDS above, which governs `crawl_task`. A tick that has not finished in 50s
-# has not finished inside its own 60-second window (`cron_jobs` below fires one every
-# minute), so letting it run all the way to the 180s `job_timeout` would only delay the
-# signal that the tick is saturated — it would already be overdue for its NEXT run before
-# arq ever cancelled it. Cancelling loses nothing correctness-wise: `SchedulesReader.
-# lock_due`'s `FOR UPDATE SKIP LOCKED` makes two overlapping ticks safe rather than
-# corrupting (`schedules/internals/schedules_reader.py`), and an uncommitted transaction
-# simply rolls back, so the next tick redoes whatever work this one did not finish.
-CRON_TICK_TIMEOUT_SECONDS = 50
+# The module docstring's warning is unaffected and still absolute: what arq reads is
+# `WorkerSettings.__dict__`, so every setting must still be ASSIGNED directly in the class
+# body below. Where the value on the right-hand side came from has never mattered —
+# `redis_settings` has been a function call since this file was written.
 
 
 class WorkerSettings:
@@ -275,8 +225,35 @@ class WorkerSettings:
     # guarantee is exactly as good as its connection to Redis at the moment it matters.
     #
     # `timeout=CRON_TICK_TIMEOUT_SECONDS` — see that constant's own comment.
+    #
+    # THE SECOND ENTRY IS THE STUCK-RUN REAPER, and everything the paragraphs above say
+    # about the schedule tick applies to it unchanged: same `max_tries=1` for the same
+    # reason (a pass that fails is re-evaluated from scratch five minutes later, never
+    # re-run against the state it half-left), and the same reliance on `FOR UPDATE SKIP
+    # LOCKED` — `RunsReader.lock_reapable` this time — rather than on arq's best-effort
+    # `unique=True`.
+    #
+    # `minute=set(range(0, 60, REAPER_INTERVAL_MINUTES))` with `second=0` is how arq spells
+    # "every five minutes": a set of the minute values to fire on, evaluated against local
+    # time inside the poll loop. Written as a comprehension over the interval rather than as
+    # a literal `{0, 5, 10, ...}` so that the cadence is stated once, in `policy.py`, where
+    # `ORPHANED_PENDING_AFTER_SECONDS` and `STUCK_AFTER_SECONDS` are reasoned about beside
+    # it — a literal here could drift from the interval those thresholds assume, and the
+    # symptom of that drift (a reaper firing more often than its thresholds expect) is
+    # exactly nothing until the day it duplicates a crawl.
+    #
+    # `60 % REAPER_INTERVAL_MINUTES == 0` is not asserted anywhere, and does not need to be:
+    # an interval that does not divide the hour simply produces a shorter gap across the
+    # hour boundary, which the reaper is entirely indifferent to.
     cron_jobs = [
         cron(schedule_tick, second=0, max_tries=1, timeout=CRON_TICK_TIMEOUT_SECONDS),
+        cron(
+            reaper_tick,
+            minute=set(range(0, 60, REAPER_INTERVAL_MINUTES)),
+            second=0,
+            max_tries=1,
+            timeout=REAPER_TIMEOUT_SECONDS,
+        ),
     ]
 
     # Named differently from the settings they land on, rather than the `on_startup =
@@ -289,3 +266,22 @@ class WorkerSettings:
     max_jobs = MAX_JOBS
     job_timeout = JOB_TIMEOUT_SECONDS
     job_completion_wait = JOB_COMPLETION_WAIT_SECONDS
+
+    # ARQ'S OWN RETRY CEILING, and it is a BACKSTOP rather than the retry policy itself.
+    # arq's default is 5; the policy this system actually runs is `MAX_ATTEMPTS` counted
+    # against `runs.attempts`, enforced in `CrawlService`, which stops asking for retries
+    # before this number is ever reached on the happy path.
+    #
+    # Set to the same value anyway, for the case where the two counters legitimately
+    # disagree: a job cancelled by SIGTERM increments arq's `job_try` without incrementing
+    # `runs.attempts`, so a run redeployed through three times would keep asking for
+    # redeliveries that the run's own budget still permits. This caps that at three, after
+    # which arq abandons the job id — and the run, left `pending`, is picked up by the
+    # reaper's orphan sweep under a fresh id with a fresh `job_try`. Slower than a
+    # redelivery, and bounded, which is the trade.
+    #
+    # NOTE what this does NOT do: arq 0.28 does not retry a job that raises an ordinary
+    # exception at all (`Worker.run_job` retries only on `Retry`, `RetryJob`, and
+    # `CancelledError`), so raising this number would not make anything retry that does not
+    # already ask to.
+    max_tries = MAX_ATTEMPTS

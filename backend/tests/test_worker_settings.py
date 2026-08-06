@@ -17,8 +17,9 @@ from arq.worker import Worker, get_kwargs
 
 from app.core.settings import settings
 from app.infrastructure.queue.pool import redis_settings_from_url
+from app.worker import policy
 from app.worker import settings as worker_settings
-from app.worker.jobs import crawl_task, noop, schedule_tick
+from app.worker.jobs import crawl_task, noop, reaper_tick, schedule_tick
 from app.worker.settings import WorkerSettings
 
 
@@ -54,19 +55,110 @@ def test_max_jobs_is_bounded() -> None:
     assert WorkerSettings.max_jobs == 2
 
 
-def test_shutdown_budgets_are_ordered_inside_flys_kill_timeout() -> None:
-    """job_timeout < job_completion_wait < kill_timeout <= Fly's ceiling.
+def test_the_crawl_cap_lands_before_arqs_job_timeout() -> None:
+    """`crawl_max_wall_clock_s` < `job_timeout`. THE ORDERING PER-166 CORRECTED.
 
-    Three nested budgets, and the graceful shutdown is theater unless they nest in that
-    order. If `job_completion_wait` ever drops below `job_timeout`, arq stops waiting while
-    the job is still legitimately running and cancels it — the exact SIGTERM behaviour the
-    setting exists to prevent. If `kill_timeout` drops below `job_completion_wait`, Fly
-    sends SIGKILL through the middle of the drain and it makes no difference that arq was
-    being polite.
+    The application-level cap has to fire FIRST. When it does, `crawl_site`'s own
+    `asyncio.timeout` ends the crawl, `CrawlService` records a clean `failed` with a
+    sanitized message, and `runs.stats` says which cap stopped it. When it does not — which
+    was the deployed state until PER-166, with `job_timeout` at 180s against a 300s crawl
+    cap — arq cancels the whole job first instead, and the run's outcome is decided by
+    cancellation handling and the reaper rather than by the crawler.
+
+    Asserted as an inequality between the two real settings objects, not as two literals: the
+    crawl cap is an environment-configurable `Settings` field and the timeout is not, so the
+    relationship is the only thing that can be pinned here.
     """
-    assert WorkerSettings.job_timeout < WorkerSettings.job_completion_wait
+    assert settings.crawl_max_wall_clock_s < WorkerSettings.job_timeout
+
+
+def test_the_shutdown_drain_nests_inside_flys_kill_timeout() -> None:
+    """job_completion_wait < kill_timeout <= Fly's ceiling.
+
+    Two nested budgets, and the graceful shutdown is theater unless they nest: if
+    `kill_timeout` drops below `job_completion_wait`, Fly sends SIGKILL through the middle of
+    the drain and it makes no difference that arq was being polite.
+
+    **`job_timeout < job_completion_wait` WAS asserted here, and PER-166 removed it — the
+    assertion was wrong, not the timeout.** Its argument was that a drain shorter than the
+    job timeout cancels a job that is still legitimately running. True as far as it goes, but
+    it has a hard external ceiling underneath it: Fly caps `kill_timeout` at 300s, so a drain
+    budget can never exceed that, and a `job_timeout` set above the 300s crawl cap — which is
+    the whole point of the test above — can never fit inside one. The two constraints are
+    unsatisfiable together. The old assertion held only because `job_timeout` was set to a
+    value (180s) that was itself the bug.
+
+    What changed underneath, and why removing it is safe rather than convenient: PER-166 made
+    a cancelled crawl RECOVERABLE. `CrawlService.execute_run` catches `CancelledError`, hands
+    the run back to `pending` (or fails it, if the budget is spent) and re-raises, and the
+    stuck-run reaper sweeps the row if even that write does not land. When this assertion was
+    written, a job cancelled by an expiring drain meant a permanently stranded run and a
+    website nothing could ever crawl again — which is why the ladder mattered so much more
+    then than it does now.
+
+    The drain is therefore still non-zero, still ordered inside Fly's budget, and still
+    exercised for real in tests/test_worker_shutdown.py. It is simply no longer claimed to
+    cover the worst case, because it never could.
+    """
     assert WorkerSettings.job_completion_wait < FLY_KILL_TIMEOUT_SECONDS
     assert FLY_KILL_TIMEOUT_SECONDS <= FLY_KILL_TIMEOUT_CEILING_SECONDS
+
+
+def test_the_reaper_threshold_sits_above_everything_that_bounds_a_live_run() -> None:
+    """STUCK_AFTER > job_timeout, > the drain budget, and > the crawl cap.
+
+    The reaper's threshold is the one number in this file where being too small is actively
+    harmful rather than merely wasteful: reaping a run that is legitimately still working
+    produces a second crawl of the same site, a second payload upload, and a race between two
+    workers to write the same row. Reaping one late costs five minutes.
+
+    So it is asserted against every clock that can legitimately keep a run in `processing`:
+    arq's own timeout, the drain a deploy may add on top of it, and the crawl's application
+    cap. `STUCK_AFTER_SECONDS` is derived from `JOB_TIMEOUT_SECONDS` in `policy.py` rather
+    than written as a literal, so this test is pinning the grace margin, not the arithmetic.
+    """
+    assert policy.STUCK_AFTER_SECONDS > policy.JOB_TIMEOUT_SECONDS
+    assert policy.STUCK_AFTER_SECONDS > policy.JOB_COMPLETION_WAIT_SECONDS
+    assert policy.STUCK_AFTER_SECONDS > settings.crawl_max_wall_clock_s
+
+
+def test_the_orphan_threshold_sits_above_the_longest_retry_backoff() -> None:
+    """A run waiting out its own backoff is `pending` with a DEFERRED job behind it, not an
+    orphan. Sweeping it early would enqueue a second job for work that was never lost, so the
+    orphan threshold has to clear the longest delay the retry ladder can ask for."""
+    assert policy.ORPHANED_PENDING_AFTER_SECONDS > max(policy.RETRY_DELAYS_SECONDS)
+
+
+def test_the_reaper_finishes_well_inside_its_own_cadence() -> None:
+    """A pass that has not finished before the next one is due is not helped by running into
+    it — the same argument `CRON_TICK_TIMEOUT_SECONDS` makes for the schedule tick."""
+    assert policy.REAPER_TIMEOUT_SECONDS < policy.REAPER_INTERVAL_MINUTES * 60
+
+
+def test_the_retry_backoff_grows_with_each_attempt() -> None:
+    """~10s, then ~60s, then ~300s. A site that is briefly down often recovers within
+    minutes; three tries in six seconds accomplish nothing but three identical failures.
+
+    Asserted as a strictly increasing sequence produced by the real function rather than as
+    three literals, so a future ladder of a different length still has to grow.
+    """
+    delays = [policy.retry_delay_seconds(attempt) for attempt in range(1, 4)]
+    assert delays == sorted(delays)
+    assert len(set(delays)) == len(delays), "each attempt must wait longer than the last"
+    assert delays[0] >= 10
+
+    # Clamped at both ends rather than raising — an attempt number past the end of the ladder
+    # is an accounting bug somewhere else, and the longest delay is a better answer to it
+    # than an IndexError inside a worker's error-handling path.
+    assert policy.retry_delay_seconds(0) == delays[0]
+    assert policy.retry_delay_seconds(99) == delays[-1]
+
+
+def test_max_tries_matches_the_retry_budget_the_run_itself_carries() -> None:
+    """arq's own ceiling is set to `MAX_ATTEMPTS`, as a backstop for the case where the two
+    counters legitimately disagree — a job cancelled by SIGTERM increments arq's `job_try`
+    without incrementing `runs.attempts`. See `WorkerSettings.max_tries`' own comment."""
+    assert WorkerSettings.max_tries == policy.MAX_ATTEMPTS
 
 
 def test_job_completion_wait_is_non_zero_so_sigterm_drains_instead_of_cancelling() -> None:
@@ -141,21 +233,22 @@ async def test_the_declared_values_arrive_on_a_constructed_worker() -> None:
         assert worker.max_jobs == WorkerSettings.max_jobs
         assert worker.job_timeout_s == WorkerSettings.job_timeout
         assert worker._job_completion_wait == WorkerSettings.job_completion_wait
+        assert worker.max_tries == WorkerSettings.max_tries
         assert set(worker.functions) == {
             noop.__qualname__,
             crawl_task.__qualname__,
             "cron:schedule_tick",
+            "cron:reaper_tick",
         }
         # The declared `cron_jobs` list itself reached the constructed `Worker`, not merely
-        # its name landing in `functions` above.
-        assert len(worker.cron_jobs) == 1
-        assert worker.cron_jobs[0].coroutine is schedule_tick
+        # its names landing in `functions` above.
+        assert [job.coroutine for job in worker.cron_jobs] == [schedule_tick, reaper_tick]
     finally:
         await worker.close()
 
 
 def test_cron_jobs_registers_the_schedule_tick() -> None:
-    """`cron_jobs` is non-empty, names the tick, and fires once a minute with one retry.
+    """`cron_jobs` names the tick, and it fires once a minute with one retry.
 
     `second == 0`, not `{0}`: the installed arq (checked directly with a throwaway `cron()`
     call, not guessed) stores whatever was passed to `second=` verbatim on the `CronJob`
@@ -163,12 +256,30 @@ def test_cron_jobs_registers_the_schedule_tick() -> None:
     happens later, inside `CronJob.calculate_next`, not here.
     """
     assert WorkerSettings.cron_jobs
-    (tick,) = WorkerSettings.cron_jobs
+    tick, _reaper = WorkerSettings.cron_jobs
     assert tick.coroutine is schedule_tick
     assert tick.name == "cron:schedule_tick"
     assert tick.second == 0
     assert tick.max_tries == 1
     assert tick.timeout_s == worker_settings.CRON_TICK_TIMEOUT_SECONDS
+
+
+def test_cron_jobs_registers_the_reaper_every_five_minutes() -> None:
+    """The second cron job, and the only thing in this system that can un-stick a run.
+
+    `minute` is asserted as the full set of firing minutes rather than as "every five",
+    because that set is what arq actually evaluates and because an interval that stopped
+    dividing the hour would change it in a way worth seeing. `max_tries == 1` for the same
+    reason the schedule tick has it: a failed pass is re-evaluated from the database five
+    minutes later, never re-run against the state it half-left.
+    """
+    _tick, reaper = WorkerSettings.cron_jobs
+    assert reaper.coroutine is reaper_tick
+    assert reaper.name == "cron:reaper_tick"
+    assert reaper.second == 0
+    assert reaper.minute == set(range(0, 60, policy.REAPER_INTERVAL_MINUTES))
+    assert reaper.max_tries == 1
+    assert reaper.timeout_s == policy.REAPER_TIMEOUT_SECONDS
 
 
 def test_crawl_task_is_registered_under_the_literal_name_a_sibling_ticket_enqueues() -> None:

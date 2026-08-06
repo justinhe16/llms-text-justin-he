@@ -18,7 +18,7 @@ copy of that HTTP-layer test.
 import gzip
 import json
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -31,7 +31,7 @@ from app.core.settings import settings
 from app.features.crawl.internals.crawler import CrawlResult
 from app.features.crawl.internals.payload import PAYLOAD_CONTENT_TYPE
 from app.features.crawl.schemas import CrawledPage
-from app.features.crawl.service import build_crawl_service
+from app.features.crawl.service import TransientCrawlError, build_crawl_service
 from app.features.runs.internals.runs_writer import RunsWriter
 from app.infrastructure.db.transaction import transaction as real_transaction
 from app.infrastructure.storage.supabase_storage import StorageUploadError
@@ -56,10 +56,26 @@ async def _execute(
     storage: FakeStorage,
     run_id: UUID,
     handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    max_attempts: int = 1,
 ) -> object:
+    """Run one crawl attempt, with the retry budget already spent by default.
+
+    `max_attempts=1` is deliberate for this file. PER-166 made a transient failure
+    (`StorageUploadError`, a connect error on the seed) return its run to `pending` and ask
+    for a redelivery instead of writing a terminal row — behaviour this suite is not about
+    and which would turn every "…leaves the run failed" test below into a test of the retry
+    policy instead of a test of persistence. Setting the budget to one attempt makes every
+    failure this file exercises the LAST one, which is exactly the case each of these
+    assertions was written for: what gets written when there is nothing left to try.
+
+    The retry path itself is covered in tests/test_crawl_retry.py, and
+    `test_no_failure_mode_ever_leaves_a_run_processing` below parametrizes this argument so
+    the "no run is ever left processing" invariant is checked on both sides of the budget.
+    """
     async with _mock_client(handler) as http_client:
         service = build_crawl_service(pool, http_client, storage, settings)
-        return await service.execute_run(run_id)
+        return await service.execute_run(run_id, max_attempts=max_attempts)
 
 
 def _ok_handler(request: httpx.Request) -> httpx.Response:
@@ -249,18 +265,31 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_status"),
+    ("mode", "max_attempts", "expected_status"),
     [
-        ("succeeds", "completed"),
-        ("seed_fails", "failed"),
-        ("upload_fails", "failed"),
-        ("db_write_fails", "failed"),
+        ("succeeds", 1, "completed"),
+        # The budget is spent, so every failure below is terminal.
+        ("seed_fails", 1, "failed"),
+        ("upload_fails", 1, "failed"),
+        ("db_write_fails", 1, "failed"),
+        # PER-166: the same three failures with budget left. The two RETRYABLE ones end
+        # `pending` — back in the queue, which is a state something acts on — and the
+        # permanent one still ends `failed` on its first attempt, because a `RuntimeError`
+        # from a database write is not something a second try answers differently. The
+        # invariant this test is named for holds in every row: never `processing`.
+        ("seed_fails", 3, "pending"),
+        ("upload_fails", 3, "pending"),
+        ("db_write_fails", 3, "failed"),
     ],
 )
 async def test_no_failure_mode_ever_leaves_a_run_processing(
-    websites_db: Pool, monkeypatch: pytest.MonkeyPatch, mode: str, expected_status: str
+    websites_db: Pool,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    max_attempts: int,
+    expected_status: str,
 ) -> None:
-    _website_id, run_id = await _seed_pending(websites_db, f"no-processing-{mode}")
+    _website_id, run_id = await _seed_pending(websites_db, f"no-processing-{mode}-{max_attempts}")
     storage = FakeStorage()
     handler: Callable[[httpx.Request], httpx.Response] = _ok_handler
 
@@ -285,7 +314,11 @@ async def test_no_failure_mode_ever_leaves_a_run_processing(
 
         monkeypatch.setattr(RunsWriter, "mark_processing_completed", _raise)
 
-    await _execute(websites_db, storage, run_id, handler)
+    # A retryable failure with budget left leaves through `TransientCrawlError` rather than
+    # returning — that is how the service asks `crawl_task` for a redelivery. Suppressed
+    # here because this test is about the row it left behind, not about the signal.
+    with suppress(TransientCrawlError):
+        await _execute(websites_db, storage, run_id, handler, max_attempts=max_attempts)
 
     row = await websites_db.fetchrow("SELECT status FROM runs WHERE id = $1", run_id)
     assert row is not None
