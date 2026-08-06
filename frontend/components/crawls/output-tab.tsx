@@ -73,11 +73,31 @@ export function OutputTab({
 
   if (isLoadingRuns) return <Skeleton className="h-64 w-full rounded-lg" />;
 
-  // Before the empty state, never after it: with the history fetch failed, `runs` is `[]`
-  // for a reason that has nothing to do with whether this site has ever been crawled, and
-  // telling someone to "run a crawl" because we could not read the list is a lie the user
-  // cannot debug.
-  if (runsError !== null && runs.length === 0) {
+  // Having something to show comes FIRST — before the error branch, not after it.
+  //
+  // `RunOutput`'s `GET /runs/{id}` is an independent request, so a run named by `?run=` is
+  // displayable even when the *list* fetch failed and `runs` is empty. Checking the error
+  // first would have made "an explicit `?run=` always wins" (lib/crawls/select-run.ts) true
+  // of the selection and false of the rendering, which is the same shape of mismatch — a
+  // comment promising more than the code does — that produced the bug that function exists
+  // to have fixed.
+  if (runIdToShow !== null) {
+    return (
+      <div className="min-w-0 space-y-4">
+        {/* No picker when the list is empty or unreadable: a dropdown of nothing is not a
+            control, and the run on screen arrived by id rather than by being chosen. */}
+        {runs.length > 0 && (
+          <RunPicker runs={runs} selectedRunId={runIdToShow} onSelectRun={onSelectRun} />
+        )}
+        <RunOutput runId={runIdToShow} origin={origin} />
+      </div>
+    );
+  }
+
+  // Nothing to show, and we know why. Distinguishing this from the empty state below is the
+  // whole point: telling someone to "run a crawl" because we could not read their run list
+  // is a claim about their data made from a failure to read it.
+  if (runsError !== null) {
     return (
       <CrawlsError
         error={runsError}
@@ -88,24 +108,15 @@ export function OutputTab({
     );
   }
 
-  // State 1 of 4: no runs at all.
-  if (runIdToShow === null) {
-    return (
-      <div className="rounded-lg border border-border bg-card p-10 text-center">
-        <p className="text-sm font-medium text-foreground">Run a crawl to generate llms.txt</p>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {canRun
-            ? "Use Run now above. The generated file will appear here."
-            : "This site has never been crawled. Its owner can start a run from this page."}
-        </p>
-      </div>
-    );
-  }
-
+  // State 1 of 4: nothing to show, and no error — this site genuinely has no runs.
   return (
-    <div className="min-w-0 space-y-4">
-      <RunPicker runs={runs} selectedRunId={runIdToShow} onSelectRun={onSelectRun} />
-      <RunOutput runId={runIdToShow} origin={origin} />
+    <div className="rounded-lg border border-border bg-card p-10 text-center">
+      <p className="text-sm font-medium text-foreground">Run a crawl to generate llms.txt</p>
+      <p className="mt-1 text-sm text-muted-foreground">
+        {canRun
+          ? "Use Run now above. The generated file will appear here."
+          : "This site has never been crawled. Its owner can start a run from this page."}
+      </p>
     </div>
   );
 }

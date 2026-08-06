@@ -15,7 +15,8 @@ import {
 } from "@/components/ui/table";
 import type { RunListItem } from "@/lib/api/runs";
 import { rowActivationProps } from "@/lib/crawls/row-activation";
-import { rowStatusFromRunStatus } from "@/lib/crawls/row-status";
+import { rowStatusFromRunStatus, rowStatusLabel } from "@/lib/crawls/row-status";
+import { formatAbsoluteTime } from "@/lib/crawls/relative-time";
 import { formatDuration, runPagesCrawled } from "@/lib/crawls/run-display";
 import { cn } from "@/lib/utils";
 
@@ -228,10 +229,23 @@ function RunRow({
     <>
       <TableRow
         {...rowActivationProps(onSelectRun, run.id)}
-        // No `aria-label`: the sibling /crawls table deliberately leaves its rows to native
-        // table semantics, and an override here would replace the row's own cells — the
-        // time, trigger, status, page count and duration a screen reader should actually
-        // hear — with one sentence that repeats what activating a row does everywhere.
+        // An accessible name built from this row's OWN data, rather than either of the two
+        // things that would be easier.
+        //
+        // A static "View the llms.txt from this run" is what was here first, and it is worse
+        // than nothing: `role="row"`'s name comes from the author, so that one sentence
+        // *replaces* the time, trigger, status, page count and duration — it hides the row's
+        // content behind a description of what clicking does.
+        //
+        // Omitting it entirely is what the sibling /crawls table does, but that table can
+        // afford to: each of its rows contains a real `<a>` (crawl-site.tsx) that gives
+        // assistive technology something named to find. These rows have no anchor, only text
+        // cells and a conditional expander, so with no label there is no defined accessible
+        // name at all and the result depends on each screen reader's fallback behaviour.
+        // Naming the row after its data keeps the content and adds the affordance.
+        aria-label={`Run started ${formatAbsoluteTime(run.started_at)}, ${rowStatusLabel(
+          rowStatusFromRunStatus(run.status)
+        )}. View its llms.txt.`}
         className={cn(
           "cursor-pointer outline-none",
           // The same focus treatment `crawls-table.tsx` uses, for the same two reasons it
