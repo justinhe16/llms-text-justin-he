@@ -253,10 +253,20 @@ type RequestBodyOf<Op> = Op extends { requestBody: { content: { "application/jso
   : never;
 
 // FastAPI only ever returns one 2xx per operation, so this union collapses to exactly one
-// member for any real `Op` — `200` for a `GET`, `201` for the `POST`, `204` for the
-// `DELETE` — and the `SuccessStatus extends infer S` distributes over the three
-// candidates, keeping only the one that is actually a key of `R`.
-type SuccessStatus = 200 | 201 | 204;
+// member for any real `Op` — `200` for a `GET`, `201` for `POST /websites`, `202` for
+// `POST /websites/{id}/runs`, `204` for the `DELETE` — and the `SuccessStatus extends infer
+// S` distributes over the candidates, keeping only the one that is actually a key of `R`.
+//
+// `202` earns its own place in this union rather than being folded in with `201`: PER-160's
+// run trigger returns `202 Accepted` deliberately (the run row exists, but the crawl it
+// names has only been queued — see `TriggerRunResponse` in
+// backend/app/features/runs/schemas.py). Until `202` was listed here, `SuccessResponseOf`
+// resolved to `never` for that one operation, and it failed in the worst possible
+// direction: `never` is assignable to everything, so a `triggerRun` helper declaring
+// `Promise<TriggeredRun>` compiled happily while this client's own inferred response type
+// for the call said it returns nothing at all. Any future 2xx the backend introduces needs
+// the same one-line entry, and `schema.type-test.ts` is where that stays checked.
+type SuccessStatus = 200 | 201 | 202 | 204;
 type SuccessResponseOf<Op> = Op extends { responses: infer R }
   ? SuccessStatus extends infer S
     ? S extends keyof R

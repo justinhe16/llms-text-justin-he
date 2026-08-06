@@ -39,10 +39,26 @@ export const ACTIVE_POLL_INTERVAL_MS = 3_000;
  * as "nothing to poll yet" rather than calling `isActive(undefined)` — every current
  * `isActive` predicate expects real data (an array of websites, say) and has no defined
  * answer for "no data at all."
+ *
+ * ## The two type parameters
+ *
+ * `TQueryFnData` is what one fetch returns; `TData` is what the cache holds. For an ordinary
+ * `useQuery` they are the same thing, which is why `TData` defaults to `TQueryFnData` and
+ * why every plain call site here still writes no type arguments at all.
+ *
+ * They come apart for an infinite query, and that is the only reason this signature has two
+ * of them: `useInfiniteQuery` fetches a `RunPage` per page but caches an
+ * `InfiniteData<RunPage>`, and React Query types `refetchInterval`'s argument as
+ * `Query<TQueryFnData, TError, TData, TQueryKey>` — with both, distinctly. A single-parameter
+ * version cannot describe that callback, so `lib/query/use-runs-infinite.ts` could not have
+ * used this helper and would have had to inline its own interval logic. Splitting the
+ * parameter is what keeps "how often does a polling query poll" answerable in one place
+ * across both query kinds. The predicate always takes `TData`, the thing actually in the
+ * cache.
  */
-export function pollWhileActive<TData>(
+export function pollWhileActive<TQueryFnData, TData = TQueryFnData>(
   isActive: (data: TData) => boolean
-): (query: Query<TData, Error, TData, QueryKey>) => number | false {
+): (query: Query<TQueryFnData, Error, TData, QueryKey>) => number | false {
   return (query) => {
     const data = query.state.data;
     return data !== undefined && isActive(data) ? ACTIVE_POLL_INTERVAL_MS : false;

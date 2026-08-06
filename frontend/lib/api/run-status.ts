@@ -54,6 +54,23 @@ export function isActiveRunStatus(status: RunStatus): boolean {
 }
 
 /**
+ * Whether an arbitrary JSON value is one of the four run statuses — the runtime half of
+ * `RunStatus`, for the one situation where a status arrives on a body this app has no
+ * compile-time contract with: an error `detail` parsed out of `ApiError.body`
+ * (see `lib/api/errors.ts`'s `isRunAlreadyInFlight`).
+ *
+ * Implemented against `ACTIVE_BY_STATUS`'s own keys rather than a hand-written
+ * `["pending", "processing", ...]` array, for the reason the comment above it already
+ * gives: that `Record` is exhaustive by compiler enforcement, so it is the only spelling of
+ * the four values in this file that cannot silently fall behind the Postgres enum. A
+ * literal array here would be exactly the second copy `RunStatusName`'s own docstring
+ * (backend/app/features/runs/schemas.py) says must never exist.
+ */
+export function isRunStatus(value: unknown): value is RunStatus {
+  return typeof value === "string" && Object.hasOwn(ACTIVE_BY_STATUS, value);
+}
+
+/**
  * Whether `website.latest_run` — present only when `GET /websites` was called with
  * `?include=latest_run` (`lib/api/websites.ts`'s `listWebsites`) — describes a run still
  * in progress. A website with no `latest_run` (never requested, or genuinely has no runs
