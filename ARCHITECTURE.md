@@ -693,6 +693,21 @@ Feature composites go in `components/crawls/`. Do not put app-specific logic int
 `components/ui/`; those files should stay close to what the generator produced so they can
 be regenerated.
 
+**A feature's non-visual logic lives in `lib/`, not in its components.** `lib/crawls/` is
+the first instance and sets the shape: the pure derivations behind the `/crawls` table
+(what status a row is in — `row-status.ts`; how the list is ordered — `sort.ts`; how a
+timestamp reads — `relative-time.ts`) and the hooks that are behaviour rather than markup
+(the shared page clock, the status-change diff, whole-row activation). It is the same
+separation §3.1 draws on the backend, and it exists for the same reason: a function that
+turns four run statuses into five row labels is testable, greppable and reusable on its
+own, and becomes none of those things once it is an `if` inside a `<td>`. The rule of
+thumb is that anything in `lib/<feature>/` should be readable without knowing what the
+screen looks like, and anything in `components/<feature>/` should be mostly markup. Note
+that this is a *feature's own* logic: shared plumbing every feature uses stays in
+`lib/api/`, `lib/query/`, `lib/auth/` and `lib/supabase/`, and a feature directory must
+never grow a second copy of something those already own — a second fetcher, a second
+query-key shape, or a second answer to "is this run still active" (§8.6).
+
 ### 8.5 Light theme only
 
 **This application is light-theme only.**
