@@ -228,7 +228,10 @@ function RunRow({
     <>
       <TableRow
         {...rowActivationProps(onSelectRun, run.id)}
-        aria-label="View the llms.txt from this run"
+        // No `aria-label`: the sibling /crawls table deliberately leaves its rows to native
+        // table semantics, and an override here would replace the row's own cells — the
+        // time, trigger, status, page count and duration a screen reader should actually
+        // hear — with one sentence that repeats what activating a row does everywhere.
         className={cn(
           "cursor-pointer outline-none",
           // The same focus treatment `crawls-table.tsx` uses, for the same two reasons it

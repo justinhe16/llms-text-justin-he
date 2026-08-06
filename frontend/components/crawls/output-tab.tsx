@@ -15,7 +15,9 @@ import type { RunListItem } from "@/lib/api/runs";
 import { isActiveRunStatus } from "@/lib/api/run-status";
 import { useRun } from "@/lib/query/use-run";
 import { rowStatusFromRunStatus } from "@/lib/crawls/row-status";
+import { selectRunToShow } from "@/lib/crawls/select-run";
 
+import { CrawlsError } from "./crawls-error";
 import { LlmsTxtViewer } from "./llms-txt-viewer";
 import { RelativeTime } from "./relative-time";
 import { RunStatusIndicator } from "./run-status-indicator";
@@ -24,8 +26,14 @@ type OutputTabProps = {
   origin: string;
   runs: RunListItem[];
   isLoadingRuns: boolean;
-  /** From `?run=` — `null` when the user has not picked one, in which case this component
-   * falls back to the most recent completed run. */
+  /** The run-history fetch's own failure, if it failed. Passed in — rather than this tab
+   * treating an empty list as "no runs" — because the two are completely different things to
+   * a reader: "this site has never been crawled" versus "we could not find out". */
+  runsError: Error | null;
+  onRetryRuns: () => void;
+  isRetryingRuns: boolean;
+  /** From `?run=` — `null` when the user has not picked one, in which case
+   * `selectRunToShow` falls back to the most recent completed run. */
   selectedRunId: string | null;
   onSelectRun: (runId: string) => void;
   canRun: boolean;
@@ -54,22 +62,34 @@ export function OutputTab({
   origin,
   runs,
   isLoadingRuns,
+  runsError,
+  onRetryRuns,
+  isRetryingRuns,
   selectedRunId,
   onSelectRun,
   canRun,
 }: OutputTabProps) {
-  // `runs` arrives newest-first from the API, so the first match in each pass is the most
-  // recent one — no sorting here, and no second opinion about the ordering the backend's
-  // keyset pagination already guarantees.
-  const selectedRun =
-    runs.find((run) => run.id === selectedRunId) ??
-    runs.find((run) => run.status === "completed") ??
-    runs[0];
+  const runIdToShow = selectRunToShow(runs, selectedRunId);
 
   if (isLoadingRuns) return <Skeleton className="h-64 w-full rounded-lg" />;
 
+  // Before the empty state, never after it: with the history fetch failed, `runs` is `[]`
+  // for a reason that has nothing to do with whether this site has ever been crawled, and
+  // telling someone to "run a crawl" because we could not read the list is a lie the user
+  // cannot debug.
+  if (runsError !== null && runs.length === 0) {
+    return (
+      <CrawlsError
+        error={runsError}
+        onRetry={onRetryRuns}
+        isRetrying={isRetryingRuns}
+        hasStaleData={false}
+      />
+    );
+  }
+
   // State 1 of 4: no runs at all.
-  if (runs.length === 0) {
+  if (runIdToShow === null) {
     return (
       <div className="rounded-lg border border-border bg-card p-10 text-center">
         <p className="text-sm font-medium text-foreground">Run a crawl to generate llms.txt</p>
@@ -81,12 +101,6 @@ export function OutputTab({
       </div>
     );
   }
-
-  // `?run=` names a run that is not on any loaded page — a deep link, or a run reached from
-  // the `409`. It is still perfectly displayable: `GET /runs/{id}` needs only the id, and
-  // whether the run happens to be in this component's list is irrelevant to it.
-  const runIdToShow = selectedRun?.id ?? selectedRunId;
-  if (runIdToShow === null || runIdToShow === undefined) return null;
 
   return (
     <div className="min-w-0 space-y-4">

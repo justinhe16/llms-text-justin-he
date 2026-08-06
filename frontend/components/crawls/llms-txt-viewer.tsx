@@ -81,9 +81,12 @@ export function LlmsTxtViewer({ content, origin }: { content: string; origin: st
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
-    // Revoking immediately is safe — the download has already been handed to the browser
-    // by `click()` — and not revoking leaks the whole artifact for the life of the document.
-    URL.revokeObjectURL(url);
+    // Revoked on the next macrotask rather than synchronously. Every current browser has
+    // handed the download off by the time `click()` returns, but some have historically
+    // processed the anchor's navigation asynchronously, and a URL revoked before that lands
+    // produces a silently empty file. Deferring costs one tick and removes the class of bug;
+    // not revoking at all would leak the whole artifact for the document's lifetime.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
     toast.success(`Downloaded ${llmsTxtFilename(origin)}`);
   };
 

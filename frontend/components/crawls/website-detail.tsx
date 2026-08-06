@@ -173,6 +173,9 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
                 origin={website?.origin ?? ""}
                 runs={runs}
                 isLoadingRuns={runsQuery.isPending}
+                runsError={runsQuery.error}
+                onRetryRuns={() => void runsQuery.refetch()}
+                isRetryingRuns={runsQuery.isFetching}
                 selectedRunId={selectedRunId}
                 onSelectRun={showRunOutput}
                 canRun={isOwner}
