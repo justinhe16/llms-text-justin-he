@@ -8,6 +8,15 @@ not — and cannot — stop a hostname lookup from reaching a real resolver. An 
 DNS entirely (`internals/ssrf.py`'s `_parse_ip_literal`), so every fetch in this file is
 fully hermetic: `ctx["http_client"]` is always built with `transport=httpx.MockTransport(...)`,
 and nothing here ever asks a real question of a real network.
+
+`ctx["storage"]` is `conftest.py`'s `FakeStorage` — a structural stand-in for
+`SupabaseStorage` that records calls without another `httpx.MockTransport` for the upload
+leg. `tests/test_run_persistence.py` is the suite that asserts on what `FakeStorage` records;
+this file only needs it present so `crawl_task` has something to build a `CrawlService` from.
+A run that reaches a successful crawl now ends `completed`, not `processing` — persisting the
+result is this ticket's whole point (PER-163) — so the happy-path test below asserts that,
+where an earlier revision of this suite (written before persistence existed) asserted the
+opposite.
 """
 
 import asyncio
@@ -18,7 +27,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from asyncpg import Pool
-from conftest import TEST_USER_A_ID, seed_run, seed_website
+from conftest import TEST_USER_A_ID, FakeStorage, seed_run, seed_website
 
 from app.worker.jobs import crawl_task
 
@@ -45,14 +54,18 @@ async def test_a_pending_run_is_claimed_and_the_task_returns_stub_output(
         return httpx.Response(200, text="hello world")
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         result = await crawl_task(ctx, str(run_id))
 
     assert result == "ok"
 
-    row = await websites_db.fetchrow("SELECT status FROM runs WHERE id = $1", run_id)
+    row = await websites_db.fetchrow(
+        "SELECT status, llms_txt, storage_path FROM runs WHERE id = $1", run_id
+    )
     assert row is not None
-    assert row["status"] == "processing"
+    assert row["status"] == "completed"
+    assert row["llms_txt"] is not None
+    assert row["storage_path"] is not None
 
 
 @pytest.mark.parametrize("status", ["processing", "completed", "failed"])
@@ -67,7 +80,7 @@ async def test_a_non_pending_run_is_skipped_and_left_untouched(
         raise AssertionError("crawl_task must not fetch anything for a non-pending run")
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         result = await crawl_task(ctx, str(run_id))
 
     assert result == "no outcome"
@@ -81,7 +94,7 @@ async def test_a_run_id_naming_no_run_returns_rather_than_raising(websites_db: P
         raise AssertionError("crawl_task must not fetch anything for a nonexistent run")
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         result = await crawl_task(ctx, str(uuid4()))
 
     assert result == "no outcome"
@@ -92,7 +105,7 @@ async def test_a_malformed_run_id_returns_rather_than_raising(websites_db: Pool)
         raise AssertionError("crawl_task must not fetch anything for a malformed run id")
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         result = await crawl_task(ctx, "not-a-uuid")
 
     assert result == "invalid run id"
@@ -106,7 +119,7 @@ async def test_seed_url_failure_leaves_the_run_failed(websites_db: Pool) -> None
         raise httpx.ConnectError("simulated connection failure", request=request)
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         result = await crawl_task(ctx, str(run_id))
 
     assert result == "no outcome"
@@ -136,7 +149,7 @@ async def test_the_recorded_error_never_leaks_exception_internals(websites_db: P
         raise httpx.ConnectError(dangerous_detail, request=request)
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         await crawl_task(ctx, str(run_id))
 
     row = await websites_db.fetchrow("SELECT error FROM runs WHERE id = $1", run_id)
@@ -159,7 +172,7 @@ async def test_two_concurrent_calls_for_the_same_run_only_one_claims_it(
         return httpx.Response(200, text="ok")
 
     async with _mock_client(handler) as http_client:
-        ctx = {"db_pool": websites_db, "http_client": http_client}
+        ctx = {"db_pool": websites_db, "http_client": http_client, "storage": FakeStorage()}
         results = await asyncio.gather(crawl_task(ctx, str(run_id)), crawl_task(ctx, str(run_id)))
 
     assert sorted(results) == ["no outcome", "ok"]
