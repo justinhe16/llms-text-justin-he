@@ -18,7 +18,7 @@ from arq.worker import Worker, get_kwargs
 from app.core.settings import settings
 from app.infrastructure.queue.pool import redis_settings_from_url
 from app.worker import settings as worker_settings
-from app.worker.jobs import noop
+from app.worker.jobs import crawl_task, noop
 from app.worker.settings import WorkerSettings
 
 
@@ -93,6 +93,12 @@ def test_functions_is_not_empty_so_the_worker_can_actually_start() -> None:
     assert noop in WorkerSettings.functions
 
 
+def test_crawl_task_is_registered_beside_noop() -> None:
+    """`crawl_task` joins `functions` rather than replacing `noop` — see `noop`'s own
+    docstring for why it stays."""
+    assert crawl_task in WorkerSettings.functions
+
+
 def test_every_setting_declared_here_actually_reaches_the_worker() -> None:
     """Guards the silent-drop failure mode of arq's settings loading.
 
@@ -129,9 +135,20 @@ async def test_the_declared_values_arrive_on_a_constructed_worker() -> None:
         assert worker.max_jobs == WorkerSettings.max_jobs
         assert worker.job_timeout_s == WorkerSettings.job_timeout
         assert worker._job_completion_wait == WorkerSettings.job_completion_wait
-        assert set(worker.functions) == {noop.__qualname__}
+        assert set(worker.functions) == {noop.__qualname__, crawl_task.__qualname__}
     finally:
         await worker.close()
+
+
+def test_crawl_task_is_registered_under_the_literal_name_a_sibling_ticket_enqueues() -> None:
+    """PER-160 enqueues this job **by the literal string** `"crawl_task"`, not by importing
+    the function — a queue producer and its consumer are two different processes and the
+    only thing they agree on is a name on the wire. arq registers a bare coroutine under
+    `coroutine.__qualname__` (`arq.worker.func`), so this pins that `crawl_task`'s
+    `__qualname__` is exactly `"crawl_task"` — no wrapping in `arq.worker.func(name=...)`,
+    no nesting inside a class that would prefix it, and no renaming the function itself.
+    """
+    assert crawl_task.__qualname__ == "crawl_task"
 
 
 def test_a_tls_url_gets_tls_with_hostname_verification() -> None:

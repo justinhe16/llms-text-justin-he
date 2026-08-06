@@ -5,13 +5,34 @@ service method, and returns. Jobs are enqueued with ids and primitives only — 
 objects, never Pydantic models — because everything on the queue is serialized and has to
 survive a deploy that changes those classes.
 
-There is exactly one job here today, and it does not call a service because there is no
-service for it to call yet. The crawl task lands with its own ticket, behind the
-`generate_llms_txt(pages)` seam (§3.4).
+**`crawl_task` lives here, not in `app/features/crawl/task.py`.** The ticket that added it
+said the latter; ARCHITECTURE.md §3.3 says "Job functions live in `backend/app/worker/`" and
+lists `worker/jobs.py` as "the job functions themselves" — and per CLAUDE.md, the document
+wins over a ticket that contradicts it. The task itself stays exactly as thin as `noop`
+below: coerce the id, pull the two resources it needs off `ctx`, call one service method,
+log, and return. Every real decision — the idempotency claim, the network call, the
+sanitized failure message — lives in `app.features.crawl.service.CrawlService`.
+
+`crawl_task`'s public signature is exactly `async def crawl_task(ctx, run_id)`. A sibling
+ticket enqueues it **by name** — arq registers a bare coroutine under its `__qualname__`
+(`arq.worker.func`), so `"crawl_task"` is the registered name regardless of which module it
+lives in. Do not rename it, wrap it in `arq.worker.func(..., name=...)`, or add a required
+parameter.
+
+`run_id` arrives as a `str`, not a `UUID`: arq serializes job arguments with msgpack, which a
+`UUID` does not survive, and ARCHITECTURE.md §3.3 says jobs take "ids and primitives" for
+exactly this reason. `crawl_task` accepts `str | UUID` and coerces with `UUID(str(run_id))`;
+a malformed id is logged and the job returns rather than raising — the same "a worker must
+not raise at arq" contract `CrawlService.execute_run` itself follows for every other failure
+mode.
 """
 
 import logging
 from typing import Any
+from uuid import UUID
+
+from app.core.settings import settings
+from app.features.crawl.service import build_crawl_service
 
 
 logger = logging.getLogger(__name__)
@@ -48,4 +69,55 @@ async def noop(ctx: dict[Any, Any]) -> str:
         default). `Job.result()` returning it is the API-side half of the round trip.
     """
     logger.info("noop job received (job_id=%s, attempt=%s)", ctx.get("job_id"), ctx.get("job_try"))
+    return "ok"
+
+
+async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
+    """Crawl the website behind `run_id`. Thin by contract — see the module docstring.
+
+    `ctx["db_pool"]` and `ctx["http_client"]` are both published once per process by
+    `app/worker/settings.py`'s `open_worker_resources`, the same pattern `noop` documents
+    for `ctx["db_pool"]` alone. This job builds a fresh `CrawlService` from them on every
+    call — the service itself is cheap to construct (see `build_crawl_service`) — rather
+    than caching one on `ctx`, so a service's dependencies are exactly what
+    `app.features.crawl.service.build_crawl_service`'s signature says they are, with
+    nothing smuggled in through job-to-job state.
+
+    Args:
+        ctx: arq's job context. Must already carry `"db_pool"` and `"http_client"` —
+            true for any job this `WorkerSettings` runs, and never true in a plain unit
+            test constructing this function's arguments by hand.
+        run_id: The run to crawl, as arq's msgpack serialization actually delivers it — see
+            the module docstring for why that is a `str` rather than a `UUID` in practice,
+            and why the parameter still accepts either.
+
+    Returns:
+        A short, human-readable outcome string for arq's job result — never anything a
+        caller is expected to parse. Never raises for an application-level failure: a bad
+        `run_id`, a missing run, a lost claim race, and a failed crawl are all logged and
+        returned, matching `CrawlService.execute_run`'s own "never raise HTTPException at
+        arq" contract. `asyncio.CancelledError` (arq's job timeout, or SIGTERM) is not
+        caught here either, for the same reason `execute_run` does not catch it.
+    """
+    try:
+        parsed_run_id = UUID(str(run_id))
+    except ValueError:
+        logger.error("crawl_task: %r is not a valid run id; skipping", run_id)
+        return "invalid run id"
+
+    service = build_crawl_service(ctx["db_pool"], ctx["http_client"], settings)
+    outcome = await service.execute_run(parsed_run_id)
+
+    if outcome is None:
+        logger.info(
+            "crawl_task: run %s produced no outcome; see CrawlService's own logs for why",
+            parsed_run_id,
+        )
+        return "no outcome"
+
+    logger.info(
+        "crawl_task: run %s fetched %d page(s)",
+        parsed_run_id,
+        outcome.stats.get("pages_crawled", 0),
+    )
     return "ok"

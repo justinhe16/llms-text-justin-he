@@ -1,9 +1,24 @@
-"""The first write path in the runs feature: `INSERT`s and `UPDATE`s for
-`POST /websites/{id}/runs`.
+"""Every write in the runs feature — two write paths, which arrived from two directions.
+
+`POST /websites/{id}/runs` owns `insert_manual` and `mark_failed`: create a `pending` run,
+and undo it if enqueueing the job afterwards fails. The crawl worker
+(`app.worker.jobs.crawl_task`) owns `claim_pending` and `mark_processing_failed`: take a
+`pending` run atomically, and record a terminal failure if the crawl never produces an
+artifact.
+
+**Why there are two "mark this failed" statements rather than one.** They guard on different
+statuses, and that is the whole of the difference: `mark_failed` fires on the enqueue-failure
+path, where the run must still be `pending`, while `mark_processing_failed` fires from the
+worker, after `claim_pending` has already moved the row to `processing`. Collapsing them into
+one unguarded `UPDATE` would let either path stomp a row the other is legitimately working
+on; collapsing them into one statement guarded on `pending` would make the worker's failure
+record a silent no-op, since by then the row is never `pending` any more. Each statement
+therefore names the status it is allowed to leave, and a no-op is the safe failure mode for
+both.
 
 **This writer never commits, never rolls back, and never opens a transaction** — the same
 contract `websites/internals/websites_writer.py` documents at length, and the reason it is
-not repeated in full here. A `RunsWriter` is built *inside* `RunService.trigger_run`'s
+not repeated in full here. A `RunsWriter` is built *inside* the calling service method's
 `transaction()` block, from the `Connection` that block yields:
 
 ```python
@@ -11,9 +26,12 @@ async with transaction(self._pool) as tx:
     row = await RunsWriter(tx).insert_manual(website_id)
 ```
 
-**No ownership check happens here**, for the same reason none happens in
-`WebsitesWriter`: by the time either method below runs, `RunService.trigger_run` has already
-fetched the website and called `require_owner`. Neither statement takes a `user_id`.
+**No ownership check happens here**, and for two different reasons depending on the caller.
+On the HTTP path, `RunService.trigger_run` has already fetched the website and called
+`require_owner` before any method below runs — the same reason none happens in
+`WebsitesWriter`. On the worker path there is no caller to check at all: a background job
+acts on its own behalf, and ARCHITECTURE.md §4 is a rule about HTTP callers. No statement
+below takes a `user_id` either way.
 """
 
 from datetime import datetime
@@ -58,6 +76,40 @@ _MARK_FAILED: Final = """
     UPDATE runs
     SET status = 'failed', error = $2, completed_at = $3
     WHERE id = $1 AND status = 'pending'
+"""
+
+# THE WORKER'S IDEMPOTENCY GUARD, and the reason it is a conditional UPDATE rather than a
+# SELECT followed by an UPDATE. arq can deliver the same job more than once, and
+# `WorkerSettings.MAX_JOBS = 2` (app/worker/settings.py) means two of them can be in flight
+# on one machine at the same moment. Both workers may issue this statement; Postgres's row
+# lock serializes them, and only the one whose UPDATE actually matches `status = 'pending'`
+# gets a row back from `RETURNING`. Read-then-write cannot make that guarantee at any
+# isolation level this application runs at — both readers would see `pending` and both would
+# proceed to crawl the same run.
+#
+# The enum is cast explicitly, matching `_LIST_BY_WEBSITE_WITH_STATUS` in
+# `runs_reader.py` and `seed_run` in `tests/conftest.py`.
+_CLAIM_PENDING: Final = """
+    UPDATE runs
+    SET status = 'processing'::run_status
+    WHERE id = $1 AND status = 'pending'::run_status
+    RETURNING id
+"""
+
+# The worker's terminal-failure record. Guarded on `processing` — NOT on `pending`, and not
+# unguarded — because it only ever runs after `_CLAIM_PENDING` above has already moved this
+# row out of `pending`. See the module docstring for why this is a second statement rather
+# than a reuse of `_MARK_FAILED`.
+#
+# `completed_at = now()` is the transaction's own start time, decided by the database, for
+# the same reason `_INSERT_MANUAL` above leaves `started_at` to `DEFAULT CURRENT_TIMESTAMP`:
+# a Python `datetime.now(UTC)` captured a moment earlier is a guess about when the row was
+# actually written. The HTTP path passes its `completed_at` in explicitly instead, because
+# there it has to agree to the microsecond with arithmetic the request already did.
+_MARK_PROCESSING_FAILED: Final = """
+    UPDATE runs
+    SET status = 'failed'::run_status, error = $2, completed_at = now()
+    WHERE id = $1 AND status = 'processing'::run_status
 """
 
 
@@ -110,3 +162,38 @@ class RunsWriter(Writer):
             docstring's note on why the guard exists without being load-bearing here.
         """
         return await self.execute(_MARK_FAILED, run_id, error, completed_at)
+
+    async def claim_pending(self, run_id: UUID) -> bool:
+        """Atomically flip `run_id` from `pending` to `processing`.
+
+        The correctness guard the crawl worker takes before it fetches a single byte. See
+        `_CLAIM_PENDING` for why this must be one conditional statement.
+
+        Returns:
+            `True` if this call won the race and the row is now `processing` under it;
+            `False` if the row was not `pending` at all — already claimed by another worker,
+            already terminal, or the id does not exist. The caller cannot tell those three
+            apart from this return value alone, and does not need to: all three mean "do not
+            crawl."
+        """
+        row = await self.fetch_one(_CLAIM_PENDING, run_id)
+        return row is not None
+
+    async def mark_processing_failed(self, run_id: UUID, error: str) -> str:
+        """Record a terminal failure for a run this worker had already claimed.
+
+        Args:
+            run_id: The run being failed. Must have been claimed by `claim_pending` first —
+                this statement matches only a `processing` row.
+            error: A message already sanitized by the caller
+                (`app.features.crawl.service.CrawlService._safe_error_message`). Never a raw
+                exception string: `runs.error` is readable by every signed-in user
+                (ARCHITECTURE.md §4.1), and an `httpx` exception's `str()` carries internal
+                hostnames and resolved addresses.
+
+        Returns:
+            asyncpg's status tag. `"UPDATE 0"` means the row was no longer `processing` —
+            something else reached a terminal state first — which is precisely the case the
+            guard exists to leave alone rather than overwrite.
+        """
+        return await self.execute(_MARK_PROCESSING_FAILED, run_id, error)
