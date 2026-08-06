@@ -48,8 +48,12 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_secret_key: str = ""
 
-    # Optional: error reporting is disabled when this is unset.
-    sentry_dsn: str | None = None
+    # THERE IS NO ERROR-TRACKING SETTING HERE, AND THERE IS NOT MEANT TO BE. `sentry_dsn`
+    # was scaffolded in PER-142 for an integration that is not happening: this system's
+    # entire observability story is JSON logs on stdout plus correlation ids, read with
+    # `fly logs | jq` (app/core/logging.py, ARCHITECTURE.md §3.8). Adding Sentry or an
+    # equivalent is its own ticket and its own decision, not a field somebody re-adds
+    # because a later ticket's prose mentions one.
 
     # Pool sizing, kept deliberately small: Fly machines are small, Supabase connection
     # limits are real, and the API and the ARQ worker draw connections from the same

@@ -202,22 +202,43 @@ async def crawl_site(
     gate = _PolitenessGate(limits.politeness_delay_ms / 1000, clock)
     semaphore = asyncio.Semaphore(limits.concurrency)
 
+    def _mark_cap_hit(hit: str) -> None:
+        """Set `cap_hit` to `hit` and log it — but only the first caller to arrive.
+
+        Called from every site below that can trip a cap, three of which run inside
+        concurrent `fetch_frontier_url` tasks. The `if cap_hit is not None: return` guard at
+        the top of that function only stops a task that starts AFTER a cap has already
+        fired; it says nothing about two tasks reaching the same cap in the same moment,
+        which without this helper would log that cap twice.
+
+        What makes the check-and-set here safe is that nothing between them awaits, so the
+        event loop cannot hand control to another task in the middle of it. The pair is
+        atomic in practice even though the five call sites are not synchronized with each
+        other in any other way: exactly one INFO line per run, whichever of them wins.
+        """
+        nonlocal cap_hit
+        if cap_hit is None:
+            cap_hit = hit
+            logger.info(
+                "crawl: hit the %s cap", hit, extra={"cap_hit": hit, "pages_crawled": len(pages)}
+            )
+
     async def fetch_frontier_url(url: str) -> None:
-        nonlocal cap_hit, pages_failed
+        nonlocal pages_failed
         async with semaphore:
             if cap_hit is not None:
                 return
             if len(pages) >= limits.max_pages:
-                cap_hit = "pages"
+                _mark_cap_hit("pages")
                 return
             if clock() >= deadline:
-                cap_hit = "wall_clock"
+                _mark_cap_hit("wall_clock")
                 return
             await gate.wait_for_turn()
             try:
                 page = await fetch_page(client, url, budget=budget, resolver=resolver)
             except ByteBudgetExceededError:
-                cap_hit = "bytes"
+                _mark_cap_hit("bytes")
                 return
             except Exception:
                 logger.warning("crawl: frontier fetch failed for %s", url, exc_info=True)
@@ -250,9 +271,9 @@ async def crawl_site(
                     await asyncio.gather(*(fetch_frontier_url(url) for url in frontier))
 
                 if frontier_was_truncated and cap_hit is None:
-                    cap_hit = "pages"
+                    _mark_cap_hit("pages")
     except TimeoutError:
-        cap_hit = "wall_clock"
+        _mark_cap_hit("wall_clock")
 
     # A run that collected NOTHING is a failed run, not a capped success — and the outer
     # `asyncio.timeout` is the one path that can produce that shape without the seed's own

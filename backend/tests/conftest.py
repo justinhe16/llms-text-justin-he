@@ -11,7 +11,9 @@ against the real application.
 """
 
 import asyncio
+import io
 import json
+import logging
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -56,6 +58,11 @@ os.environ["SUPABASE_SECRET_KEY"] = "not-a-real-key"
 
 from app.api.deps import get_db_pool  # noqa: E402  — must follow the assignments above
 from app.core.auth.jwks import JwksCache, get_jwks_cache  # noqa: E402  — as above
+from app.core.logging import (  # noqa: E402  — as above
+    JsonFormatter,
+    ProcessName,
+    RedactionFilter,
+)
 from app.infrastructure.queue.pool import redis_settings_from_url  # noqa: E402  — as above
 from app.main import app  # noqa: E402  — must follow the assignments above
 
@@ -774,6 +781,73 @@ def plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
 # `app.infrastructure.storage.supabase_storage.SupabaseStorage` is a complete substitute,
 # with no `httpx.AsyncClient` anywhere behind it.
 # -----------------------------------------------------------------------------------------
+
+
+class _JsonLogCapture:
+    """A real logging handler carrying the real `JsonFormatter` and `RedactionFilter`,
+    writing to memory.
+
+    Shared by `tests/test_logging.py` and `tests/test_request_context.py`, which is why it
+    lives here rather than in either of them — the same "promote once a second suite needs
+    it" rule the seed helpers above document.
+
+    Deliberately the real classes rather than a stub: what these suites are asserting is
+    that a line logged three modules deep comes out of the pipeline `app.core.logging`
+    actually installs, with its correlation ids attached and its credentials scrubbed. A
+    formatter called directly on a hand-built `LogRecord` would prove none of that.
+    """
+
+    def __init__(self, process: ProcessName = "app") -> None:
+        self.stream = io.StringIO()
+        self.handler = logging.StreamHandler(self.stream)
+        self.handler.setFormatter(JsonFormatter(process))
+        self.handler.addFilter(RedactionFilter())
+        self.handler.setLevel(logging.DEBUG)
+
+    @property
+    def raw(self) -> str:
+        """Everything written, as text — for asserting a secret appears NOWHERE, which is a
+        claim about the whole stream rather than about any one field of it."""
+        return self.stream.getvalue()
+
+    @property
+    def lines(self) -> list[dict[str, Any]]:
+        return [json.loads(line) for line in self.raw.splitlines() if line.strip()]
+
+    @property
+    def only(self) -> dict[str, Any]:
+        """The single line emitted, failing loudly if there was more or less than one."""
+        (line,) = self.lines
+        return line
+
+    def at(self, logger_name: str) -> list[dict[str, Any]]:
+        """Every line emitted by one logger, for a suite that only cares about its own."""
+        return [line for line in self.lines if line["logger"] == logger_name]
+
+
+@pytest.fixture
+def json_logs() -> Iterator[_JsonLogCapture]:
+    """Attach a JSON capture handler to the ROOT logger for one test, then remove it.
+
+    Root rather than the logger under test, so records have to reach it by propagation
+    exactly as they do in production — a handler attached directly to one logger would not
+    prove that a line logged inside a dependency, a service, or an internals module still
+    arrives.
+
+    The root level is forced to DEBUG (and restored) because two of the things worth
+    asserting — the crawler's per-fetch lines and the `/health` request summary — are
+    deliberately DEBUG in production.
+    """
+    capture = _JsonLogCapture()
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.DEBUG)
+    root.addHandler(capture.handler)
+    try:
+        yield capture
+    finally:
+        root.removeHandler(capture.handler)
+        root.setLevel(previous_level)
 
 
 class FakeStorage:

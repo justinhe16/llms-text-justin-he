@@ -149,19 +149,24 @@ class CrawlService:
         try:
             run = await self._runs.get_run(run_id)
         except HTTPException:
-            logger.warning("crawl: run %s no longer exists; skipping", run_id)
+            # `run_id` is deliberately not interpolated here, or in any log line below it in
+            # this method: `crawl_task` binds it with `run_id_context` around this entire
+            # call, so `app.core.logging.JsonFormatter` already attaches it to every line —
+            # repeating it in the message text would just be `jq`-unfriendly duplication.
+            logger.warning("crawl: run no longer exists; skipping")
             return None
 
         if run.status != "pending":
             # The readable guard. `claim_for_processing` below is the one that is actually
             # correct under concurrent delivery — this one only makes the common case fail
-            # fast and say why in the log.
-            logger.info("crawl: run %s is %r, not pending; skipping", run_id, run.status)
+            # fast and say why in the log. `status` is a structured value, so it goes in
+            # `extra` rather than only inside the message.
+            logger.info("crawl: run is not pending; skipping", extra={"status": run.status})
             return None
 
         claimed = await self._runs.claim_for_processing(run_id)
         if not claimed:
-            logger.info("crawl: run %s lost the claim race to another worker; skipping", run_id)
+            logger.info("crawl: lost the claim race to another worker; skipping")
             return None
 
         # Hoisted above the `try` so the `except` below can build a partial `stats` dict from
@@ -174,17 +179,29 @@ class CrawlService:
         try:
             website = await self._websites.get_website(run.website_id)
 
+            # Hoisted so the "crawl starting" line below and the `crawl_site` call right
+            # after it are guaranteed to describe the same caps — building `CrawlLimits`
+            # twice here would risk the log claiming one set of numbers while the run
+            # actually executed under another.
+            limits = CrawlLimits.from_settings(self._settings)
+            logger.info(
+                "crawl: starting",
+                extra={
+                    "url": website.url,
+                    "max_pages": limits.max_pages,
+                    "max_bytes": limits.max_bytes,
+                    "max_wall_clock_s": limits.max_wall_clock_s,
+                },
+            )
+
             # The network call, deliberately outside any transaction — see the module
             # docstring's second paragraph.
-            result = await crawl_site(
-                self._client, website.url, limits=CrawlLimits.from_settings(self._settings)
-            )
+            result = await crawl_site(self._client, website.url, limits=limits)
 
             if result.seed_error is not None:
                 message = _safe_error_message(result.seed_error)
                 logger.warning(
-                    "crawl: run %s could not fetch its seed URL (%s)",
-                    run_id,
+                    "crawl: could not fetch its seed URL (%s)",
                     message,
                     exc_info=result.seed_error,
                 )
@@ -206,13 +223,25 @@ class CrawlService:
             storage_path = await self._storage.upload(
                 object_path, payload, content_type=PAYLOAD_CONTENT_TYPE
             )
+            # `len(payload)` is a number already sitting in hand, not a re-derivation — this
+            # stays cheap. The payload itself is never logged: it is every fetched page's
+            # content, gzip-compressed, and a page's content has no business appearing in
+            # `fly logs`, which every signed-in user's crawl targets share.
+            logger.info(
+                "crawl: uploaded payload to storage",
+                extra={"bytes": len(payload), "storage_path": storage_path},
+            )
 
             stats = build_run_stats(result.stats, links_emitted=links_emitted)
             await self._runs.record_success(
                 run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
             )
         except Exception as exc:
-            logger.error("crawl: run %s failed unexpectedly", run_id, exc_info=True)
+            # `exc_info=True` stays: `fly logs` is the only log surface this system has and
+            # there is no error-tracking service on either side of it holding a second copy
+            # (`app.core.logging`'s own module docstring), so the full traceback this one
+            # line carries is the only record of the failure that will ever exist.
+            logger.error("crawl: failed unexpectedly", exc_info=True)
             partial_stats = (
                 build_run_stats(result.stats, links_emitted=links_emitted)
                 if result is not None
@@ -221,13 +250,12 @@ class CrawlService:
             await self._runs.record_failure(run_id, _safe_error_message(exc), partial_stats)
             return None
 
-        logger.info(
-            "crawl: run %s completed: %d page(s) (cap_hit=%s), storage_path=%s",
-            run_id,
-            len(result.pages),
-            result.stats.get("cap_hit"),
-            storage_path,
-        )
+        # `result.stats` already has exactly the five keys `runs.stats` wants named
+        # (`pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`, `cap_hit`) —
+        # spread rather than restated by hand, so this line can never drift from the shape
+        # `internals/crawler.py` actually produces. `storage_path` is the one field that
+        # isn't already on it.
+        logger.info("crawl: completed", extra={**result.stats, "storage_path": storage_path})
         return CrawlOutcome(llms_txt=llms_txt, stats=stats, storage_path=storage_path)
 
 

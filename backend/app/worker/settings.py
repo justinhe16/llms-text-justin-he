@@ -14,7 +14,7 @@ introduce a base class here, and do not set these from a loop or a mixin.
 """
 
 import logging
-from typing import Any
+from typing import Any, Final
 
 from arq import cron
 
@@ -37,11 +37,37 @@ logger = logging.getLogger(__name__)
 # print with no level, name, or timestamp. Doing it here rather than in `on_startup` means
 # an exception raised while this module is being imported is still logged properly, and
 # that is exactly when a misconfigured worker fails.
-configure_logging()
+#
+# `"worker"` is the `process` field stamped on every line this process emits, and it is the
+# name backend/fly.toml's `[processes]` block uses, so `fly logs --process worker` and a
+# `jq 'select(.process == "worker")'` over the same stream select the same lines.
+configure_logging("worker")
 
-# arq's own handler already prints its messages. Its logger propagates by default, so once
-# the root logger above has a handler too, every arq line would appear twice.
-logging.getLogger("arq").propagate = False
+
+# HOW ARQ'S OWN LINES BECOME JSON. Passed to the worker as
+# `--custom-log-dict app.worker.settings.ARQ_LOG_CONFIG`, in backend/fly.toml's `worker`
+# process command and in scripts/dev.sh — tests/test_logging.py asserts that both of them
+# still name this symbol, because a typo in either is a worker that fails to boot.
+#
+# THIS CANNOT BE DONE FROM `configure_logging()` ABOVE, and that is the only reason the dict
+# exists. `arq.cli` imports this module FIRST and calls `logging.config.dictConfig(...)`
+# SECOND, so anything the import-time call did to the `arq` logger is undone a moment later
+# by arq's own default config — which attaches a plain-text handler
+# (`'%(asctime)s: %(message)s'`) and would leave arq's job lines as the only non-JSON
+# output the worker produced. `--custom-log-dict` replaces that default with this, which
+# gives the `arq` logger no handler of its own and lets its records propagate to the JSON
+# handler on the root logger instead.
+#
+# `disable_existing_loggers: False` matters as much as the rest of it: the default is True,
+# and dictConfig would otherwise disable every `app.*` logger created during the import
+# that has already happened — silencing the whole application to configure one library.
+ARQ_LOG_CONFIG: Final[dict[str, Any]] = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "loggers": {
+        "arq": {"handlers": [], "level": settings.log_level, "propagate": True},
+    },
+}
 
 
 async def open_worker_resources(ctx: dict[Any, Any]) -> None:
