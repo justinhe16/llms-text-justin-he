@@ -1,10 +1,11 @@
-"""Every write in the runs feature — two write paths, which arrived from two directions.
+"""Every write in the runs feature — three write paths, which arrived from three directions.
 
 `POST /websites/{id}/runs` owns `insert_manual` and `mark_failed`: create a `pending` run,
 and undo it if enqueueing the job afterwards fails. The crawl worker
-(`app.worker.jobs.crawl_task`) owns `claim_pending` and `mark_processing_failed`: take a
-`pending` run atomically, and record a terminal failure if the crawl never produces an
-artifact.
+(`app.worker.jobs.crawl_task`, by way of `app.features.crawl.service.CrawlService`) owns the
+other three: `claim_pending` takes a `pending` run atomically; `mark_processing_completed`
+records a successful crawl's artifact, Storage location, and stats; `mark_processing_failed`
+records a terminal failure for a crawl that never produces one.
 
 **Why there are two "mark this failed" statements rather than one.** They guard on different
 statuses, and that is the whole of the difference: `mark_failed` fires on the enqueue-failure
@@ -14,7 +15,11 @@ one unguarded `UPDATE` would let either path stomp a row the other is legitimate
 on; collapsing them into one statement guarded on `pending` would make the worker's failure
 record a silent no-op, since by then the row is never `pending` any more. Each statement
 therefore names the status it is allowed to leave, and a no-op is the safe failure mode for
-both.
+both. `mark_processing_completed` extends that same argument rather than contradicting it: it
+guards on `processing` for exactly the reason `mark_processing_failed` does — a no-op on a row
+that has already reached a terminal state by some other path is the safe outcome, not an
+error this method needs to raise about (`RunService.record_success` logs it instead; see that
+method's docstring for why).
 
 **This writer never commits, never rolls back, and never opens a transaction** — the same
 contract `websites/internals/websites_writer.py` documents at length, and the reason it is
@@ -34,6 +39,7 @@ acts on its own behalf, and ARCHITECTURE.md §4 is a rule about HTTP callers. No
 below takes a `user_id` either way.
 """
 
+import json
 from datetime import datetime
 from typing import Any, Final
 from uuid import UUID
@@ -96,6 +102,31 @@ _CLAIM_PENDING: Final = """
     RETURNING id
 """
 
+# The worker's success record — the third write path, and the only one that ever moves a run
+# to `completed`. Guarded on `processing`, for the same reason `_MARK_PROCESSING_FAILED`
+# below is: this only ever runs after `_CLAIM_PENDING` has moved the row out of `pending`, and
+# a no-op here (something else already reached a terminal state first) is the safe failure
+# mode rather than an overwrite.
+#
+# `stats` arrives pre-serialized to JSON text, not as a Python dict — see
+# `mark_processing_completed`'s docstring for why marshalling happens in this writer rather
+# than in `RunService`. `completed_at = now()`, not a value passed in, for the same reason
+# `_MARK_PROCESSING_FAILED` decides it in the database rather than in Python: by the time this
+# statement runs, the Storage upload it is recording the result of has already taken
+# unpredictable, unmeasured wall-clock time, so there is no earlier Python `datetime.now(UTC)`
+# that could describe "when this row actually finished" any better than the database's own
+# clock at the moment of the UPDATE.
+_MARK_PROCESSING_COMPLETED: Final = """
+    UPDATE runs
+    SET status = 'completed'::run_status,
+        llms_txt = $2,
+        storage_path = $3,
+        stats = $4::jsonb,
+        completed_at = now()
+    WHERE id = $1 AND status = 'processing'::run_status
+    RETURNING id
+"""
+
 # The worker's terminal-failure record. Guarded on `processing` — NOT on `pending`, and not
 # unguarded — because it only ever runs after `_CLAIM_PENDING` above has already moved this
 # row out of `pending`. See the module docstring for why this is a second statement rather
@@ -106,9 +137,19 @@ _CLAIM_PENDING: Final = """
 # a Python `datetime.now(UTC)` captured a moment earlier is a guess about when the row was
 # actually written. The HTTP path passes its `completed_at` in explicitly instead, because
 # there it has to agree to the microsecond with arithmetic the request already did.
+#
+# `stats = COALESCE($3::jsonb, stats)`, not a bare `$3` — a caller with nothing new to record
+# (`RunService.record_failure`'s `stats=None` default) passes SQL `NULL` for $3, and COALESCE
+# is what makes that a no-op against whatever `stats` already holds instead of blanking a
+# value nothing else wrote. `CrawlService.execute_run`'s partial-stats-on-failure path is
+# exactly the caller that has something to pass instead of `NULL`: a seed or mid-crawl failure
+# still knows `pages_crawled`, `cap_hit`, and the rest, and this is where that survives.
 _MARK_PROCESSING_FAILED: Final = """
     UPDATE runs
-    SET status = 'failed'::run_status, error = $2, completed_at = now()
+    SET status = 'failed'::run_status,
+        error = $2,
+        stats = COALESCE($3::jsonb, stats),
+        completed_at = now()
     WHERE id = $1 AND status = 'processing'::run_status
 """
 
@@ -179,7 +220,48 @@ class RunsWriter(Writer):
         row = await self.fetch_one(_CLAIM_PENDING, run_id)
         return row is not None
 
-    async def mark_processing_failed(self, run_id: UUID, error: str) -> str:
+    async def mark_processing_completed(
+        self, run_id: UUID, *, llms_txt: str, storage_path: str, stats: dict[str, Any]
+    ) -> bool:
+        """Record a successful crawl for a run this worker had already claimed.
+
+        Called by `RunService.record_success` only AFTER the Storage upload that produced
+        `storage_path` has already succeeded (ARCHITECTURE.md §5.1) — this method has no way
+        to enforce that ordering itself, it only records the result of it.
+
+        Args:
+            run_id: The run being completed. Must have been claimed by `claim_pending` first
+                — this statement matches only a `processing` row.
+            llms_txt: The generated artifact — `generate_llms_txt(pages)`'s return value,
+                unmodified.
+            storage_path: The bucket-qualified path the payload landed at
+                (`SupabaseStorage.upload`'s return value).
+            stats: The shape `internals/run_stats.py`'s `build_run_stats` produces. Serialized
+                with `json.dumps` HERE, in the writer, not by the caller: asyncpg has no jsonb
+                codec registered in this project (see `RunService._parse_stats`, which
+                `json.loads`s this same column on the way back out), so the parameter has to
+                travel as JSON text rather than a Python dict. Marshalling a parameter for the
+                database it is headed to is the writer's job; deciding what that parameter
+                means is the caller's — the same division `mark_processing_failed` below
+                follows for its own `stats` argument.
+
+        Returns:
+            `True` if this call won and the row is now `completed`; `False` if the row was no
+            longer `processing` — something else (a redelivered job losing a race, a reaper)
+            reached a terminal state first. `RunService.record_success` logs that case at
+            WARNING rather than raising: the Storage object this run's payload was uploaded to
+            is now orphaned, which is the accepted, benign half of the upload-then-write
+            ordering trade (see that method's own docstring), not a corruption this writer
+            needs to escalate.
+        """
+        row = await self.fetch_one(
+            _MARK_PROCESSING_COMPLETED, run_id, llms_txt, storage_path, json.dumps(stats)
+        )
+        return row is not None
+
+    async def mark_processing_failed(
+        self, run_id: UUID, error: str, stats: dict[str, Any] | None = None
+    ) -> str:
         """Record a terminal failure for a run this worker had already claimed.
 
         Args:
@@ -190,10 +272,20 @@ class RunsWriter(Writer):
                 exception string: `runs.error` is readable by every signed-in user
                 (ARCHITECTURE.md §4.1), and an `httpx` exception's `str()` carries internal
                 hostnames and resolved addresses.
+            stats: Whatever partial numbers the crawl produced before it failed — built by
+                `internals/run_stats.py`'s `build_run_stats` from a `CrawlResult` the failure
+                path still has (a seed failure, or a Storage upload failure after the crawl
+                itself succeeded), or `None` if nothing usable exists yet (an exception raised
+                before `crawl_site` ever returned). Serialized to JSON text here, same as
+                `mark_processing_completed` above and for the same reason. `None` travels as
+                SQL `NULL`, which `_MARK_PROCESSING_FAILED`'s `COALESCE($3::jsonb, stats)`
+                turns into "leave the column exactly as it was" rather than blanking it — see
+                that statement's comment.
 
         Returns:
             asyncpg's status tag. `"UPDATE 0"` means the row was no longer `processing` —
             something else reached a terminal state first — which is precisely the case the
             guard exists to leave alone rather than overwrite.
         """
-        return await self.execute(_MARK_PROCESSING_FAILED, run_id, error)
+        encoded_stats = json.dumps(stats) if stats is not None else None
+        return await self.execute(_MARK_PROCESSING_FAILED, run_id, error, encoded_stats)

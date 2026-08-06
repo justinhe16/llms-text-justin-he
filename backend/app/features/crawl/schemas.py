@@ -51,23 +51,56 @@ class CrawledPage:
     fetched_at: datetime
     """When this page's final response was received, in UTC."""
 
+    content_bytes: int
+    """Added last, deliberately: an earlier field inserted anywhere but the end would break
+    every positional `CrawledPage(...)` construction already in this codebase, silently
+    reordering arguments into the wrong parameters rather than raising. Required, not
+    defaulted — a silent `0` here would be worse than the compile error a missing argument
+    produces, because a `0` looks like a legitimately empty page rather than a caller that
+    forgot to wire this field through.
+
+    The number of body bytes actually charged against the run's `ByteBudget`
+    (`internals/fetcher.py`) while streaming this page — what came off the wire, not
+    `len(content.encode())`. Those two disagree the moment `content` is not valid UTF-8:
+    `_read_body_within_budget` decodes with `errors="replace"`, which can both shrink and
+    grow the byte count relative to the original bytes (a truncated multi-byte sequence
+    becomes one substitution character; some replacement runs are longer than what they
+    replaced), so re-encoding `content` after the fact and counting *that* would report a
+    number that never actually crossed the network. `internals/payload.py`'s
+    `serialize_payload` writes this value out as the payload's `bytes` field for exactly this
+    reason — it is the honest answer to "how large was this page," not a derived
+    approximation of it."""
+
 
 @dataclass(frozen=True, slots=True)
 class CrawlOutcome:
-    """What `CrawlService.execute_run` (a later phase of this ticket) hands back to the
-    worker job: an artifact plus the numbers the run's `stats` column stores.
+    """What `CrawlService.execute_run` hands back to the worker job once a run has already
+    been persisted: the artifact, the numbers `runs.stats` stores, and where the raw payload
+    landed in Storage.
 
-    Deliberately does not persist anything itself — writing `llms_txt` and flipping a run
-    to `completed` is a separate write path, added alongside the service that produces
-    this.
+    **No longer "deliberately does not persist anything itself."** An earlier revision of
+    this docstring said exactly that, because at the time `execute_run` stopped short of
+    writing anything and left the row `processing` for a later ticket. That ticket is this
+    one: by the time a `CrawlOutcome` exists, the payload has already been uploaded to
+    Supabase Storage and the `runs` row has already been committed as `completed` — see
+    `app.features.crawl.service`'s module docstring for the upload-then-write ordering. This
+    dataclass is now a report of what already happened, returned so `app.worker.jobs.
+    crawl_task` has something to log, not an instruction for something still to do.
     """
 
     llms_txt: str
-    """The generated artifact — `generate_llms_txt(pages)`'s return value, unmodified."""
+    """The generated artifact — `generate_llms_txt(pages)`'s return value, unmodified. The
+    same value already written to `runs.llms_txt`."""
 
     stats: dict[str, Any]
-    """The same shape `runs.stats` stores as jsonb: `pages_crawled`, `pages_failed`,
-    `bytes_fetched`, `duration_ms`, and `cap_hit`. Typed loosely (`dict[str, Any]`) to
-    match `app.features.runs.schemas.RunListItemResponse.stats`, which reads this same
-    column back out with the same justification — the shape belongs to this feature, which
-    is why it is built here rather than validated against a model owned by `runs`."""
+    """The same shape `runs.stats` stores as jsonb — built by `internals/run_stats.py`'s
+    `build_run_stats`: `pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`,
+    `cap_hit`, `links_emitted`, and `version`. Typed loosely (`dict[str, Any]`) to match
+    `app.features.runs.schemas.RunListItemResponse.stats`, which reads this same column back
+    out with the same justification — the shape belongs to this feature, which is why it is
+    built here rather than validated against a model owned by `runs`."""
+
+    storage_path: str
+    """The bucket-qualified path the payload landed at, e.g.
+    `crawl-payloads/{website_id}/{run_id}.jsonl.gz` — `SupabaseStorage.upload`'s return
+    value, and the same value already written to `runs.storage_path`."""

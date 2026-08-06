@@ -75,18 +75,18 @@ async def noop(ctx: dict[Any, Any]) -> str:
 async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
     """Crawl the website behind `run_id`. Thin by contract — see the module docstring.
 
-    `ctx["db_pool"]` and `ctx["http_client"]` are both published once per process by
-    `app/worker/settings.py`'s `open_worker_resources`, the same pattern `noop` documents
-    for `ctx["db_pool"]` alone. This job builds a fresh `CrawlService` from them on every
-    call — the service itself is cheap to construct (see `build_crawl_service`) — rather
-    than caching one on `ctx`, so a service's dependencies are exactly what
+    `ctx["db_pool"]`, `ctx["http_client"]`, and `ctx["storage"]` are all published once per
+    process by `app/worker/settings.py`'s `open_worker_resources`, the same pattern `noop`
+    documents for `ctx["db_pool"]` alone. This job builds a fresh `CrawlService` from them on
+    every call — the service itself is cheap to construct (see `build_crawl_service`) —
+    rather than caching one on `ctx`, so a service's dependencies are exactly what
     `app.features.crawl.service.build_crawl_service`'s signature says they are, with
     nothing smuggled in through job-to-job state.
 
     Args:
-        ctx: arq's job context. Must already carry `"db_pool"` and `"http_client"` —
-            true for any job this `WorkerSettings` runs, and never true in a plain unit
-            test constructing this function's arguments by hand.
+        ctx: arq's job context. Must already carry `"db_pool"`, `"http_client"`, and
+            `"storage"` — true for any job this `WorkerSettings` runs, and never true in a
+            plain unit test constructing this function's arguments by hand.
         run_id: The run to crawl, as arq's msgpack serialization actually delivers it — see
             the module docstring for why that is a `str` rather than a `UUID` in practice,
             and why the parameter still accepts either.
@@ -94,10 +94,11 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
     Returns:
         A short, human-readable outcome string for arq's job result — never anything a
         caller is expected to parse. Never raises for an application-level failure: a bad
-        `run_id`, a missing run, a lost claim race, and a failed crawl are all logged and
-        returned, matching `CrawlService.execute_run`'s own "never raise HTTPException at
-        arq" contract. `asyncio.CancelledError` (arq's job timeout, or SIGTERM) is not
-        caught here either, for the same reason `execute_run` does not catch it.
+        `run_id`, a missing run, a lost claim race, and a failed crawl (including a failed
+        Storage upload or database write) are all logged and returned, matching
+        `CrawlService.execute_run`'s own "never raise HTTPException at arq" contract.
+        `asyncio.CancelledError` (arq's job timeout, or SIGTERM) is not caught here either,
+        for the same reason `execute_run` does not catch it.
     """
     try:
         parsed_run_id = UUID(str(run_id))
@@ -105,7 +106,7 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
         logger.error("crawl_task: %r is not a valid run id; skipping", run_id)
         return "invalid run id"
 
-    service = build_crawl_service(ctx["db_pool"], ctx["http_client"], settings)
+    service = build_crawl_service(ctx["db_pool"], ctx["http_client"], ctx["storage"], settings)
     outcome = await service.execute_run(parsed_run_id)
 
     if outcome is None:
@@ -116,8 +117,9 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
         return "no outcome"
 
     logger.info(
-        "crawl_task: run %s fetched %d page(s)",
+        "crawl_task: run %s fetched %d page(s), storage_path=%s",
         parsed_run_id,
         outcome.stats.get("pages_crawled", 0),
+        outcome.storage_path,
     )
     return "ok"
