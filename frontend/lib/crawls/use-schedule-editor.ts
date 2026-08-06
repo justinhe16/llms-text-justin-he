@@ -121,9 +121,29 @@ export function useScheduleEditor({
   // change made while a request is in flight starts a second one.
   const latestSentBody = useRef<UpsertScheduleRequest | null>(null);
 
-  // A change that has been drafted but whose timer has not fired yet. Held in a ref purely so
-  // the unmount effect below can see it without re-subscribing on every keystroke.
+  // A change that has been drafted but whose timer has not fired yet. Read by the unmount
+  // effect below, and by `settlesLatestIntent` — a queued edit is the reason a response can
+  // arrive while the draft on screen is still ahead of the server.
   const unsentBody = useRef<UpsertScheduleRequest | null>(null);
+
+  // Whether a settling response represents the user's CURRENT intent, and may therefore
+  // clear the draft.
+  //
+  // Matching `latestSentBody` alone is not enough, and the gap is the whole reason this
+  // helper exists. A response can be the newest thing *sent* while a newer edit is already
+  // drafted and waiting on its timer — that edit lives in `unsentBody`, not in
+  // `latestSentBody`. Clearing the draft then sets `draft` to `null`, the debounce effect
+  // early-returns on the next render, and its cleanup tears down the pending `setTimeout`
+  // before it ever fires: the queued edit is silently dropped and the server keeps the older
+  // value, with the panel showing that older value as though it were what the user chose.
+  //
+  // The window is ordinary, not exotic — it is open for the whole debounce interval, so any
+  // "pick an option, then pick another a moment later" lands in it whenever the first
+  // response comes back inside 500ms, which is the normal case against a local or healthy
+  // backend. Requiring `unsentBody` to be empty keeps the draft alive until the edit it
+  // represents has actually been sent and answered.
+  const settlesLatestIntent = (body: UpsertScheduleRequest) =>
+    sameBody(body, latestSentBody.current) && unsentBody.current === null;
 
   const { mutate, isPending } = usePutSchedule({
     onSuccess: (_data, variables) => {
@@ -131,14 +151,14 @@ export function useScheduleEditor({
       // `serverValue` is about to equal what this draft was asking for. Dropping the draft
       // here rather than diffing avoids the panel getting stuck showing a draft forever if
       // the server ever answers with something other than what was sent.
-      if (sameBody(variables.body, latestSentBody.current)) setDraft(null);
+      if (settlesLatestIntent(variables.body)) setDraft(null);
     },
     onError: (_error, variables) => {
       // The toast is already handled inside `usePutSchedule` from `ApiError.message`, so a
       // non-owner's `403` reads as the backend's own wording. All that is left here is the
       // revert: drop the draft and the server's last known state shows through again, which
       // is the ticket's "never show a setting that didn't persist".
-      if (sameBody(variables.body, latestSentBody.current)) setDraft(null);
+      if (settlesLatestIntent(variables.body)) setDraft(null);
     },
   });
 
