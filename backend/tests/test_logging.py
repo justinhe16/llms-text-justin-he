@@ -367,6 +367,21 @@ _A_JWT = (
         ("a service key assignment", "SUPABASE_SECRET_KEY=sb_secret_9Xq2LmNp7Rt4Vw8Zc1Bd"),
         ("a bare provider key", "uploading with sb_secret_9Xq2LmNp7Rt4Vw8Zc1Bd"),
         ("an api key kwarg", 'api_key="9Xq2LmNp7Rt4Vw8Zc1Bd"'),
+        # RFC 3986 ends the userinfo at the LAST `@` in the authority, so a password with a
+        # literal `@` in it — legal, and easy to end up with in a hand-set local Redis
+        # password — is the case a first-`@` match half-redacts and calls done. Caught in
+        # review; see rule 3's comment for why its password class deliberately spans `@`.
+        (
+            "a password containing an @",
+            "rediss://default:AX8sAA@IjcDE@eu1.upstash.io:6379",
+        ),
+        (
+            "a Postgres password containing an @, with a path after it",
+            "postgresql://postgres:s3cr3t@p4ss@db.example.co:5432/postgres",
+        ),
+        # Every one of these prefixes starts with a word character, so a `\b` in rule 5
+        # would refuse to match a key concatenated straight onto a preceding word.
+        ("a provider key glued to a preceding word", "keysb_secret_9Xq2LmNp7Rt4Vw8Zc1Bd"),
     ],
 )
 def test_the_redaction_filter_scrubs_credential_shaped_values(secret: str, text: str) -> None:
@@ -375,10 +390,15 @@ def test_the_redaction_filter_scrubs_credential_shaped_values(secret: str, text:
     scrubbed = redact(text)
 
     assert REDACTED in scrubbed, secret
+    # Every distinguishing fragment of every secret above, checked against every case —
+    # including the TAILS (`IjcDE`, `p4ss`) that a rule stopping at the first `@` of an
+    # authority would leave behind while still reporting a redaction it did not finish.
     for fragment in (
         _A_JWT,
         "s3cr3t-p4ss",
         "AX8sAAIjcDE",
+        "IjcDE",
+        "p4ss",
         "9Xq2LmNp7Rt4Vw8Zc1Bd",
         "abcdef0123456789",
     ):

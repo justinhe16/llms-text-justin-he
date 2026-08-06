@@ -175,8 +175,18 @@ _REDACTIONS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     #    `rediss://default:pw@host`. The username is kept — it is not the secret, and
     #    losing it would make a misconfigured DSN much harder to recognise — and only the
     #    password is rewritten. DATABASE_URL and REDIS_URL are the two this exists for.
+    #
+    #    The password class is `[^\s/?#]+` — deliberately INCLUDING `@`, and greedy. RFC
+    #    3986 ends the userinfo at the LAST `@` in the authority, so a password containing
+    #    a literal `@` (legal, and what a hand-set local Redis password can easily look
+    #    like) is only fully covered by a class that can cross one: excluding `@` here would
+    #    stop at the first, redact the front half, and leave the rest of the real password
+    #    in the line. Greediness is what picks the last `@` rather than the first — the
+    #    engine backtracks from the end of the authority to the furthest `@` that still has
+    #    a host after it. Excluding `/?#` is what keeps it from running past the authority
+    #    into a path or query that happens to contain an `@`.
     (
-        re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s:/?#@]*):([^\s@/]+)@"),
+        re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s:/?#@]*):([^\s/?#]+)@"),
         rf"\g<1>\g<2>:{REDACTED}@",
     ),
     # 4a. A named credential assigned a QUOTED value, in a dict repr, JSON fragment, or
@@ -208,9 +218,16 @@ _REDACTIONS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     # 5. Opaque provider keys, which match none of the shapes above because they are just
     #    a prefix and a long random tail: Supabase publishable/secret keys and personal
     #    access tokens, Fly deploy tokens, GitHub tokens.
+    #
+    #    No leading `\b`, for the same reason 4b has none: every one of these prefixes
+    #    begins with a word character, so a `\b` would refuse to match a key concatenated
+    #    straight onto a preceding word — `f"prefix{key}"` is an ordinary enough mistake to
+    #    make, and it is exactly the mistake this rule exists to survive. Matching a prefix
+    #    mid-word costs nothing: the only thing on the other side of it is a value that
+    #    looks like a provider key, which is a thing to redact wherever it appears.
     (
         re.compile(
-            r"\b(?:sb_secret_|sb_publishable_|sbp_|fo1_|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]{8,}"
+            r"(?:sb_secret_|sb_publishable_|sbp_|fo1_|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]{8,}"
         ),
         REDACTED,
     ),

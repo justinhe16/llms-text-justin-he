@@ -24,6 +24,16 @@ buffers streaming responses. Implementing `__call__(scope, receive, send)` direc
 both: the downstream app is awaited in this same task, so a contextvar it sets is still
 set when the await returns.
 
+That last sentence rests on two things that are true of the versions pinned in
+`backend/requirements.txt` and are not documented public contracts of either library:
+Starlette's HTTP path spawns no task around the endpoint, and FastAPI resolves a request's
+dependencies **sequentially** rather than concurrently. A future FastAPI that solved
+independent sub-dependencies in parallel would hand each one a context of its own, and
+`user_id` would silently stop arriving here.
+`tests/test_request_context.py::test_the_summary_line_names_the_authenticated_user` is the
+tripwire: it drives the real dependency through a real request, so the upgrade that breaks
+this fails CI instead of quietly dropping a field.
+
 **Nothing here reads the `Authorization` header.** `user_id` arrives through
 `app.core.logging.bind_user_id`, called by `app.core.auth.dependencies` once a token has
 actually verified — so what reaches a log line is a user id, never a credential
