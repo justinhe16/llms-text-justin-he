@@ -64,22 +64,33 @@ export function useOpenCrawl(): (websiteId: string) => void {
  * that scrolls the page instead of doing the obvious thing is a small, constant annoyance.
  * Both are gated on `event.target === event.currentTarget` so that a keystroke aimed at
  * something inside the row is never stolen by the row.
+ *
+ * The parameters are named `activate`/`id` rather than `open`/`websiteId` because two
+ * different tables now use this for two different actions: the /crawls table navigates to a
+ * website's detail page (`useOpenCrawl` above), and that detail page's own Runs tab selects
+ * a run and switches to the Output tab. What both need here is identical — the
+ * interactive-child guard and the keyboard contract — and neither is about navigation
+ * specifically.
+ *
+ * The Runs tab is also why `cameFromInteractiveChild` matters more than it first appears:
+ * its failed rows carry an expander button, and without the guard every attempt to read a
+ * run's error would also leave the tab.
  */
 export function rowActivationProps(
-  open: (websiteId: string) => void,
-  websiteId: string
+  activate: (id: string) => void,
+  id: string
 ): RowActivationProps {
   return {
     tabIndex: 0,
     onClick: (event) => {
       if (cameFromInteractiveChild(event)) return;
-      open(websiteId);
+      activate(id);
     },
     onKeyDown: (event) => {
       if (event.target !== event.currentTarget) return;
       if (event.key !== "Enter" && event.key !== " ") return;
       event.preventDefault();
-      open(websiteId);
+      activate(id);
     },
   };
 }

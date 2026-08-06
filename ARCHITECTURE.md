@@ -751,6 +751,15 @@ generated `paths` type, and every feature-level helper (`frontend/lib/api/websit
 `components["schemas"][...]`. Calling a path that does not exist, or getting a parameter or a
 body wrong, is a `tsc` error, not a runtime one.
 
+One maintenance note on that client, because it fails quietly rather than loudly. It resolves
+an operation's response type by looking up the 2xx status the operation declares, against a
+fixed `SuccessStatus = 200 | 201 | 202 | 204` union in `fetcher.ts`. A backend endpoint
+returning a 2xx that is *not* in that union resolves to `never` — and because `never` is
+assignable to everything, a helper declaring its own return type still compiles while the
+client's inferred type says the call returns nothing. `202` had to be added when PER-160's
+`POST /websites/{id}/runs` landed, for exactly that reason. Any future 2xx needs the same
+one-line entry.
+
 **The drift check has two halves, enforced separately.** `scripts/export-openapi.sh --check`
 (run in `ci-backend.yml`'s `lint` job, and by `make lint`) re-exports the live schema from
 `app.openapi()` and diffs it against the committed `openapi.json` — this is what catches a
@@ -771,6 +780,18 @@ schedule is 1:1 with a website and has no independent id anywhere in the API sur
 `websiteId` alone is both the scope and the whole key, unlike `runs`, which is genuinely a
 collection per website.
 
+`runs` carries two further keys, both added for the detail page. `.infinite(websiteId,
+filters?)` is the same list read through `useInfiniteQuery` rather than `useQuery`
+(`frontend/lib/query/use-runs-infinite.ts`, the Runs tab's "Load more"); it is a separate key
+from `.list` because the two cache genuinely different shapes — an infinite query stores
+`{ pages, pageParams }` where a plain one stores a bare `Page[RunListItemResponse]` — and its
+`filters` are `RunListOptions` **minus** `cursor`, since in an infinite query the cursor is
+the page parameter rather than part of the key. `.forWebsite(websiteId)` is a prefix of both
+and is never fetched with: it exists so `useTriggerRun` can invalidate every cached page and
+filter variant of one website's history in a single call. That is deliberately narrower than
+`runs.all`, which would also drop every `runs.detail` entry — including the `llms_txt` the
+Output tab may be displaying for a run that certainly did not change.
+
 **Polling.** A query polls only while something in its data is still in progress, at
 `ACTIVE_POLL_INTERVAL_MS` (3 seconds), and stops the moment it isn't —
 `frontend/lib/query/polling.ts`'s `pollWhileActive` builds a `refetchInterval` callback from
@@ -781,8 +802,21 @@ place, and three call sites currently build a `pollWhileActive` predicate on top
 per response shape that carries a status: `anyWebsiteHasActiveRun` for the websites list
 (`useWebsites`, `GET /websites?include=latest_run`), `anyRunActive` for a website's run
 history (`useRuns`, `GET /websites/{id}/runs`), and `runIsActive` for a single run's own
-detail (`useRun`, `GET /runs/{id}`). A fourth call site means a fourth thin fold over
-`isActiveRunStatus`, never a fresh string comparison. Polling also pauses on a hidden tab
+detail (`useRun`, `GET /runs/{id}`). A fourth has since landed and follows the same rule
+rather than bending it: `anyRunActiveInPages` (`frontend/lib/query/use-runs-infinite.ts`) is
+`anyRunActive` folded over an `InfiniteData`'s pages, so the accumulating Runs tab shares the
+one definition of "still running" with everything else. It lives in `lib/query/` rather than
+beside its three siblings in `lib/api/run-status.ts` because `InfiniteData` is a React Query
+type and the `lib/api/` layer describes the backend's shapes without knowing what this app
+caches them in. A fifth call site means a fifth thin fold over `isActiveRunStatus`, never a
+fresh string comparison.
+
+Supporting that fourth fold, `pollWhileActive` takes two type parameters —
+`pollWhileActive<TQueryFnData, TData = TQueryFnData>`. They are the same type for an ordinary
+`useQuery`, which is why the default exists and why no plain call site passes either. They
+come apart only for an infinite query, which fetches one page but caches all of them, and
+React Query types `refetchInterval`'s argument over both; without the split, an infinite
+query could not use this helper at all and would have had to inline its own interval. Polling also pauses on a hidden tab
 (`refetchIntervalInBackground: false`, set as a `QueryClient` default in `app/providers.tsx`
 rather than trusted to every `useQuery` call) — a run that takes ten minutes should not poll
 a tab nobody is looking at roughly 200 times. `useWebsite` (`GET /websites/{id}`, a single

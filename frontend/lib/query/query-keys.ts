@@ -42,6 +42,37 @@ const runs = {
   list: (websiteId: string, options?: RunListOptions) =>
     ["runs", "list", websiteId, options] as const,
 
+  // A *prefix* of both `list` and `infinite` below, and the only key here that is not
+  // fetched with — it exists purely to be invalidated. React Query matches queries by key
+  // prefix, so `invalidateQueries({ queryKey: queryKeys.runs.forWebsite(id) })` catches
+  // every cached page and every filter variant of one website's history in a single call,
+  // without touching another website's or any run's detail entry.
+  //
+  // The alternative, `runs.all`, is the reason this exists: it is correct but far too
+  // coarse for the one caller that needs this (lib/query/use-trigger-run.ts). Triggering a
+  // run on website A has no bearing whatsoever on website B's history, and invalidating
+  // `["runs"]` would refetch every run list *and* every `runs.detail` entry currently
+  // mounted — including the multi-thousand-line `llms_txt` the Output tab is displaying,
+  // for a run that certainly did not change.
+  forWebsite: (websiteId: string) => ["runs", "list", websiteId] as const,
+
+  // The same list as `list` above, read through `useInfiniteQuery` instead of `useQuery`
+  // (lib/query/use-runs-infinite.ts). It gets its own key rather than sharing `list`'s
+  // because the two cache genuinely different shapes under React Query: an infinite query
+  // stores `{ pages, pageParams }`, a plain one stores a bare `RunPage`, and a component
+  // reading one from a cache entry written by the other would crash rather than merely
+  // render something stale.
+  //
+  // `filters` is `RunListOptions` minus `cursor` — deliberately, and this is the whole
+  // point of the type below. In an infinite query the cursor is the *page parameter*, not
+  // part of the key: baking it in would give every "Load more" click its own cache entry
+  // again, which is exactly the accumulation problem `useInfiniteQuery` exists to solve.
+  // Spelled as an `Omit` of the real options type rather than a hand-written `{ status?,
+  // limit? }` so a fourth query parameter added to `RunListOptions` cannot quietly go
+  // missing from this key.
+  infinite: (websiteId: string, filters?: Omit<RunListOptions, "cursor">) =>
+    ["runs", "list", websiteId, "infinite", filters] as const,
+
   // One run's own detail (`GET /runs/{id}`) — independent of which website's history it was
   // reached from, since a run's id alone identifies it.
   detail: (id: string) => ["runs", "detail", id] as const,
