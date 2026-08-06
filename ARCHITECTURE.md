@@ -235,8 +235,10 @@ fails silently rather than loudly:
 
 Startup and shutdown hooks (`on_startup`/`on_shutdown`) open and close the asyncpg pool with
 **the same factory the API's lifespan uses**, and publish shared resources on arq's context
-dict so jobs build them once per process rather than once per job. That is where the crawl
-task's `httpx.AsyncClient` goes.
+dict so jobs build them once per process rather than once per job. The crawl task's shared
+`httpx.AsyncClient` (`ctx["http_client"]`, built once by
+`app.features.crawl.http_client.build_crawl_client` and closed on shutdown) is exactly that
+pattern in use, not merely anticipated by it.
 
 ### 3.4 The crawler seam
 
@@ -244,13 +246,30 @@ Real crawling and extraction logic is **out of scope for this milestone** and ha
 designed yet. Until it is, everything downstream of a fetched page sits behind one function:
 
 ```python
-def generate_llms_txt(pages: list[Page]) -> str:
+def generate_llms_txt(pages: list[CrawledPage]) -> str:
     ...
 ```
+
+`CrawledPage`, not `Page`: `app.core.pagination.Page` already names the generic pagination
+envelope returned by `GET /websites/{id}/runs`, and a second, unrelated `Page` in the same
+codebase is an import collision waiting to happen. The rename changes nothing about the
+seam's shape — one argument, a list of fetched pages, returns `str` — only the element
+type's name.
 
 Build against that signature. Do not scatter crawling, parsing, or LLM-calling logic
 through the services in anticipation of a design that does not exist yet, and do not widen
 the signature without a ticket that redesigns this seam.
+
+**The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
+which owns no table and therefore holds no reader/writer pair — a feature with private,
+table-free I/O to do may keep it in `internals/` anyway, as this one keeps `ssrf.py`,
+`fetcher.py`, and `crawler.py`. Every fetch, seed or redirect, passes `internals/ssrf.py`'s
+SSRF guard before a socket opens, and the crawl loop (`internals/crawler.py`) runs under six
+hard caps read from `Settings` — page count, wall-clock budget, total response bytes,
+per-request timeout, concurrency, and a politeness delay between request starts. Hitting one
+of those caps ends the crawl with whatever pages it already collected and is a **success**,
+not a failure; only the seed itself failing to fetch is treated as one, because a run with no
+pages at all has nothing to build an artifact from.
 
 ### 3.5 The database infrastructure layer
 

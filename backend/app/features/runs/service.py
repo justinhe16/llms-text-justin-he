@@ -1,17 +1,22 @@
-"""Business logic for the runs feature. No writer, and no transaction anywhere in this file.
+"""Business logic for the runs feature.
 
-This feature has no `internals/runs_writer.py`, and no call to `transaction()`
-(`app.infrastructure.db.transaction`, ARCHITECTURE.md §5). Nothing in PER-155 mutates
-`runs` — both endpoints are reads — so there is nothing here for a unit of work to protect.
-If a later ticket adds a write (recording a crawl's result is the likely first one), it adds
-`internals/runs_writer.py` and a `transaction()` call beside these methods; it does not
-retrofit one into `list_runs` or `get_run`.
+`internals/runs_writer.py` holds the feature's two writes: `claim_for_processing` below
+opens one `transaction(self._pool)` around `RunsWriter.claim_pending` — the atomic
+`pending -> processing` guard `app.features.crawl.service.CrawlService.execute_run` uses
+before it ever fetches a byte — and `record_failure` opens a second, independent
+`transaction()` around `RunsWriter.mark_failed` for the case where a crawl never produces an
+artifact. Both are the only writes this feature has; `list_runs` and `get_run` remain reads
+with no transaction of their own.
 
 **Reads are unscoped, the same rule `websites/service.py` follows.** `list_runs` and
 `get_run` never look at who is asking — `CurrentUserId` is threaded through
 `app.api.routers.runs` purely to require a token (ARCHITECTURE.md §4.1). There is no
-`require_owner` call anywhere in this file, and there should never be one: ownership only
-matters on a write path, and this feature has none.
+`require_owner` call anywhere in this file, and there should never be one — not even beside
+the two write methods. `require_owner` (ARCHITECTURE.md §4.2) checks an HTTP caller against
+a resource's owner; `claim_for_processing` and `record_failure` are called from
+`app.worker.jobs.crawl_task`, a background job acting on its own behalf, with no caller and
+therefore no owner to compare against. Ownership on this feature's writes is a question that
+does not arise, not one this file forgot to ask.
 
 **`RunService` depends on `WebsiteService`, never on `WebsitesReader`.** `list_runs` has to
 404 on an unknown website before "that website's runs" means anything, and
@@ -42,8 +47,10 @@ from fastapi import HTTPException, status
 from app.core.pagination import Page
 from app.features.runs.internals.run_cursor import RunCursor, encode_cursor
 from app.features.runs.internals.runs_reader import RunsReader
+from app.features.runs.internals.runs_writer import RunsWriter
 from app.features.runs.schemas import RunDetailResponse, RunListItemResponse, RunStatusName
 from app.features.websites.service import WebsiteService
+from app.infrastructure.db.transaction import transaction
 
 
 _NOT_FOUND_DETAIL = "No run with that id"
@@ -199,3 +206,33 @@ class RunService:
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND_DETAIL)
         return _to_detail(row)
+
+    async def claim_for_processing(self, run_id: UUID) -> bool:
+        """Atomically flip `run_id` from `pending` to `processing`, or refuse to.
+
+        The correctness guard `app.features.crawl.service.CrawlService.execute_run` relies
+        on before it fetches a single byte: `arq`'s `MAX_JOBS = 2`
+        (`app/worker/settings.py`) makes concurrent delivery of the same job a real
+        scenario, and only a single, atomic conditional `UPDATE` — never a `SELECT` followed
+        by an `UPDATE` — can guarantee that at most one caller ever sees `True` for a given
+        `run_id`.
+
+        Returns:
+            `True` if this call won the race and the row is now `processing`; `False` if it
+            was not `pending` — already claimed, already terminal, or nonexistent. The
+            caller treats every `False` the same way: do not crawl.
+        """
+        async with transaction(self._pool) as tx:
+            return await RunsWriter(tx).claim_pending(run_id)
+
+    async def record_failure(self, run_id: UUID, error: str) -> None:
+        """Record a run's terminal failure.
+
+        `error` must already be sanitized by the caller
+        (`app.features.crawl.service.CrawlService`'s "Sanitizing" note) — this method does
+        not inspect, truncate, or otherwise second-guess it, because `runs.error` is
+        readable by every signed-in user (ARCHITECTURE.md §4.1) and this feature has no way
+        to tell a safe message from an unsafe one after the fact.
+        """
+        async with transaction(self._pool) as tx:
+            await RunsWriter(tx).mark_failed(run_id, error)

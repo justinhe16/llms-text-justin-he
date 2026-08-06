@@ -14,6 +14,7 @@ validation error below names missing variables and nothing else.
 
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -59,6 +60,32 @@ class Settings(BaseSettings):
     db_pool_min_size: int = 2
     db_pool_max_size: int = 10
     db_command_timeout: float = 30.0
+
+    # Crawl hard caps (app.features.crawl). Hitting one of these is a SUCCESS, not a
+    # failure: the crawl returns whatever pages it collected before the cap tripped, and
+    # `runs.stats` records which cap (if any) stopped it. These are ordinary `Settings`
+    # fields, unlike `worker/settings.py`'s POLL_DELAY_SECONDS/MAX_JOBS, which are
+    # deliberately kept off `Settings` for arq-specific reasons documented there — there is
+    # no equivalent reason to hide these, and everything else the crawler needs to know is
+    # configured the same way.
+    crawl_max_pages: int = Field(default=100, ge=1)
+
+    # The crawl's OWN wall-clock budget — but not the number that actually lands first in
+    # a deployed worker. `WorkerSettings.job_timeout` (app/worker/settings.py) is 180s, and
+    # arq cancels the whole job at that mark regardless of what this field says, so a
+    # 300-second crawl budget here is an outer bound that a crawl running inside arq will
+    # rarely reach on its own terms — `asyncio.CancelledError` from arq's own timeout lands
+    # first. Do not "fix" that by raising `job_timeout`: it is ordered against
+    # `job_completion_wait` (200s) and fly.toml's `kill_timeout` (240s), and
+    # tests/test_worker_settings.py asserts that ladder. `CancelledError` is deliberately
+    # never caught by the crawl service — the stuck-run reaper (a later, reliability
+    # ticket) is what notices a run arq cut off mid-flight, not this field.
+    crawl_max_wall_clock_s: float = Field(default=300.0, gt=0)
+
+    crawl_max_bytes: int = Field(default=52_428_800, ge=1)  # 50 MiB across the whole run
+    crawl_request_timeout_s: float = Field(default=10.0, gt=0)
+    crawl_concurrency: int = Field(default=5, ge=1)
+    crawl_politeness_delay_ms: int = Field(default=200, ge=0)
 
     def validate_required_secrets(self) -> None:
         """Fail loudly if any required variable is unset, naming every one of them.

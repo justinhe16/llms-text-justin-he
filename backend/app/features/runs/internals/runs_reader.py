@@ -1,5 +1,8 @@
-"""Every `SELECT` for the runs feature. No writes — this ticket has none at all: there is no
-`runs_writer.py` beside this file, because nothing in PER-155 mutates `runs`.
+"""Every `SELECT` for the runs feature. `internals/runs_writer.py`, beside this file, holds
+the feature's two writes — the atomic `pending -> processing` claim and the terminal-failure
+record the crawl feature's worker job needs — added once something in this codebase finally
+mutated `runs`. Nothing below this docstring changed to make room for it: every query here
+remains a plain `SELECT`, and the reader still knows nothing about `runs_writer.py`.
 
 **READS IN THIS FILE ARE INTENTIONALLY NOT SCOPED TO THE CALLER.** Same rule as
 `websites_reader.py` (ARCHITECTURE.md §4.1): `list_by_website` returns a website's runs to

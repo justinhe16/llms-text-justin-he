@@ -66,9 +66,13 @@ must never be prefixed `NEXT_PUBLIC_`.
 downstream of a fetched page stays behind one seam:
 
 ```python
-def generate_llms_txt(pages: list[Page]) -> str:
+def generate_llms_txt(pages: list[CrawledPage]) -> str:
     ...
 ```
+
+It lives in `backend/app/features/crawl/internals/llms_txt.py`, and it is a stub returning
+deterministic placeholder output. `CrawledPage`, not `Page` — `app.core.pagination.Page` is
+already taken (ARCHITECTURE.md §3.4).
 
 Build against that signature. Do not scatter crawling, parsing, or LLM-calling logic through
 the services in anticipation of a design that does not exist yet.
