@@ -1,9 +1,13 @@
-"""Every `SELECT` for the runs feature. PER-160 adds this feature's first writer
-(`runs_writer.py`, beside this file) and its first write path,
-`POST /websites/{id}/runs` — the three queries at the bottom of this module belong to that
-path, even though every one of them is a `SELECT`: the duplicate-run guard and both abuse
-caps are read-then-decide checks the service runs before it opens a transaction, not writes
-in their own right.
+"""Every `SELECT` for the runs feature. `internals/runs_writer.py`, beside this file, holds
+every write: the manual-trigger insert behind `POST /websites/{id}/runs`, plus the atomic
+`pending -> processing` claim and the terminal-failure record the crawl feature's worker job
+needs.
+
+Nothing below this docstring changed to make room for any of them — every query here is
+still a plain `SELECT`, and this reader knows nothing about `runs_writer.py`. The three
+queries at the bottom of this module do belong to the manual-trigger path even though all
+three are `SELECT`s: the duplicate-run guard and both abuse caps are read-then-decide checks
+the service runs before it opens a transaction, not writes in their own right.
 
 **READS IN THIS FILE ARE INTENTIONALLY NOT SCOPED TO THE CALLER — WITH ONE NAMED EXCEPTION.**
 Same rule as `websites_reader.py` (ARCHITECTURE.md §4.1): `list_by_website` returns a

@@ -1,21 +1,37 @@
-"""Business logic for the runs feature: two unscoped reads, and — new in PER-160 — this
-feature's first write, `POST /websites/{id}/runs` (`RunService.trigger_run`).
+"""Business logic for the runs feature: three unscoped reads, and writes reached from two
+completely different directions.
 
-**This feature now has a writer, and a transaction.** `internals/runs_writer.py` exists, and
-`RunService.trigger_run` opens one `transaction()` call (`app.infrastructure.db.transaction`,
-ARCHITECTURE.md §5). That was not true before PER-160 — an earlier revision of this docstring
-said "no writer, and no transaction anywhere in this file," and predicted that whichever
-ticket added the first write "adds `internals/runs_writer.py` and a `transaction()` call
-beside these methods; it does not retrofit one into `list_runs` or `get_run`." That is exactly
-what happened: `list_runs` and `get_run` are unchanged, and everything new lives in
-`trigger_run` and the private helpers beside it.
+**This feature has a writer, and transactions.** `internals/runs_writer.py` exists, and
+three methods here open a `transaction()` (`app.infrastructure.db.transaction`,
+ARCHITECTURE.md §5). An earlier revision of this docstring said "no writer, and no
+transaction anywhere in this file," and predicted that whichever ticket added the first write
+"adds `internals/runs_writer.py` and a `transaction()` call beside these methods; it does not
+retrofit one into `list_runs` or `get_run`." That is exactly what happened, twice over:
 
-**Reads are still unscoped, the same rule `websites/service.py` follows.** `list_runs`,
-`get_run`, and `get_website_stats` never look at who is asking — `CurrentUserId` is threaded
-through `app.api.routers.runs` purely to require a token (ARCHITECTURE.md §4.1).
-`require_owner` appears in this file for the first time in PER-160, but only inside
-`trigger_run`, because that is the one method here that writes; there is still no ownership
-check on any of the three reads, and there should never be one.
+* `trigger_run` — the HTTP write behind `POST /websites/{id}/runs`, with its abuse caps and
+  duplicate-run guard in the private helpers beside it.
+* `claim_for_processing` and `record_failure` — the worker's pair, called from
+  `app.worker.jobs.crawl_task` by way of `app.features.crawl.service.CrawlService`. The
+  first wraps `RunsWriter.claim_pending`, the atomic `pending -> processing` guard the crawl
+  takes before it fetches a single byte; the second wraps
+  `RunsWriter.mark_processing_failed`, for a crawl that never produces an artifact. They are
+  two independent transactions on purpose — the crawl itself happens BETWEEN them, and a
+  network call must never run inside a transaction (ARCHITECTURE.md §5.1).
+
+`list_runs`, `get_run`, and `get_website_stats` are unchanged by any of it, and open no
+transaction of their own.
+
+**Reads are still unscoped, the same rule `websites/service.py` follows.** None of the three
+ever looks at who is asking — `CurrentUserId` is threaded through `app.api.routers.runs`
+purely to require a token (ARCHITECTURE.md §4.1).
+
+**`require_owner` appears exactly once, and its absence elsewhere is also deliberate.** It is
+called inside `trigger_run`, because that is the one method here reached by an HTTP caller
+who could fail to own the resource. It is *not* called by `claim_for_processing` or
+`record_failure`, and adding it there would be meaningless rather than safer:
+`require_owner` (ARCHITECTURE.md §4.2) compares a resource's owner to a caller, and a
+background job acting on its own behalf has no caller to compare against. Ownership on the
+worker's writes is a question that does not arise, not one this file forgot to ask.
 
 **`RunService` depends on `WebsiteService`, never on `WebsitesReader`.** `list_runs` and
 `trigger_run` both have to 404 on an unknown website before anything else about it means
@@ -597,3 +613,40 @@ class RunService:
         resolved = resolve_window(window, datetime.now(UTC))
         rows = await self._reader.website_stats(website_id, window=resolved)
         return _to_stats(resolved, rows)
+
+    async def claim_for_processing(self, run_id: UUID) -> bool:
+        """Atomically flip `run_id` from `pending` to `processing`, or refuse to.
+
+        The correctness guard `app.features.crawl.service.CrawlService.execute_run` relies
+        on before it fetches a single byte: `arq`'s `MAX_JOBS = 2`
+        (`app/worker/settings.py`) makes concurrent delivery of the same job a real
+        scenario, and only a single, atomic conditional `UPDATE` — never a `SELECT` followed
+        by an `UPDATE` — can guarantee that at most one caller ever sees `True` for a given
+        `run_id`.
+
+        Returns:
+            `True` if this call won the race and the row is now `processing`; `False` if it
+            was not `pending` — already claimed, already terminal, or nonexistent. The
+            caller treats every `False` the same way: do not crawl.
+        """
+        async with transaction(self._pool) as tx:
+            return await RunsWriter(tx).claim_pending(run_id)
+
+    async def record_failure(self, run_id: UUID, error: str) -> None:
+        """Record the terminal failure of a run this worker had already claimed.
+
+        Calls `RunsWriter.mark_processing_failed`, NOT `mark_failed`. The two are not
+        interchangeable: `mark_failed` is `trigger_run`'s enqueue-undo and matches only a
+        `pending` row, so using it here — after `claim_for_processing` has already moved the
+        run to `processing` — would silently update nothing and leave the run stuck. See
+        `internals/runs_writer.py`'s module docstring for why the two statements are
+        deliberately separate rather than one unguarded `UPDATE`.
+
+        `error` must already be sanitized by the caller
+        (`app.features.crawl.service.CrawlService`'s "Sanitizing" note) — this method does
+        not inspect, truncate, or otherwise second-guess it, because `runs.error` is
+        readable by every signed-in user (ARCHITECTURE.md §4.1) and this feature has no way
+        to tell a safe message from an unsafe one after the fact.
+        """
+        async with transaction(self._pool) as tx:
+            await RunsWriter(tx).mark_processing_failed(run_id, error)

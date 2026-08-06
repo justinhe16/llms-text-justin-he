@@ -18,9 +18,10 @@ from typing import Any
 
 from app.core.logging import configure_logging
 from app.core.settings import settings
+from app.features.crawl.http_client import build_crawl_client
 from app.infrastructure.db.pool import close_pool, open_pool
 from app.infrastructure.queue.pool import redis_settings_from_url
-from app.worker.jobs import noop
+from app.worker.jobs import crawl_task, noop
 
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,12 @@ async def open_worker_resources(ctx: dict[Any, Any]) -> None:
       a background job is a service call with a different trigger). In the API a service
       receives its pool through FastAPI dependency injection; there is no injector here,
       so `get_pool()` is the equivalent.
-    * `ctx["db_pool"]` is arq's own idiom, and it is the pattern the crawl task will follow
-      for every other resource it wants to build once instead of per job — an
-      `httpx.AsyncClient` above all. One place to add them, one place to close them.
+    * `ctx["db_pool"]` is arq's own idiom, and it is the pattern this function follows for
+      every other resource it wants to build once instead of per job. `ctx["http_client"]`,
+      added below, is the first of those: the crawl task's shared `httpx.AsyncClient`
+      (`app.features.crawl.http_client.build_crawl_client`), read by `crawl_task`
+      (`jobs.py`) on every call rather than opened fresh per job. One place to add them,
+      one place to close them.
 
     Errors are logged at CRITICAL and re-raised. arq's `Worker.run()` only swallows
     `CancelledError`, so re-raising exits the process with a traceback; the log line above
@@ -77,18 +81,26 @@ async def open_worker_resources(ctx: dict[Any, Any]) -> None:
             "HTTP to notice it. Check `fly logs --app llms-text-justin-he --process worker`."
         )
         raise
+    # After the pool, and unguarded: constructing an `httpx.AsyncClient` opens no socket
+    # and makes no network call (see `build_crawl_client`'s own docstring), so there is no
+    # way for this line to fail the way the pool open above can.
+    ctx["http_client"] = build_crawl_client(settings)
     logger.info("ARQ worker ready (poll_delay=%ss, max_jobs=%s)", POLL_DELAY_SECONDS, MAX_JOBS)
 
 
-async def close_worker_resources(_ctx: dict[Any, Any]) -> None:
-    """Close the Postgres pool.
+async def close_worker_resources(ctx: dict[Any, Any]) -> None:
+    """Close the shared `httpx.AsyncClient` and the Postgres pool.
 
     Called by `Worker.close()` after the in-flight jobs have finished or been cancelled,
     and before arq closes its own Redis connection. Safe if `on_startup` never got as far
-    as opening the pool: `close_pool()` is a no-op when there is nothing to close, which
-    matters because `Worker.run()`'s `finally` calls this even on a failed startup.
+    as opening either resource: `ctx.get("http_client")` is `None` and skipped, and
+    `close_pool()` is a no-op when there is nothing to close — both matter because
+    `Worker.run()`'s `finally` calls this even on a failed startup.
     """
     logger.info("ARQ worker shutting down")
+    http_client = ctx.get("http_client")
+    if http_client is not None:
+        await http_client.aclose()
     await close_pool()
 
 
@@ -155,15 +167,14 @@ class WorkerSettings:
     # in both environments and neither hardcodes the other's transport.
     redis_settings = redis_settings_from_url(settings.redis_url)
 
-    # The crawl task registers itself here in a later ticket.
-    #
-    # `noop` IS NOT A PLACEHOLDER TO DELETE WHEN IT DOES. `arq.worker.Worker.__init__`
-    # raises `RuntimeError('at least one function or cron_job must be registered')` on an
-    # empty list, so emptying this does not leave an idle worker — it leaves a worker that
-    # crashes before it opens a socket, restart-looping on Fly with no HTTP listener to
-    # fail a health check. It is also the probe that makes "enqueue -> picked up" an
-    # observable event rather than an assumption. See jobs.py.
-    functions = [noop]
+    # `noop` IS NOT A PLACEHOLDER, NOW THAT `crawl_task` HAS LANDED BESIDE IT.
+    # `arq.worker.Worker.__init__` raises `RuntimeError('at least one function or cron_job
+    # must be registered')` on an empty list, so emptying this list would not leave an idle
+    # worker — it would leave one that crashes before it opens a socket, restart-looping on
+    # Fly with no HTTP listener to fail a health check. `noop` is also the probe that makes
+    # "enqueue -> picked up" an observable event independent of whether a crawl itself
+    # succeeds. See jobs.py.
+    functions = [noop, crawl_task]
 
     # Named differently from the settings they land on, rather than the `on_startup =
     # on_startup` the arq README shows: inside a class body that reads as a self-
