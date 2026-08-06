@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -13,16 +13,19 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { RunListItem } from "@/lib/api/runs";
-import { formatAbsoluteTime, formatDuration, formatRelativeTime } from "@/lib/format/time";
-import { runPagesCrawled } from "@/lib/format/run";
+import { rowActivationProps } from "@/lib/crawls/row-activation";
+import { rowStatusFromRunStatus } from "@/lib/crawls/row-status";
+import { formatDuration, runPagesCrawled } from "@/lib/crawls/run-display";
 import { cn } from "@/lib/utils";
 
-import { RunStatusBadge } from "./run-status-indicator";
+import { CrawlsError } from "./crawls-error";
+import { EmptyCell } from "./empty-cell";
+import { RelativeTime } from "./relative-time";
+import { RunStatusIndicator } from "./run-status-indicator";
 
-/** The five columns, in order. `numeric` right-aligns a column and puts it in the tabular
- * figures the mono face provides, so page counts and durations line up on their digits. */
+/** The five columns, in order. `numeric` right-aligns a column and renders it in tabular
+ * figures, so page counts and durations line up on their digits down the table. */
 const COLUMNS = [
   { key: "started", label: "Started", numeric: false },
   { key: "trigger", label: "Trigger", numeric: false },
@@ -31,50 +34,54 @@ const COLUMNS = [
   { key: "duration", label: "Duration", numeric: true },
 ] as const;
 
-type RunsTabProps = {
+const SKELETON_ROW_COUNT = 5;
+
+interface RunsTabProps {
   runs: RunListItem[];
   isLoading: boolean;
-  isError: boolean;
   error: Error | null;
+  onRetry: () => void;
+  isRetrying: boolean;
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
   onLoadMore: () => void;
-  /** Row click — switches to the Output tab with this run selected. */
+  /** Row activation — switches to the Output tab with this run selected. */
   onSelectRun: (runId: string) => void;
-  /** Whether the current user may trigger a run, so the empty state can point at the right
-   * thing instead of at a button the reader cannot press. */
+  /** Whether the reader may trigger a run, so the empty state points at something they can
+   * actually do rather than at a button that is disabled for them. */
   canRun: boolean;
-};
+}
 
 /**
  * A website's run history.
  *
  * ## Two different clicks on one row
  *
- * The row itself opens the run in the Output tab. The chevron on a failed row expands its
- * error inline. Those are different intentions, so they are different targets: the chevron
- * is a real `<button>` that stops propagation, rather than the row doing one thing in one
- * region and another elsewhere.
+ * The row itself opens that run in the Output tab. The chevron on a failed row expands its
+ * error in place. Those are different intentions, so they are different targets — and the
+ * separation is enforced by `rowActivationProps` (lib/crawls/row-activation.ts, shared with
+ * the /crawls table), whose interactive-child guard is exactly what stops a click on the
+ * expander from also navigating.
  *
- * Errors expand rather than always showing because they can be long — a stack trace or a
- * fetch failure with a full URL in it — and a permanently expanded one would break the
+ * Errors expand rather than showing permanently because they can be long — a stack trace, or
+ * a fetch failure with a full URL in it — and one always-visible error would break the
  * table's rhythm for every row that has none.
  */
 export function RunsTab({
   runs,
   isLoading,
-  isError,
   error,
+  onRetry,
+  isRetrying,
   hasNextPage,
   isFetchingNextPage,
   onLoadMore,
   onSelectRun,
   canRun,
 }: RunsTabProps) {
-  // Which failed rows have their error open. A `Set` of ids, not an index or a single
-  // "expandedId": several errors can be open at once, and an index would attach the
-  // expansion to a *position* — which shifts under it the moment polling puts a new run at
-  // the top of the list.
+  // Which failed rows have their error open. A `Set` of run ids, not an index or a single
+  // "expandedId": several can be open at once, and an index would tie the expansion to a
+  // *position*, which shifts under it the moment polling puts a new run at the top.
   const [expandedRunIds, setExpandedRunIds] = useState<ReadonlySet<string>>(new Set());
 
   const toggleExpanded = (runId: string) => {
@@ -85,21 +92,38 @@ export function RunsTab({
     });
   };
 
-  if (isLoading) return <RunsTableSkeleton />;
-
-  if (isError) {
+  // Ordered so a failed refetch never blanks a table that is already readable: with rows on
+  // screen the error renders as a strip above them (`hasStaleData`), and only a failure with
+  // nothing to show takes over the panel. `CrawlsError` is shared with the /crawls table and
+  // already draws that distinction.
+  if (error !== null) {
     return (
-      <p className="rounded-lg border border-border bg-card p-6 text-sm text-status-failed">
-        {error?.message ?? "Could not load this website's run history."}
-      </p>
+      <div className="space-y-4">
+        <CrawlsError
+          error={error}
+          onRetry={onRetry}
+          isRetrying={isRetrying}
+          hasStaleData={runs.length > 0}
+        />
+        {runs.length > 0 && (
+          <RunsTable
+            runs={runs}
+            expandedRunIds={expandedRunIds}
+            onToggleExpanded={toggleExpanded}
+            onSelectRun={onSelectRun}
+          />
+        )}
+      </div>
     );
   }
 
+  if (isLoading) return <RunsSkeleton />;
+
   if (runs.length === 0) {
     return (
-      <div className="rounded-lg border border-border bg-card p-10 text-center">
+      <div className="flex flex-col items-center gap-2 rounded-xl border border-border bg-card px-6 py-16 text-center">
         <p className="text-sm font-medium text-foreground">No runs yet</p>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="max-w-sm text-sm text-muted-foreground">
           {canRun
             ? "Use Run now above to crawl this site and generate its llms.txt."
             : "Nothing has crawled this site yet. Its owner can start a run from this page."}
@@ -110,48 +134,18 @@ export function RunsTab({
 
   return (
     <div className="space-y-4">
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              {COLUMNS.map((column) => (
-                <TableHead
-                  key={column.key}
-                  className={cn(
-                    "text-xs font-medium text-muted-foreground",
-                    column.numeric && "text-right"
-                  )}
-                >
-                  {column.label}
-                </TableHead>
-              ))}
-              {/* The expander's column. Headed by a screen-reader-only label rather than an
-                  empty `<th>`, which reads as an unnamed column. */}
-              <TableHead className="w-8">
-                <span className="sr-only">Error details</span>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-
-          <TableBody>
-            {runs.map((run) => (
-              <RunRow
-                key={run.id}
-                run={run}
-                isExpanded={expandedRunIds.has(run.id)}
-                onToggleExpanded={() => toggleExpanded(run.id)}
-                onSelect={() => onSelectRun(run.id)}
-              />
-            ))}
-          </TableBody>
-        </Table>
-      </div>
+      <RunsTable
+        runs={runs}
+        expandedRunIds={expandedRunIds}
+        onToggleExpanded={toggleExpanded}
+        onSelectRun={onSelectRun}
+      />
 
       {hasNextPage && (
         <div className="flex justify-center">
-          {/* "Load more", not infinite scroll: users scan run history looking for a
-              specific run, they do not browse it, and an infinite list makes the end of the
-              history unreachable and the page's own footer unreachable with it. */}
+          {/* "Load more", not infinite scroll: people scan run history for a particular
+              run rather than browsing it, and an endless list puts the oldest run — and
+              anything below the table — permanently out of reach. */}
           <Button variant="outline" onClick={onLoadMore} disabled={isFetchingNextPage}>
             {isFetchingNextPage ? "Loading…" : "Load more"}
           </Button>
@@ -161,51 +155,95 @@ export function RunsTab({
   );
 }
 
+function RunsTable({
+  runs,
+  expandedRunIds,
+  onToggleExpanded,
+  onSelectRun,
+}: {
+  runs: RunListItem[];
+  expandedRunIds: ReadonlySet<string>;
+  onToggleExpanded: (runId: string) => void;
+  onSelectRun: (runId: string) => void;
+}) {
+  return (
+    <div className="overflow-hidden rounded-xl border border-border bg-card">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            {COLUMNS.map((column) => (
+              <TableHead
+                key={column.key}
+                className={cn(
+                  "text-xs font-medium text-muted-foreground",
+                  column.numeric && "text-right"
+                )}
+              >
+                {column.label}
+              </TableHead>
+            ))}
+            {/* The expander's column. Named for screen readers rather than left as an
+                empty `<th>`, which announces as an unlabelled column. */}
+            <TableHead className="w-10">
+              <span className="sr-only">Error details</span>
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+
+        <TableBody>
+          {runs.map((run) => (
+            <RunRow
+              key={run.id}
+              run={run}
+              isExpanded={expandedRunIds.has(run.id)}
+              onToggleExpanded={() => onToggleExpanded(run.id)}
+              onSelectRun={onSelectRun}
+            />
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
 function RunRow({
   run,
   isExpanded,
   onToggleExpanded,
-  onSelect,
+  onSelectRun,
 }: {
   run: RunListItem;
   isExpanded: boolean;
   onToggleExpanded: () => void;
-  onSelect: () => void;
+  onSelectRun: (runId: string) => void;
 }) {
-  // Only a failed run has an error to expand. A run that failed with no error text still
-  // gets the expander — "failed, and the backend recorded no reason" is information, and
-  // silently having no control on that row looks like a rendering bug.
+  // Only a failed run has an error to expand. A failed run with no recorded error still gets
+  // the control — "it failed and said nothing" is information, and a row that silently lacks
+  // the affordance its neighbours have reads as a rendering bug.
   const isExpandable = run.status === "failed";
   const pages = runPagesCrawled(run);
+  const duration = formatDuration(run.duration_ms);
 
   return (
     <>
       <TableRow
-        // A row is not natively focusable or activatable, so the keyboard handling is
-        // explicit. `role="button"` plus Enter/Space is the same contract a real button
-        // offers, which is what a row that navigates should behave like.
-        role="button"
-        tabIndex={0}
-        aria-label={`View the llms.txt from the run started ${formatAbsoluteTime(run.started_at)}`}
-        onClick={onSelect}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter" && event.key !== " ") return;
-          event.preventDefault();
-          onSelect();
-        }}
-        className="cursor-pointer focus-visible:bg-muted/50 focus-visible:outline-none"
+        {...rowActivationProps(onSelectRun, run.id)}
+        aria-label="View the llms.txt from this run"
+        className={cn(
+          "cursor-pointer outline-none",
+          // The same focus treatment `crawls-table.tsx` uses, for the same two reasons it
+          // documents at length: `outline` rather than `ring`, because a ring is a
+          // box-shadow and a box-shadow does not paint on a `<tr>` under the
+          // `border-collapse: collapse` Tailwind's preflight sets; and `outline-solid`
+          // explicitly, because `outline-none` above sets `--tw-outline-style: none` in
+          // Tailwind v4 and `outline-2` sets only the width — the pair alone paints a 2px
+          // outline with `outline-style: none`, i.e. nothing at all, and no static gate
+          // notices. Verified in a real browser rather than reasoned about.
+          "focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+        )}
       >
         <TableCell>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              {/* `<time>` with a machine-readable `dateTime`, so the exact instant is in
-                  the markup even though the text is relative. */}
-              <time dateTime={run.started_at} className="text-sm">
-                {formatRelativeTime(run.started_at)}
-              </time>
-            </TooltipTrigger>
-            <TooltipContent>{formatAbsoluteTime(run.started_at)}</TooltipContent>
-          </Tooltip>
+          <RelativeTime iso={run.started_at} className="text-sm" />
         </TableCell>
 
         <TableCell>
@@ -217,39 +255,36 @@ function RunRow({
                 : "border-transparent bg-secondary text-muted-foreground"
             )}
           >
-            {run.trigger === "manual" ? "Manual" : "Scheduled"}
+            {run.trigger === "manual" ? "manual" : "scheduled"}
           </span>
         </TableCell>
 
         <TableCell>
-          <RunStatusBadge status={run.status} />
-        </TableCell>
-
-        {/* Tabular figures: without them the mono column still jitters between rows,
-            because the sans face's digits are proportional. */}
-        <TableCell className="text-right font-mono text-xs tabular-nums">
-          {pages === null ? "—" : pages.toLocaleString()}
+          <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
         </TableCell>
 
         <TableCell className="text-right font-mono text-xs tabular-nums">
-          {formatDuration(run.duration_ms)}
+          {pages === null ? <EmptyCell label="no pages counted" /> : pages.toLocaleString()}
         </TableCell>
 
-        <TableCell className="w-8">
+        <TableCell className="text-right font-mono text-xs tabular-nums">
+          {duration === null ? <EmptyCell label="still running" /> : duration}
+        </TableCell>
+
+        <TableCell className="w-10">
           {isExpandable && (
             <Button
               variant="ghost"
               size="icon-xs"
               aria-expanded={isExpanded}
               aria-label={isExpanded ? "Hide the error" : "Show the error"}
-              onClick={(event) => {
-                // Without this the row's own handler also fires and navigates to the
-                // Output tab, so expanding an error would always leave the Runs tab.
-                event.stopPropagation();
-                onToggleExpanded();
-              }}
+              onClick={onToggleExpanded}
             >
-              {isExpanded ? <ChevronDownIcon aria-hidden /> : <ChevronRightIcon aria-hidden />}
+              {isExpanded ? (
+                <ChevronDown aria-hidden="true" />
+              ) : (
+                <ChevronRight aria-hidden="true" />
+              )}
             </Button>
           )}
         </TableCell>
@@ -258,11 +293,11 @@ function RunRow({
       {isExpandable && isExpanded && (
         <TableRow className="hover:bg-transparent">
           <TableCell colSpan={COLUMNS.length + 1} className="p-0">
-            {/* `whitespace-pre-wrap` + `break-words`: an error is arbitrary text that may
-                contain newlines and may contain a single unbroken 400-character URL. The
-                first preserves the structure, the second stops the second case from
-                widening the table and, through it, the page. */}
-            <pre className="max-h-64 overflow-auto border-t border-border bg-status-failed-surface px-4 py-3 font-mono text-xs whitespace-pre-wrap break-words text-status-failed">
+            {/* `whitespace-pre-wrap` with `break-words`: an error is arbitrary text that may
+                carry newlines and may carry one unbroken 400-character URL. The first keeps
+                the structure, the second stops the second case widening the table — and
+                through it, the page. */}
+            <pre className="max-h-64 overflow-auto border-t border-border bg-status-failed-surface px-4 py-3 font-mono text-xs break-words whitespace-pre-wrap text-status-failed">
               {run.error ?? "This run failed, but recorded no error message."}
             </pre>
           </TableCell>
@@ -272,12 +307,22 @@ function RunRow({
   );
 }
 
-function RunsTableSkeleton() {
+/**
+ * The loading state, shaped like the table it replaces so the panel does not change height
+ * when the data lands. `aria-hidden` over the placeholder with one polite message behind it:
+ * a screen reader should hear "loading", not five rows of nothing.
+ */
+function RunsSkeleton() {
   return (
-    <div className="space-y-2 rounded-lg border border-border bg-card p-4">
-      {Array.from({ length: 5 }, (_, index) => (
-        <Skeleton key={index} className="h-9 w-full" />
-      ))}
+    <div className="rounded-xl border border-border bg-card p-4">
+      <div aria-hidden="true" className="space-y-3">
+        {Array.from({ length: SKELETON_ROW_COUNT }, (_, index) => (
+          <Skeleton key={index} className="h-8 w-full" />
+        ))}
+      </div>
+      <span role="status" aria-live="polite" className="sr-only">
+        Loading run history
+      </span>
     </div>
   );
 }

@@ -14,10 +14,11 @@ import {
 import type { RunListItem } from "@/lib/api/runs";
 import { isActiveRunStatus } from "@/lib/api/run-status";
 import { useRun } from "@/lib/query/use-run";
-import { formatRelativeTime } from "@/lib/format/time";
+import { rowStatusFromRunStatus } from "@/lib/crawls/row-status";
 
 import { LlmsTxtViewer } from "./llms-txt-viewer";
-import { RunStatusBadge, RunStatusDot, runStatusLabel } from "./run-status-indicator";
+import { RelativeTime } from "./relative-time";
+import { RunStatusIndicator } from "./run-status-indicator";
 
 type OutputTabProps = {
   origin: string;
@@ -117,14 +118,11 @@ function RunPicker({
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="outline" className="justify-between gap-2">
-            <span className="flex items-center gap-2">
+            <span className="flex min-w-0 items-center gap-2">
               {selected ? (
                 <>
-                  <RunStatusDot status={selected.status} />
-                  {formatRelativeTime(selected.started_at)}
-                  <span className="text-muted-foreground">
-                    · {runStatusLabel(selected.status)}
-                  </span>
+                  <RelativeTime iso={selected.started_at} className="text-sm" />
+                  <RunStatusIndicator status={rowStatusFromRunStatus(selected.status)} />
                 </>
               ) : (
                 "Selected run"
@@ -139,10 +137,9 @@ function RunPicker({
           <DropdownMenuRadioGroup value={selectedRunId} onValueChange={onSelectRun}>
             {runs.map((run) => (
               <DropdownMenuRadioItem key={run.id} value={run.id}>
-                <span className="flex items-center gap-2">
-                  <RunStatusDot status={run.status} />
-                  {formatRelativeTime(run.started_at)}
-                  <span className="text-muted-foreground">· {runStatusLabel(run.status)}</span>
+                <span className="flex min-w-0 items-center gap-2">
+                  <RelativeTime iso={run.started_at} className="text-sm" />
+                  <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
                 </span>
               </DropdownMenuRadioItem>
             ))}
@@ -180,7 +177,7 @@ function RunOutput({ runId, origin }: { runId: string; origin: string }) {
     return (
       <div className="space-y-3 rounded-lg border border-border bg-card p-6">
         <div className="flex items-center gap-2 text-sm text-foreground">
-          <RunStatusBadge status={run.status} />
+          <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
           <span className="text-muted-foreground">
             Generating… this page updates on its own when the crawl finishes.
           </span>
@@ -198,7 +195,7 @@ function RunOutput({ runId, origin }: { runId: string; origin: string }) {
     return (
       <div className="space-y-3 rounded-lg border border-border bg-card p-6">
         <div className="flex items-center gap-2">
-          <RunStatusBadge status="failed" />
+          <RunStatusIndicator status="failed" />
           <span className="text-sm text-muted-foreground">
             This run produced no llms.txt.
           </span>

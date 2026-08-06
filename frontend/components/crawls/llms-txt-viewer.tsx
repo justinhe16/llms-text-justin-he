@@ -5,7 +5,7 @@ import { CopyIcon, DownloadIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { llmsTxtFilename } from "@/lib/format/run";
+import { llmsTxtFilename } from "@/lib/crawls/run-display";
 
 /**
  * The `llms.txt` artifact itself: line numbers, a copy button, a download button, and

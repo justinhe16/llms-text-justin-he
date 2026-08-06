@@ -95,6 +95,25 @@ export function rowStatus(website: WebsiteListItem): RowStatus {
   return latestRun ? ROW_STATUS_BY_RUN_STATUS[latestRun.status] : "never-run";
 }
 
+/**
+ * The same mapping as `rowStatus` above, applied to a run's own status rather than to the
+ * `latest_run` folded into a website row.
+ *
+ * The detail page (PER-162) needs this because everything it renders is already a run: the
+ * Runs tab's Status column, the run picker in the Output tab, and the status shown beside
+ * the origin in the header. All three want the vocabulary and the colours this module owns,
+ * and none of them has a `WebsiteListItem` to hand.
+ *
+ * Exported here rather than re-derived there so `ROW_STATUS_BY_RUN_STATUS` remains the one
+ * place a `run_status` becomes a `RowStatus`. There is deliberately no `"never-run"` branch:
+ * a run that exists has a status, and "no run has ever happened" is the caller's fact to
+ * represent — see `website-detail.tsx`, which falls back to `"never-run"` itself when a
+ * website's history is empty.
+ */
+export function rowStatusFromRunStatus(status: RunStatus): RowStatus {
+  return ROW_STATUS_BY_RUN_STATUS[status];
+}
+
 /** The status token name — `completed`, `processing`, `failed`, or `idle` — this row's
  * colour comes from. */
 export function rowStatusToken(status: RowStatus): StatusToken {

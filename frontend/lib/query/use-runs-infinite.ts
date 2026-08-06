@@ -1,6 +1,6 @@
 "use client";
 
-import { useInfiniteQuery, type InfiniteData } from "@tanstack/react-query";
+import { useInfiniteQuery, type InfiniteData, type QueryKey } from "@tanstack/react-query";
 
 import { anyRunActive } from "@/lib/api/run-status";
 import { listRuns, type RunListItem, type RunListOptions, type RunPage } from "@/lib/api/runs";

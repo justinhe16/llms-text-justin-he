@@ -2,6 +2,7 @@ import { Suspense } from "react";
 import type { Metadata } from "next";
 
 import { Skeleton } from "@/components/ui/skeleton";
+import { CrawlsHeader } from "@/components/crawls/crawls-header";
 import { WebsiteDetail } from "@/components/crawls/website-detail";
 
 export const metadata: Metadata = {
@@ -34,11 +35,17 @@ export default async function WebsiteDetailPage({
   const { websiteId } = await params;
 
   return (
-    <main className="min-h-screen">
-      <Suspense fallback={<DetailFallback />}>
-        <WebsiteDetail websiteId={websiteId} />
-      </Suspense>
-    </main>
+    <div className="flex min-h-screen flex-col">
+      {/* The same chrome `/crawls` renders (PER-161). Shared rather than rebuilt, so the
+          wordmark, "Add site" and the user menu cannot drift between the two screens. */}
+      <CrawlsHeader />
+
+      <main className="min-w-0 flex-1">
+        <Suspense fallback={<DetailFallback />}>
+          <WebsiteDetail websiteId={websiteId} />
+        </Suspense>
+      </main>
+    </div>
   );
 }
 
@@ -46,7 +53,7 @@ export default async function WebsiteDetailPage({
  * fallback to content does not jump the layout. */
 function DetailFallback() {
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-10">
+    <div aria-hidden="true" className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
       <Skeleton className="h-5 w-24" />
       <Skeleton className="mt-6 h-7 w-64" />
       <Skeleton className="mt-2 h-4 w-40" />

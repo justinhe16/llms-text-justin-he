@@ -1,11 +1,11 @@
 "use client";
 
-import { PlayIcon, RefreshCwIcon } from "lucide-react";
+import { Play, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ownerIdentity } from "@/lib/crawls/owner";
 import { useTriggerRun } from "@/lib/query/use-trigger-run";
-import { ownerShortId } from "./owner-label";
 
 type RunNowButtonProps = {
   websiteId: string;
@@ -69,7 +69,7 @@ export function RunNowButton({
   // Ordered by precedence, matching the `disabled` expression above: ownership is checked
   // first because it is the only reason that will not resolve on its own.
   const disabledReason = !isOwner
-    ? `Only the owner (${ownerShortId(ownerUserId)}) can start a run.`
+    ? `Only the owner (${ownerIdentity(ownerUserId, null).label}) can start a run.`
     : hasActiveRun
       ? "A run is already in progress. It will finish on its own."
       : isSubmitting
@@ -89,9 +89,9 @@ export function RunNowButton({
       aria-disabled={disabled}
     >
       {hasActiveRun || isSubmitting ? (
-        <RefreshCwIcon className="animate-spin" aria-hidden />
+        <RefreshCw className="animate-spin" aria-hidden="true" />
       ) : (
-        <PlayIcon aria-hidden />
+        <Play aria-hidden="true" />
       )}
       {label}
     </Button>
