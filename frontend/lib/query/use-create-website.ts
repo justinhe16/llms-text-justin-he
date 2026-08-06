@@ -20,11 +20,20 @@ import { queryKeys } from "./query-keys";
  * `isWebsiteAlreadyExists` exists for — **without** losing either behavior above: both
  * run, this hook's always first, so the invalidation and the toast have already happened
  * by the time a caller's own callback sees the result.
+ *
+ * `toastOnError` is the one part of that a caller may switch off. It defaults to `true`, so
+ * nothing about an existing call site changes; the landing page passes `false` because it
+ * renders the failure *under the field that caused it* rather than in a corner of the
+ * screen, and a toast saying the same thing twice is noise. The invalidation is not
+ * optional in the same way — it is correctness, not presentation.
  */
 export function useCreateWebsite(
-  options?: Pick<UseMutationOptions<Website, Error, string>, "onSuccess" | "onError">
+  options?: Pick<UseMutationOptions<Website, Error, string>, "onSuccess" | "onError"> & {
+    toastOnError?: boolean;
+  }
 ) {
   const queryClient = useQueryClient();
+  const toastOnError = options?.toastOnError ?? true;
 
   return useMutation({
     mutationFn: (url: string) => createWebsite(url),
@@ -33,7 +42,7 @@ export function useCreateWebsite(
       options?.onSuccess?.(data, variables, onMutateResult, context);
     },
     onError: (error, variables, onMutateResult, context) => {
-      toast.error(error.message);
+      if (toastOnError) toast.error(error.message);
       options?.onError?.(error, variables, onMutateResult, context);
     },
   });

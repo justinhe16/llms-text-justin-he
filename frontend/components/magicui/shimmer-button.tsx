@@ -1,4 +1,5 @@
 import React, { type ComponentPropsWithoutRef, type CSSProperties } from "react"
+import { Slot } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 
@@ -10,6 +11,16 @@ export interface ShimmerButtonProps extends ComponentPropsWithoutRef<"button"> {
   background?: string
   className?: string
   children?: React.ReactNode
+  /**
+   * Render the child element instead of a `<button>`, keeping every style and the
+   * shimmer layers. Added — the same `Slot`-based escape hatch `components/ui/button.tsx`
+   * already exposes — because the landing page's primary action when you are signed in is
+   * a *navigation* to /crawls, and a `<button>` that calls `router.push` breaks
+   * middle-click, cmd-click and "copy link address" on the page's main call to action.
+   * Wrapping the button in an `<a>` instead is invalid HTML (interactive content inside a
+   * link), so the element itself has to become the link.
+   */
+  asChild?: boolean
 }
 
 export const ShimmerButton = React.forwardRef<
@@ -28,12 +39,15 @@ export const ShimmerButton = React.forwardRef<
       background = "var(--primary)",
       className,
       children,
+      asChild = false,
       ...props
     },
     ref
   ) => {
+    const Comp = asChild ? Slot.Root : "button"
+
     return (
-      <button
+      <Comp
         style={
           {
             "--spread": "90deg",
@@ -68,7 +82,14 @@ export const ShimmerButton = React.forwardRef<
             <div className="animate-spin-around absolute -inset-full w-auto [translate:0_0] rotate-0 [background:conic-gradient(from_calc(270deg-(var(--spread)*0.5)),transparent_0,var(--shimmer-color)_var(--spread),transparent_var(--spread))]" />
           </div>
         </div>
-        {children}
+        {/* `Slottable` is not decoration, and removing it breaks `asChild` at runtime only.
+            `Slot` requires a single React element child so it knows what to clone; this
+            component hands it four (three shimmer layers plus `children`), and without this
+            marker it throws "Slot failed to slot onto its children" the moment an `asChild`
+            instance renders — a client-side crash that `tsc`, eslint, `next build` and the
+            smoke test all pass straight through. Marking `children` tells `Slot` which one
+            becomes the rendered element; the three layers stay, as its children. */}
+        <Slot.Slottable>{children}</Slot.Slottable>
 
         {/* Highlight */}
         <div
@@ -94,7 +115,7 @@ export const ShimmerButton = React.forwardRef<
             "absolute inset-(--cut) -z-20 [border-radius:var(--shimmer-radius)] [background:var(--bg)]"
           )}
         />
-      </button>
+      </Comp>
     )
   }
 )

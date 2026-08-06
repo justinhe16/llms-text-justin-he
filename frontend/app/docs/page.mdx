@@ -1,0 +1,96 @@
+# Documentation
+
+Everything llms-text does, in one page.
+
+## What is llms.txt
+
+`llms.txt` is a small Markdown file a website publishes at its root — `example.com/llms.txt` —
+that tells a large language model what the site is and which of its pages are worth reading.
+The convention is described at [llmstxt.org](https://llmstxt.org).
+
+The problem it solves is that a model reading a site through a browser or a crawler gets
+navigation, cookie banners, footers and duplicated boilerplate along with the content, and has
+to guess what matters. A hand-written index of the pages that do matter is smaller, cheaper to
+read, and says what the site's author would have said if asked.
+
+llms-text writes that file for you: it crawls a site, works out which pages carry the content,
+and produces one `llms.txt` you can publish.
+
+## Adding a site
+
+Paste a URL into the box on the [home page](/) and press Enter. It has to be an absolute
+`http://` or `https://` URL — `https://example.com`, not `example.com`.
+
+That does two things: it registers the site, and it starts the first crawl immediately. You
+land on the site's page with a run already showing as **pending**, and the page updates itself
+as the run progresses — there is nothing to refresh and nothing else to press.
+
+Pasting a URL you have already added takes you straight to it rather than reporting an error.
+Two people can each add the same site; one person cannot add it twice.
+
+## Manual vs scheduled runs
+
+A **run** is one crawl of one site. Every run is either manual or scheduled, and both produce
+the same thing.
+
+- **Manual** — the **Run now** button on a site's page. Use it after you have changed the site
+  and want the file regenerated before the next scheduled run would do it.
+- **Scheduled** — a repeating run, configured on a site's **Schedule** tab. Four intervals are
+  available, and they are the only four:
+  - **Hourly** — a site that changes through the day: a changelog, a status page.
+  - **Every 6 hours** — an active documentation site.
+  - **Daily** — most sites.
+  - **Weekly** — a site that rarely changes: a marketing site, a personal page.
+
+A schedule can be turned off without being deleted, and its run history outlives it. Scheduled
+runs count against the daily limit below in exactly the same way manual ones do.
+
+## Reading the output
+
+A finished run's `llms.txt` is on the site's **Output** tab, with line numbers, a **Copy**
+button and a **Download** button. Downloading gives you a plain `llms.txt`.
+
+Publish it at the root of your site, so that it answers at `https://your-site.com/llms.txt`
+as plain text. Where that file goes depends on your host — a `public/` or `static/` directory
+for most frameworks, the site root for anything served from disk.
+
+Runs are kept, so you can open an older one from the **Runs** tab and see what the file looked
+like before a change.
+
+## Limits
+
+Every crawl runs inside fixed caps, and there are two per-account caps on top of them. They
+are listed here so nobody has to discover one by hitting it.
+
+**Per crawl**
+
+- **100 pages** — the most a single run will fetch.
+- **5 minutes** — the wall-clock budget for a run.
+- **50 MB** — the total downloaded across the whole run.
+
+Reaching one of these ends the run **successfully**, with whatever pages it had collected by
+then. It is a budget, not a failure: a 400-page site produces an `llms.txt` built from the
+first 100 pages rather than no file at all.
+
+**Per account**
+
+- **2 concurrent runs** — you can have two manual runs in flight at once. A third has to wait
+  for one of them to finish.
+- **50 runs per day** — across a rolling 24 hours, counting manual and scheduled runs
+  together.
+
+Going over either one is answered immediately, with a message saying which cap you hit and
+when it frees up. Nothing is queued behind a cap and nothing is silently dropped.
+
+## API
+
+llms-text is a FastAPI service, and it publishes its own interactive OpenAPI documentation —
+every endpoint, every request and response shape, generated from the code that serves them.
+
+{/* A hyperlink a reader clicks, not a request this application makes. ARCHITECTURE.md §8.1
+    ("the browser never calls Fly") is about how this app fetches data — which is always
+    same-origin, through app/api/[...path]/. Nothing on this page fetches anything. */}
+
+[Browse the API documentation](https://llms-text-justin-he.fly.dev/docs)
+
+Running the stack locally, the same document is at `http://localhost:8000/docs`.
