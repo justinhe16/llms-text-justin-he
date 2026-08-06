@@ -467,11 +467,16 @@ the row:
 
 ```python
 async def delete_website(self, website_id: UUID, user_id: UUID) -> None:
-    website = await self._reader.get_by_id(website_id)   # 404 if missing
+    website = await self.get_website(website_id)         # 404 if missing
     require_owner(website, user_id)                      # 403 if not owner
-    async with self.transaction() as tx:
-        await self._writer.delete(tx, website_id)
+    async with transaction(self._pool) as tx:
+        await WebsitesWriter(tx).delete(website_id)
 ```
+
+Note the writer is **constructed around the transaction** — `WebsitesWriter(tx)` — rather
+than handed one per call. A writer is bound to exactly one `DbHandle` for its lifetime, so
+there is no way to call a write method and forget to pass the transaction, and no way for
+two statements in the same `async with` to land on different connections.
 
 Never scatter ownership checks inline in routers, and never reimplement the comparison. One
 helper, called from services, is what makes "is this endpoint authorized?" answerable by
@@ -496,10 +501,15 @@ truth for who may write what.
 
 ```python
 async def record_run_result(self, run_id: UUID, storage_url: str, llms_txt: str) -> None:
-    async with self.transaction() as tx:
-        await self._writer.update_status(tx, run_id, status="succeeded")
-        await self._writer.set_output(tx, run_id, storage_url, llms_txt)
+    async with transaction(self._pool) as tx:
+        writer = RunsWriter(tx)
+        await writer.update_status(run_id, status="succeeded")
+        await writer.set_output(run_id, storage_url, llms_txt)
 ```
+
+`transaction()` is a module-level helper taking the pool, not a service method; the writer
+is constructed around the handle it writes through. Binding one `RunsWriter` to `tx` and
+reusing it is what keeps both statements provably inside the same unit of work.
 
 Rules:
 
@@ -522,13 +532,13 @@ Do the external work first, then open a transaction to record the result:
 ```python
 # CORRECT — upload first, then a short transaction to record the outcome
 storage_url = await self._storage.upload(key, content)     # network, no transaction held
-async with self.transaction() as tx:
-    await self._writer.set_output(tx, run_id, storage_url, llms_txt)
+async with transaction(self._pool) as tx:
+    await RunsWriter(tx).set_output(run_id, storage_url, llms_txt)
 
 # WRONG — a slow upload holds a Postgres transaction open the whole time
-async with self.transaction() as tx:
+async with transaction(self._pool) as tx:
     storage_url = await self._storage.upload(key, content)
-    await self._writer.set_output(tx, run_id, storage_url, llms_txt)
+    await RunsWriter(tx).set_output(run_id, storage_url, llms_txt)
 ```
 
 This is no longer only illustrative. `app.features.crawl.service.CrawlService.execute_run`
