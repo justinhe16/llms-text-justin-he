@@ -208,8 +208,8 @@ def _classify(address: IPv4Address | IPv6Address) -> str | None:
         return f"{address} is an unspecified address"
     # DEPRECATED IPv6 SITE-LOCAL (fec0::/10), AND THE ONE GAP THIS FUNCTION HAD.
     #
-    # Measured on this project's pinned interpreter (CPython 3.12.13), `fec0::1` answers
-    # every check above like this:
+    # Measured on CPython 3.12, the version this project targets, `fec0::1` answers every
+    # check above like this:
     #
     #     is_global    True    is_private     False   is_loopback    False
     #     is_reserved  False   is_link_local  False   is_multicast   False
