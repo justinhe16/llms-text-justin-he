@@ -107,6 +107,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.exceptions import PyJWTError
 
 from app.core.auth.jwks import JwksCache, get_jwks_cache
+from app.core.logging import bind_user_id
 
 
 logger = logging.getLogger(__name__)
@@ -206,6 +207,14 @@ async def _verify_bearer_token(token: str, cache: JwksCache) -> str:
     if not isinstance(sub, str) or not sub.strip():
         _reject("verified token has no usable sub")
 
+    # Correlation, not authorization. Every log line for the rest of this request now
+    # carries `user_id`, including the one-line request summary
+    # (`app.api.middleware.request_context`), which is what makes "what did this user do?"
+    # answerable from `fly logs` alone. Bound HERE — after verification, and nowhere else —
+    # so an unverified claim can never reach a log field, and it is the `sub` that is bound,
+    # never the token it came out of (ARCHITECTURE.md §9.4). The matching unbind belongs to
+    # the middleware, which opened the scope before routing began.
+    bind_user_id(sub)
     return sub
 
 

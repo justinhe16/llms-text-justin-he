@@ -331,6 +331,63 @@ for the same reason it is documented in `internals/payload.py`: it is what would
 everything a website ever produced" a single prefix-delete operation, the day that operation
 exists (§11 records that it does not yet).
 
+### 3.8 Logging and correlation ids
+
+**`fly logs` is the entire observability story, and that is a decision rather than a gap.**
+There is **no error-tracking service on either side of this system** — no Sentry, no
+equivalent, nothing like it in `backend/requirements.txt` or under `frontend/`. Backend
+errors surface as JSON `ERROR` lines in `fly logs`; frontend errors surface in Vercel's
+runtime logs. Adding an error-tracking service later is its own ticket and its own decision.
+It is not something a ticket re-introduces in passing, and a later ticket whose prose
+mentions one does not override this paragraph.
+
+Two consequences follow, and both are enforced in code rather than asked for politely:
+
+- **An `ERROR` line _is_ the incident record.** No second system holds a copy, so an
+  unhandled exception logs its **complete** traceback alongside its correlation id.
+  Truncating tracebacks to keep logs tidy would leave nothing to debug from.
+- **Every line has to be machine-readable**, because reading an interleaved stream by eye is
+  not a debugging strategy for a job system.
+
+`backend/app/core/logging.py` configures both processes. Every line is one JSON object on
+stdout carrying `ts` (ISO-8601 UTC), `level`, `logger`, `message`, and `process` — `app` or
+`worker`, matching `backend/fly.toml`'s `[processes]` keys — plus whatever the call site
+passed as `extra=`. `configure_logging()` is called once per process: from
+`app.main.create_app()` for the API, and at module import in `app/worker/settings.py` for the
+worker, which never imports `app.main`. It also pulls uvicorn's own loggers onto the same
+handler, so nothing the container prints is un-parseable. arq's half of that cannot be done
+from Python at import time — its CLI applies its own `dictConfig` afterwards — and is passed
+on the command line instead, as `--custom-log-dict app.worker.settings.ARQ_LOG_CONFIG`, in
+both `fly.toml` and `scripts/dev.sh`.
+
+**Correlation ids travel in `contextvars`, never in module globals and never as function
+arguments.** The API's middleware (`app/api/middleware/request_context.py`) accepts or
+generates an `X-Request-ID`, binds it, and echoes it on every response.
+`app.worker.jobs.crawl_task` binds `run_id` for the life of one crawl, and `schedule_tick`
+binds a `tick_id` for one cron tick. Everything logged beneath those scopes is tagged
+automatically — no service, reader, or `internals/` module is handed an id — so
+
+```
+fly logs --app llms-text-justin-he | jq 'select(.run_id == "…")'
+```
+
+reconstructs one crawl out of a stream shared with every other job. A module-level "current
+run id" would be shared by every task on the event loop, so two concurrent crawls
+(`max_jobs = 2`) would attribute each other's failures, which is worse than having no
+correlation id at all. `backend/tests/test_logging.py` proves that isolation under real
+concurrency rather than asserting it in a comment.
+
+The API additionally logs **one summary line per request** — method, path, status,
+`duration_ms`, and `user_id` when the request authenticated — at `ERROR` for 5xx, `WARNING`
+for the 4xx that mean something actually went wrong (409, 429), `INFO` otherwise, and `DEBUG`
+for `/health`, which Fly probes every ten seconds forever. The path never includes the query
+string, and nothing on that path reads the `Authorization` header.
+
+Finally, **a redaction filter runs on every record** before any handler formats it, rewriting
+bearer tokens, JWTs, credentialed connection strings, and named-credential assignments to
+`[REDACTED]`. It is insurance, not permission: §9.4 still forbids logging a secret, and a
+call site that does is still a bug — one the filter may not recognise.
+
 ---
 
 ## 4. The authorization contract — public read, owner write

@@ -49,6 +49,7 @@ fired:
 """
 
 import asyncio
+import logging
 import socket
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -56,6 +57,8 @@ from ipaddress import IPv4Address, IPv6Address, IPv6Network, ip_address
 from typing import Final
 from urllib.parse import urlsplit, urlunsplit
 
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 
@@ -108,6 +111,37 @@ class SsrfBlockedError(Exception):
         self.reason = reason
         """A human-readable reason naming which check failed and why."""
         super().__init__(reason)
+
+
+def _refused(url: str, reason: str) -> SsrfBlockedError:
+    """Record the refusal and return the error to raise — `raise _refused(url, reason)`.
+
+    A factory rather than logging inside `SsrfBlockedError.__init__`, and rather than a
+    `logger.warning` at each of `validate_url`'s ten refusal sites. The constructor is the
+    wrong place because an exception object has to stay inert: a test that builds one to
+    assert against, or any code that constructs one without raising it, would otherwise
+    emit a security warning about a refusal that never happened. Ten call sites is the
+    wrong place because it is ten chances to forget. This is the one place every refusal
+    goes through that is still an *action* rather than a value.
+
+    Returning the error instead of raising it keeps `raise ... from None` expressible at
+    the call sites that need it — four of them do, to keep a platform resolver's or
+    `urlsplit`'s own message out of the chain.
+
+    **An SSRF refusal is a security event and belongs in `fly logs` on its own**, not only
+    as a sanitized string inside a later `runs.error`. `reason` sometimes names the
+    resolved address that caused the rejection, and that is deliberate: it is the crawl
+    TARGET's address, never this process's own infrastructure, and it is exactly what
+    distinguishes "a hostname legitimately moved" from "something is DNS-rebinding at us".
+    `SsrfBlockedError` already commits to `reason` being safe to show a signed-in user
+    verbatim (see its docstring), so logging it is a strictly smaller disclosure.
+
+    `run_id` is not passed and does not need to be: this only ever runs inside
+    `crawl_task`'s `run_id_context` (`app.core.logging`), so the line is already correlated
+    to the run whose fetch was refused.
+    """
+    logger.warning("crawl: refused a URL (%s)", reason, extra={"url": url, "reason": reason})
+    return SsrfBlockedError(url, reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,30 +353,30 @@ async def validate_url(
     try:
         parts = urlsplit(url)
     except ValueError as error:
-        raise SsrfBlockedError(url, f"URL could not be parsed: {error}") from None
+        raise _refused(url, f"URL could not be parsed: {error}") from None
 
     scheme = parts.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
-        raise SsrfBlockedError(url, f"scheme {parts.scheme!r} is not http or https")
+        raise _refused(url, f"scheme {parts.scheme!r} is not http or https")
 
     if "@" in parts.netloc:
-        raise SsrfBlockedError(url, "URL must not contain credentials (a user:password@ prefix)")
+        raise _refused(url, "URL must not contain credentials (a user:password@ prefix)")
 
     host = parts.hostname or ""
     if host.endswith("."):
         host = host[:-1]
     host = host.lower()
     if not host:
-        raise SsrfBlockedError(url, "URL must include a host")
+        raise _refused(url, "URL must include a host")
 
     try:
         port = parts.port
     except ValueError as error:
-        raise SsrfBlockedError(url, f"URL port is invalid: {error}") from None
+        raise _refused(url, f"URL port is invalid: {error}") from None
     if port is None:
         port = _DEFAULT_PORTS[scheme]
     if port not in allowed_ports:
-        raise SsrfBlockedError(url, f"port {port} is not allowed")
+        raise _refused(url, f"port {port} is not allowed")
 
     literal = _parse_ip_literal(host)
     if literal is not None:
@@ -363,15 +397,15 @@ async def validate_url(
             # control the content of. It is generic library text in practice; excluding it
             # costs nothing and keeps "safe verbatim" true by construction rather than by
             # inspection of whatever libc happens to say.
-            raise SsrfBlockedError(url, f"DNS resolution for {host!r} failed") from None
+            raise _refused(url, f"DNS resolution for {host!r} failed") from None
         if not resolved:
-            raise SsrfBlockedError(url, f"DNS resolution for {host!r} returned no addresses")
+            raise _refused(url, f"DNS resolution for {host!r} returned no addresses")
         addresses = []
         for candidate in resolved:
             try:
                 addresses.append(ip_address(candidate))
             except ValueError as error:
-                raise SsrfBlockedError(
+                raise _refused(
                     url, f"resolver returned an unparseable address {candidate!r}: {error}"
                 ) from None
 
@@ -381,7 +415,7 @@ async def validate_url(
     for address in addresses:
         reason = _reject_reason(address)
         if reason is not None:
-            raise SsrfBlockedError(url, reason)
+            raise _refused(url, reason)
 
     chosen = addresses[0]
     default_port = _DEFAULT_PORTS[scheme]

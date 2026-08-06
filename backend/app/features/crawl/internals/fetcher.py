@@ -22,6 +22,7 @@ the crawl loop's job (a later phase of this ticket). It fetches exactly one URL,
 its own redirects, and returns exactly one `CrawledPage` or raises.
 """
 
+import logging
 from datetime import UTC, datetime
 from urllib.parse import urljoin, urlsplit
 
@@ -30,6 +31,8 @@ import httpx
 from app.features.crawl.internals.ssrf import Resolver, ValidatedTarget, validate_url
 from app.features.crawl.schemas import CrawledPage
 
+
+logger = logging.getLogger(__name__)
 
 MAX_REDIRECTS = 5
 """How many redirect hops one fetch will follow before giving up. `fetch_page` makes at
@@ -167,7 +170,10 @@ async def fetch_page(
     """
     current_url = url
 
-    for _hop in range(MAX_REDIRECTS + 1):
+    # `hop` doubles as "how many redirects have already been followed" for the DEBUG lines
+    # below: it is 0 on the first attempt, so a response that is not a redirect logs
+    # `redirects=0` without a separate counter to keep in sync with the loop.
+    for hop in range(MAX_REDIRECTS + 1):
         target: ValidatedTarget = await validate_url(current_url, resolver=resolver)
 
         extensions: dict[str, str] = {}
@@ -192,10 +198,39 @@ async def fetch_page(
                 next_url = urljoin(target.url, location)
                 if target.scheme == "https" and urlsplit(next_url).scheme.lower() == "http":
                     raise FetchError("refusing to follow a redirect from https to http")
+                # `%s` args, not an f-string: at INFO (the deployed default) this line is
+                # never formatted at all, and building the string up front would spend the
+                # cost on every hop of every fetch regardless of whether anything reads it.
+                logger.debug(
+                    "fetch: redirect %s -> %s (%d)",
+                    target.url,
+                    next_url,
+                    response.status_code,
+                    extra={
+                        "from_url": target.url,
+                        "to_url": next_url,
+                        "status": response.status_code,
+                    },
+                )
                 current_url = next_url
                 continue
 
             content, content_bytes = await _read_body_within_budget(response, budget)
+            # One DEBUG line per fetch outcome, never the body: `content` is a page's actual
+            # text and has no business in `fly logs`, so only its byte count is here.
+            logger.debug(
+                "fetch: %s -> %d (%d bytes, %d redirect(s))",
+                target.url,
+                response.status_code,
+                content_bytes,
+                hop,
+                extra={
+                    "url": target.url,
+                    "status": response.status_code,
+                    "bytes": content_bytes,
+                    "redirects": hop,
+                },
+            )
             return CrawledPage(
                 url=target.url,
                 status=response.status_code,
