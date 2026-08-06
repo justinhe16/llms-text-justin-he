@@ -203,7 +203,21 @@ export function useScheduleEditor({
     // This effect re-runs whenever `serverValue` changes, which includes background refetches
     // landing while a request is in flight. Without this guard that would queue a duplicate
     // of the request already on the wire.
-    if (isPending && sameBody(body, latestSentBody.current)) return;
+    //
+    // Clearing `unsentBody` here is not housekeeping — it is the correctness of this branch.
+    // Reaching it means the draft has returned to the value already in flight, so whatever was
+    // queued a moment ago has been abandoned, and the effect cleanup tears that edit's timer
+    // down on the way in. Leaving the ref pointing at it strands a value nothing will ever
+    // send on purpose, and two readers then misbehave: `settlesLatestIntent` refuses to clear
+    // the draft when this request settles (so a failure never reverts, the panel sits on
+    // "Saving…", and the next effect run re-sends the already-failed body unprompted), and the
+    // unmount flush below dispatches the abandoned value on a tab switch.
+    //
+    // Reachable by: pick A, pick B while A is still in flight, then pick A again.
+    if (isPending && sameBody(body, latestSentBody.current)) {
+      unsentBody.current = null;
+      return;
+    }
 
     unsentBody.current = body;
     const timer = setTimeout(() => send(body), SCHEDULE_SAVE_DEBOUNCE_MS);
