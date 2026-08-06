@@ -85,7 +85,7 @@ function describeFailure(error: unknown): { message: string; retryable: boolean 
  * | `503` / `5xx` / network | stay, render the message, offer a retry — and, when the site was already created, a link to it |
  *
  * The `503` case is the one worth stating: the queue could not be reached, and
- * `RunService._abandon_unqueued_run` has already marked the row `failed` before answering. So
+ * `RunService.abandon_unqueued_run` has already marked the row `failed` before answering. So
  * there is no run in flight to go and watch — sending the user to a detail page to look at a
  * run that never started would be worse than saying so here and offering a retry that can
  * actually work.
@@ -178,7 +178,7 @@ export function useAddSite(): {
           triggered = true;
         } else {
           // Everything else stays on this page. `503` is the one worth naming: the queue
-          // could not be reached, and `RunService._abandon_unqueued_run` has already marked
+          // could not be reached, and `RunService.abandon_unqueued_run` has already marked
           // the row `failed` before answering — so there is no run in flight to go and
           // watch, and sending the user to a detail page to look at a run that never
           // started would be worse than saying so here and offering the retry that can

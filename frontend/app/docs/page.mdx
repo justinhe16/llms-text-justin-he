@@ -59,11 +59,10 @@ only four:
 - **Weekly** — a site that rarely changes: a marketing site, a personal page.
 
 A site has at most one schedule, set through `PUT /websites/{id}/schedule` — see **API** at
-the end of this page. Runs do not fire on the exact interval: each one is nudged by up to ±5% —
-about ±3 minutes on an hourly schedule, ±72 on a daily one — so that a batch of sites added
-in the same sitting does not settle into crawling in the same second forever. A schedule can
-be switched off without being deleted, its run history outlives it, and its runs count against
-the daily limit below exactly as manual ones do.
+the end of this page. After the first one, fire times are not exact: each is nudged by up to
+±5% — about ±3 minutes on an hourly schedule, ±72 on a daily one — so that a batch of sites
+added in the same sitting does not settle into crawling in the same second forever. A schedule
+can be switched off without being deleted, and its run history outlives it.
 
 ## Reading the output
 
@@ -106,7 +105,8 @@ cut off mid-flight rather than wrapped up neatly.
 - **2 concurrent runs** — you can have two manual runs in flight at once. A third has to wait
   for one of them to finish.
 - **50 runs per day** — across a rolling 24 hours, counting manual and scheduled runs
-  together.
+  together. Reaching it refuses further **manual** runs; a schedule keeps firing, so a busy
+  schedule can spend the budget a manual run would then be refused for.
 
 Going over either one is answered immediately, with a message naming the cap you hit. The
 daily cap also says when it resets; the concurrent one does not, because "when a run you are
