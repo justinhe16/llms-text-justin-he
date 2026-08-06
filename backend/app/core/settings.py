@@ -87,6 +87,35 @@ class Settings(BaseSettings):
     crawl_concurrency: int = Field(default=5, ge=1)
     crawl_politeness_delay_ms: int = Field(default=200, ge=0)
 
+    # Abuse protection for `POST /websites/{id}/runs` (`app.features.runs.service.
+    # RunService.trigger_run`). Both caps are per-USER, not per-website — a user with ten
+    # websites gets ten websites' worth of manual triggers, not ten independent budgets —
+    # and both are enforced by joining `runs` to `websites` on `websites.user_id` rather
+    # than by a column on `runs` itself, which has none.
+    #
+    # `max_concurrent_runs_per_user` counts only `trigger = 'manual'` runs in `pending` or
+    # `processing`, deliberately excluding scheduled ones: a website on an hourly schedule
+    # would otherwise hold one of these two slots for a large fraction of every hour,
+    # which would look like a bug from the UI ("why can't I trigger a run when nothing
+    # I started is running?"). See `internals/runs_reader.py` and `RunService` for the
+    # matching asymmetry in the duplicate-run guard, which has no such filter.
+    #
+    # `max_runs_per_day_per_user` counts every trigger — manual and scheduled alike, since
+    # a scheduled crawl costs the same worker time a manual one does — over a ROLLING 24h
+    # window ending now, not a calendar day. A calendar day needs a timezone to be
+    # anchored to, and this product has never asked a user for one; a rolling window needs
+    # nothing but `now()`, which every request already has.
+    # Both are `ge=1`, and that constraint is load-bearing rather than tidy-minded. A cap of
+    # 0 would mean "no manual runs at all", which nothing in the product wants and which
+    # nothing in `_enforce_run_caps` is written to survive: the daily branch derives its
+    # reset time from `min(started_at)` over the runs inside the window, and a cap of 0
+    # makes that branch reachable with no rows in the window at all, where `min()` is NULL
+    # and `None + timedelta` is a `TypeError` — a 500 from the code path whose whole job is
+    # to answer 429 politely. Constraining it here turns that misconfiguration into a
+    # refusal to boot, which is this module's whole thesis (see the module docstring).
+    max_concurrent_runs_per_user: int = Field(default=2, ge=1)
+    max_runs_per_day_per_user: int = Field(default=50, ge=1)
+
     def validate_required_secrets(self) -> None:
         """Fail loudly if any required variable is unset, naming every one of them.
 

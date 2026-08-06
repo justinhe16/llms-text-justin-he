@@ -178,8 +178,11 @@ def build_crawl_service(pool: Pool, client: httpx.AsyncClient, settings: Setting
     Constructs its own `WebsiteService` and `RunService` rather than importing either
     feature's router-level provider function — those are wired for FastAPI's dependency
     injection, which does not exist inside an arq job. Mirrors
-    `app.api.routers.runs.get_run_service`, which builds the same pair for the same reason.
+    `app.api.routers.runs.get_run_service`, which builds the same trio for the same reason,
+    including handing `RunService` the same `Settings` object: it takes one so that its
+    per-user run caps are configurable and testable without mutating the module singleton,
+    and a worker-built instance must not quietly diverge from a request-built one.
     """
     website_service = WebsiteService(pool)
-    run_service = RunService(pool, website_service)
+    run_service = RunService(pool, website_service, settings)
     return CrawlService(client, run_service, website_service, settings)
