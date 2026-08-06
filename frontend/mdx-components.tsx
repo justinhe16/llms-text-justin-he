@@ -11,8 +11,8 @@ import Link from "next/link";
  * Every element is styled explicitly rather than through a typography plugin. There is one
  * MDX page in this application, `@tailwindcss/typography` is not installed, and a plugin
  * would bring its own opinions about colour — including a `prose-invert` dark variant this
- * repository does not have and must not grow (CLAUDE.md rule 7). Twelve element styles that
- * name the palette's own tokens are smaller than that and cannot drift from it.
+ * repository does not have and must not grow (CLAUDE.md rule 7). A dozen-odd element styles
+ * that name the palette's own tokens are smaller than that and cannot drift from it.
  */
 export function useMDXComponents(components: MDXComponents): MDXComponents {
   return {

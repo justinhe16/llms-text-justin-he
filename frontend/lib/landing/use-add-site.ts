@@ -84,9 +84,11 @@ function describeFailure(error: unknown): { message: string; retryable: boolean 
  * | `429` | stay, and render the backend's cap message inline, verbatim |
  * | `503` / `5xx` / network | stay, render the message, offer a retry — and, when the site was already created, a link to it |
  *
- * The `503` case is the one that must not be folded into "some error happened": the run row
- * exists but nothing will ever pick it up, so navigating would show a `pending` run that is
- * never going to move.
+ * The `503` case is the one worth stating: the queue could not be reached, and
+ * `RunService._abandon_unqueued_run` has already marked the row `failed` before answering. So
+ * there is no run in flight to go and watch — sending the user to a detail page to look at a
+ * run that never started would be worse than saying so here and offering a retry that can
+ * actually work.
  *
  * Both mutations run with `toastOnError: false`. Every message here belongs under the field
  * that produced it — and on the two `409` paths there is no failure to report at all, only a
@@ -138,7 +140,9 @@ export function useAddSite(): {
     const timer = setTimeout(() => {
       setIsNavigating(false);
       setError({
-        message: "That took longer than expected — the site was added, but the page didn't move.",
+        // Deliberately does not say "the site was added": this also fires on the
+        // already-exists path, where the site was not added by this submit.
+        message: "That took longer than expected, and the page didn't move.",
         websiteId: pendingWebsiteId.current,
         retryable: false,
       });

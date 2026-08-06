@@ -45,19 +45,19 @@ same thing.
 **Manual runs work today.** The **Run now** button on a site's page starts one. Adding a site
 starts one too. Use it after you have changed the site and want the file regenerated.
 
-**Scheduled runs are not finished yet.** Every run you see today is one somebody started by
-hand. The design is fixed and the API already accepts it — four intervals, and these are the
-only four:
+**Scheduled runs work too, but there is no screen for them yet.** A schedule repeats a run at
+a fixed interval, and there are four intervals — these are the only four:
 
 - **Hourly** — a site that changes through the day: a changelog, a status page.
 - **Every 6 hours** — an active documentation site.
 - **Daily** — most sites.
 - **Weekly** — a site that rarely changes: a marketing site, a personal page.
 
-What is still missing is the tab that configures a schedule and the timer that fires it, so
-setting one has no effect for now. When they land, a schedule will be switchable off without
-being deleted, its run history will outlive it, and its runs will count against the daily
-limit below exactly as manual ones do.
+The API accepts a schedule and a timer fires the due ones, so a schedule set through the API
+does run. What is missing is the **Schedule** tab that would let you set one without touching
+the API — until it lands, that tab is a placeholder. A schedule can be switched off without
+being deleted, its run history outlives it, and its runs count against the daily limit below
+exactly as manual ones do.
 
 ## Reading the output
 
@@ -86,12 +86,16 @@ are listed here so nobody has to discover one by hitting it.
 - **3 minutes** — how long a run gets. The crawler's own budget is 5 minutes, but the job
   runner stops a job at 3, so 3 is the number that actually bites.
 
-The page and size caps are budgets rather than failures: reaching one ends the run with
-whatever it had collected by then, so a large site yields a partial file instead of no file at
-all. The page cap is the ceiling that applies once link discovery lands — a run fetches a
-single page today, so it cannot be reached yet, though the size cap can if that one page is
-enormous. The time limit is the blunt one: a run stopped at 3 minutes is cut off mid-flight
-rather than wrapped up neatly.
+The page cap is a budget rather than a failure: reaching it ends the run with the pages it
+already had, so a large site yields a partial file instead of no file at all. It is also the
+one cap you cannot reach today — a run fetches a single page — so it is really the ceiling
+that starts applying once link discovery lands.
+
+The other two are blunt, and worth knowing about before you meet one. Going over 50 MiB
+**fails** the run right now, with "The site's response was too large": a run fetches one page,
+and when the only page is the one that overran there is nothing partial left to keep. (Once a
+run fetches many pages, busting the budget partway through will stop it the way the page cap
+does.) And a run stopped at 3 minutes is cut off mid-flight rather than wrapped up neatly.
 
 **Per account**
 
