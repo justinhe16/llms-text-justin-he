@@ -891,6 +891,7 @@ DELETE /websites/{id}
 GET    /websites/{id}/runs
 POST   /websites/{id}/runs
 GET    /runs/{id}
+GET    /websites/{id}/stats
 GET    /websites/{id}/schedule
 PUT    /websites/{id}/schedule
 ```

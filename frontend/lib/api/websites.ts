@@ -8,14 +8,16 @@
 // Read helpers for `GET /websites/{id}/runs` and `GET /runs/{id}` live in `lib/api/runs.ts`,
 // and `GET`/`PUT /websites/{id}/schedule` live in `lib/api/schedules.ts` — not here. Each
 // feature owns its own response shapes, the same way this file owns `WebsiteResponse` and
-// friends. What is still ABSENT: `POST /websites/{id}/runs` (triggering a run) and any stats
-// endpoint — see backend/app/api/routers/websites.py, which declares no such routes yet.
-// They land with their own tickets (a run trigger, then PER-156's stats), each of which adds
-// its own helper here or in a sibling file. Writing `triggerRun`/`getStats` now, ahead of a
-// real endpoint, would either hand-write a response shape nothing generates or silently
-// point at a path `paths` does not know about — the latter is exactly what `PathsWithMethod`
-// in fetcher.ts turns into a compile error, which is the intended guardrail working
-// correctly, not a gap to work around.
+// friends. What is still ABSENT: `POST /websites/{id}/runs` (triggering a run) — see
+// backend/app/api/routers/websites.py, which declares no such route yet. `GET
+// /websites/{id}/stats` (PER-156) has since landed, on backend/app/api/routers/runs.py, not
+// here — but this file and lib/api/runs.ts both still have no `getStats` helper, and there
+// is no Trends tab to call one yet. Each of these lands with its own ticket, adding its own
+// helper here or in a sibling file. Writing `triggerRun`/`getStats` now, ahead of the UI that
+// would actually call them, would either hand-write a response shape nothing generates or
+// silently point at a path `paths` does not know about — the latter is exactly what
+// `PathsWithMethod` in fetcher.ts turns into a compile error, which is the intended
+// guardrail working correctly, not a gap to work around.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";
