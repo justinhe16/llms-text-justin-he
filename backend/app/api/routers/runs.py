@@ -12,42 +12,65 @@ exception type into HTTP.
 
 **Authentication vs. authorization, visible in the signatures — same pattern as
 `websites.py`.** Every handler takes `CurrentUserId`, so every endpoint is `401` without a
-valid token. Neither handler passes that id to its service, because both endpoints are
-reads and reads in this codebase are unscoped by caller (ARCHITECTURE.md §4.1): any
-signed-in user may read any website's run history, and any run's full detail including its
-`llms_txt`. `user_id` is present purely to require a token and is deliberately never
-threaded any further — that is the whole of what makes this feature's tests for "a
-non-owner can read this" meaningful rather than vacuous.
+valid token. `trigger_run` is now the exception to "reads are unscoped, writes are owned"
+that this module used to be able to say applied to nothing here — it passes `user_id` on to
+`RunService.trigger_run`, which calls `require_owner` with it, because it is the one WRITE
+in this router (ARCHITECTURE.md §4.2). `list_runs` and `get_run` still take `CurrentUserId`
+purely to require a token and still deliberately never pass it anywhere: they are reads, and
+reads in this codebase are unscoped by caller (ARCHITECTURE.md §4.1). Any signed-in user may
+read any website's run history and any run's full detail including its `llms_txt` —
+`user_id` on those two exists only so this feature's tests for "a non-owner can read this"
+are meaningful rather than vacuous.
 """
 
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from arq.connections import ArqRedis
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.api.deps import CurrentUserId, DbPool
+from app.api.deps import CurrentUserId, DbPool, SettingsDep, get_arq_pool
 from app.core.pagination import Page
 from app.features.runs.internals.run_cursor import CursorError, RunCursor, decode_cursor
-from app.features.runs.schemas import RunDetailResponse, RunListItemResponse, RunStatusName
+from app.features.runs.schemas import (
+    RunAlreadyInFlightResponse,
+    RunDetailResponse,
+    RunLimitExceededResponse,
+    RunListItemResponse,
+    RunStatusName,
+    TriggerRunResponse,
+)
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
 
 
 router = APIRouter(tags=["runs"])
 
+# `list_runs` below has its own parameter named `status` (the `?status=` query filter),
+# which shadows this import — but only inside that function's body. The two `@router...`
+# decorators, and every `status.HTTP_*` reference in this module's `responses=` and
+# `status_code=` keyword arguments, are evaluated at MODULE scope, where the name still
+# resolves to `fastapi.status`. This looks like a collision on a quick read and is not one.
 
-def get_run_service(pool: DbPool) -> RunService:
+
+def get_run_service(pool: DbPool, settings: SettingsDep) -> RunService:
     """Build the service for one request from the process-wide pool, mirroring
     `get_website_service` (`app.api.routers.websites`).
 
     Builds a `WebsiteService` here too, rather than importing the websites router's
-    provider function: `RunService.list_runs` calls `WebsiteService.get_website` to 404 on
-    an unknown website (ARCHITECTURE.md §3.1 — a feature calls another feature's service,
-    never its reader), and the service it calls is wired up right where the rest of this
-    request's dependencies are, the same way `get_website_service` wires up
-    `WebsitesReader` for its own feature.
+    provider function: `RunService.list_runs` and `.trigger_run` both call
+    `WebsiteService.get_website` to 404 on an unknown website (ARCHITECTURE.md §3.1 — a
+    feature calls another feature's service, never its reader), and the service it calls is
+    wired up right where the rest of this request's dependencies are, the same way
+    `get_website_service` wires up `WebsitesReader` for its own feature.
+
+    `settings` arrives through `SettingsDep` rather than being read from the module
+    singleton inside `RunService`, so that `dependency_overrides[get_settings]` can lower
+    the two abuse caps in a test — see `RunService.__init__`. This is the first feature
+    service in the codebase to need configuration at all; every one that follows should
+    take it the same way.
     """
-    return RunService(pool, WebsiteService(pool))
+    return RunService(pool, WebsiteService(pool), settings)
 
 
 RunServiceDep = Annotated[RunService, Depends(get_run_service)]
@@ -107,6 +130,54 @@ def parse_cursor(cursor: CursorQuery = None) -> RunCursor | None:
 
 CursorDep = Annotated[RunCursor | None, Depends(parse_cursor)]
 
+# The `detail` of the `503` this router answers with when there is no queue to enqueue onto
+# at all — as opposed to `RunService`'s own `503`, raised after a queue pool was obtained but
+# `enqueue_job` still failed. Deliberately the same shape of message (generic, no mention of
+# Redis — ARCHITECTURE.md §9.4): a client cannot act differently on "there was never a pool"
+# versus "there was a pool and the call failed", so there is no reason to make it try.
+_QUEUE_UNAVAILABLE_DETAIL = "Could not start this run right now. Please try again shortly."
+
+
+def require_queue_pool() -> ArqRedis:
+    """Turn `app.api.deps.get_arq_pool`'s `RuntimeError` into this route's `503`.
+
+    `get_arq_pool`'s own docstring names exactly this obligation: "a route that enqueues has
+    to decide what to do about it — the first one to exist should catch this and answer
+    503." `POST /websites/{id}/runs` is that first route, which is also why this function
+    lives here and not in `app.api.deps`, which stays generic (ARCHITECTURE.md §3.1's
+    reasoning for `get_website_service` living beside its own routes applies identically
+    here). When a second feature enqueues, this moves to `app.api.deps` and both routes
+    depend on it there.
+
+    **Must call `get_arq_pool()` inside this function's own `try`, never take it as a
+    declared parameter (`pool: ArqPool`).** FastAPI resolves every sub-dependency before it
+    calls the dependant that needs them, so a declared `ArqPool` parameter would let
+    `get_arq_pool`'s `RuntimeError` propagate BEFORE this function's body — where the
+    `except` lives — ever ran, surfacing as an unhandled `500` instead of the `503` this
+    exists to produce. Calling the plain function directly, from inside this function, is
+    the entire reason this dependency is shaped as a zero-argument function rather than a
+    thin wrapper around `Depends(get_arq_pool)`.
+
+    **Why the two read endpoints below do not take this dependency at all.** The API boots
+    without Redis on purpose (`app.main.lifespan`), and `GET /runs/{id}` /
+    `GET /websites/{id}/runs` must keep answering while Redis is down — a queue outage is
+    not a database outage. That is also why the queue is a per-ROUTE dependency here rather
+    than a constructor argument on `RunService`: `get_run_service` above is shared by both
+    reads and this one write, and threading a queue pool through its constructor would make
+    every read's service construction depend on Redis being reachable — exactly the
+    coupling `get_optional_arq_pool` and `/health`'s two-tier reporting exist to avoid
+    everywhere else in this codebase.
+    """
+    try:
+        return get_arq_pool()
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_QUEUE_UNAVAILABLE_DETAIL
+        ) from error
+
+
+QueuePoolDep = Annotated[ArqRedis, Depends(require_queue_pool)]
+
 
 @router.get("/websites/{id}/runs", response_model=Page[RunListItemResponse])
 async def list_runs(
@@ -143,3 +214,47 @@ async def get_run(
     no run.
     """
     return await service.get_run(id)
+
+
+@router.post(
+    "/websites/{id}/runs",
+    response_model=TriggerRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        status.HTTP_409_CONFLICT: {
+            "model": RunAlreadyInFlightResponse,
+            "description": (
+                "This website already has a pending or processing run — of any trigger, "
+                "manual or scheduled. The response carries that run's id and status."
+            ),
+        },
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": RunLimitExceededResponse,
+            "description": (
+                "The caller is over their concurrent- or daily-run cap. `detail.scope` "
+                "says which; `detail.resets_at` is set only for the daily cap."
+            ),
+        },
+    },
+)
+async def trigger_run(
+    id: UUID,
+    user_id: CurrentUserId,
+    service: RunServiceDep,
+    queue: QueuePoolDep,
+) -> TriggerRunResponse:
+    """Start a manual crawl of one website. Owner-only — unlike this module's two reads.
+
+    `202 Accepted`, not `201 Created`: the body describes a `pending` run that has been
+    queued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and
+    `get_run`, `user_id` IS passed to the service here, because this is the one write in
+    this router and writes are ownership-checked (ARCHITECTURE.md §4.2).
+
+    Four things can stop this short of a `202`: `404` if `id` names no website; `403` if the
+    caller does not own it; `409` if that website already has a run in flight; `429` if the
+    caller is over their concurrent- or daily-run cap. A `503` is also possible, if the run
+    was created but could not be queued — see `RunService.trigger_run` for exactly which
+    check produces which, and `require_queue_pool` above for the one `503` this router
+    itself can raise before the service even runs.
+    """
+    return await service.trigger_run(id, user_id, queue)

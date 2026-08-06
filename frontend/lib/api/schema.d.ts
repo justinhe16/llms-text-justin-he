@@ -161,7 +161,23 @@ export interface paths {
          */
         get: operations["list_runs_websites__id__runs_get"];
         put?: never;
-        post?: never;
+        /**
+         * Trigger Run
+         * @description Start a manual crawl of one website. Owner-only — unlike this module's two reads.
+         *
+         *     `202 Accepted`, not `201 Created`: the body describes a `pending` run that has been
+         *     queued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and
+         *     `get_run`, `user_id` IS passed to the service here, because this is the one write in
+         *     this router and writes are ownership-checked (ARCHITECTURE.md §4.2).
+         *
+         *     Four things can stop this short of a `202`: `404` if `id` names no website; `403` if the
+         *     caller does not own it; `409` if that website already has a run in flight; `429` if the
+         *     caller is over their concurrent- or daily-run cap. A `503` is also possible, if the run
+         *     was created but could not be queued — see `RunService.trigger_run` for exactly which
+         *     check produces which, and `require_queue_pool` above for the one `503` this router
+         *     itself can raise before the service even runs.
+         */
+        post: operations["trigger_run_websites__id__runs_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -307,6 +323,46 @@ export interface components {
             next_cursor?: string | null;
         };
         /**
+         * RunAlreadyInFlightDetail
+         * @description The `detail` of the `409` from `POST /websites/{id}/runs` when that website already
+         *     has a run in progress.
+         *
+         *     Carries the existing run's id and status, the same shape `WebsiteAlreadyExistsDetail`
+         *     (`app.features.websites.schemas`) carries the existing website's id: a 409 that hands
+         *     back nothing actionable makes the client build a second request just to find out what it
+         *     collided with.
+         */
+        RunAlreadyInFlightDetail: {
+            /**
+             * Code
+             * @default run_already_in_flight
+             * @constant
+             */
+            code: "run_already_in_flight";
+            /** Message */
+            message: string;
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "completed" | "failed";
+        };
+        /**
+         * RunAlreadyInFlightResponse
+         * @description The **whole** `409` body, envelope included — see `WebsiteAlreadyExistsResponse` for
+         *     why the envelope is a separate model from its `detail` (FastAPI wraps `detail` in a JSON
+         *     object, so documenting the inner model directly in `responses=` would describe a shape no
+         *     actual response has).
+         */
+        RunAlreadyInFlightResponse: {
+            detail: components["schemas"]["RunAlreadyInFlightDetail"];
+        };
+        /**
          * RunDetailResponse
          * @description The full body of `GET /runs/{id}` — every list-item field, plus the two that are too
          *     large or too rarely needed for a list view.
@@ -355,6 +411,40 @@ export interface components {
              * Format: uuid
              */
             website_id: string;
+        };
+        /**
+         * RunLimitExceededDetail
+         * @description The `detail` of the `429` from `POST /websites/{id}/runs` — either abuse cap.
+         *
+         *     `scope` is the discriminator a client branches on; `message` is prose for a human and is
+         *     free to be reworded without breaking a client that reads `scope` and `limit` instead.
+         */
+        RunLimitExceededDetail: {
+            /**
+             * Code
+             * @default run_limit_exceeded
+             * @constant
+             */
+            code: "run_limit_exceeded";
+            /** Limit */
+            limit: number;
+            /** Message */
+            message: string;
+            /** Resets At */
+            resets_at: string | null;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "concurrent" | "daily";
+        };
+        /**
+         * RunLimitExceededResponse
+         * @description The **whole** `429` body, envelope included — same reasoning as
+         *     `RunAlreadyInFlightResponse` above.
+         */
+        RunLimitExceededResponse: {
+            detail: components["schemas"]["RunLimitExceededDetail"];
         };
         /**
          * RunListItemResponse
@@ -460,6 +550,36 @@ export interface components {
             interval_minutes: number;
             /** Next Run At */
             next_run_at: string | null;
+        };
+        /**
+         * TriggerRunResponse
+         * @description The body of `POST /websites/{id}/runs` on success.
+         *
+         *     Deliberately not `RunListItemResponse` or a slice of it: a just-triggered run has no
+         *     `completed_at`, `duration_ms`, `stats`, or `error` worth returning, and reusing that
+         *     model would mean either faking those fields or making them optional on a response that
+         *     is supposed to be the simplest one this feature has.
+         *
+         *     Status `202 Accepted`, not `201 Created` (see the router): the row this describes has
+         *     been written, but the crawl it names has only been queued, not completed — `201` would
+         *     claim more than is true the instant this response leaves the server.
+         */
+        TriggerRunResponse: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "completed" | "failed";
         };
         /**
          * UpsertScheduleRequest
@@ -840,6 +960,55 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    trigger_run_websites__id__runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TriggerRunResponse"];
+                };
+            };
+            /** @description This website already has a pending or processing run — of any trigger, manual or scheduled. The response carries that run's id and status. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunAlreadyInFlightResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The caller is over their concurrent- or daily-run cap. `detail.scope` says which; `detail.resets_at` is set only for the daily cap. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunLimitExceededResponse"];
                 };
             };
         };
