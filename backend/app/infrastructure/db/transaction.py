@@ -19,11 +19,15 @@ This module encodes three rules from ARCHITECTURE.md §5 in code, not just prose
     that rule mechanically; it is enforced by review and by keeping transaction blocks
     short.
 
-ARCHITECTURE.md §5's illustrative example writes `async with self.transaction() as tx:`
-on a service. Today, services call `transaction(self._pool)` directly, as shown in this
-module's tests — a `self.transaction()` convenience method on a shared service base class
-would be a one-line wrapper around this function, but it is deliberately not built here:
-no service exists yet to prove that base class is the right shape.
+Services call `transaction(self._pool)` directly — a module-level function taking the pool,
+not a method — and construct a writer around the handle it yields (`WebsitesWriter(tx)`),
+rather than passing `tx` to each write call. ARCHITECTURE.md §4.2 and §5 show that same
+shape; if you change one, change the other in the same PR.
+
+A `self.transaction()` convenience method on a shared service base class would be a
+one-line wrapper around this function, and is deliberately not built: no second shape has
+emerged across the feature modules to prove what that base class should hold, and one
+indirection that only ever wraps one call is not worth the layer.
 """
 
 from collections.abc import AsyncIterator
