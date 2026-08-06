@@ -1,5 +1,5 @@
-"""HTTP handlers for `/websites/{id}/runs` and `/runs/{id}`. Thin by contract
-(ARCHITECTURE.md §3.2).
+"""HTTP handlers for `/websites/{id}/runs`, `/runs/{id}`, and `/websites/{id}/stats`. Thin
+by contract (ARCHITECTURE.md §3.2).
 
 Every handler below parses its input, calls exactly one service method, and returns the
 result. There is no `if`, no `for`, no SQL, and no second service call anywhere in this
@@ -8,16 +8,22 @@ file. The one thing that looks like logic — `parse_cursor` — is a router-lev
 FastAPI cannot validate declaratively (an opaque, feature-owned cursor format) into either
 a typed `RunCursor` or a `422`, before any service method runs. It contains no business
 rule about runs — it is `decode_cursor` plus one `try`/`except` translating its one
-exception type into HTTP.
+exception type into HTTP. `WindowQuery`, `get_website_stats`'s query parameter, needs no
+such parser: `StatsWindowName` is a `Literal`, so FastAPI itself turns an unrecognized
+`?window=` into a `422` declaratively.
 
 **Authentication vs. authorization, visible in the signatures — same pattern as
 `websites.py`.** Every handler takes `CurrentUserId`, so every endpoint is `401` without a
-valid token. Neither handler passes that id to its service, because both endpoints are
+valid token. No handler passes that id to its service, because all three endpoints are
 reads and reads in this codebase are unscoped by caller (ARCHITECTURE.md §4.1): any
-signed-in user may read any website's run history, and any run's full detail including its
-`llms_txt`. `user_id` is present purely to require a token and is deliberately never
-threaded any further — that is the whole of what makes this feature's tests for "a
-non-owner can read this" meaningful rather than vacuous.
+signed-in user may read any website's run history, any run's full detail including its
+`llms_txt`, and any website's run statistics. `user_id` is present purely to require a
+token and is deliberately never threaded any further — that is the whole of what makes
+this feature's tests for "a non-owner can read this" meaningful rather than vacuous.
+
+`GET /websites/{id}/stats` lives here rather than in a new `stats` feature module because
+the aggregate it runs reads exactly one table, `runs`, which this feature already owns —
+see `app.features.runs.service.RunService.get_website_stats` for the full reasoning.
 """
 
 from typing import Annotated
@@ -28,7 +34,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.deps import CurrentUserId, DbPool
 from app.core.pagination import Page
 from app.features.runs.internals.run_cursor import CursorError, RunCursor, decode_cursor
-from app.features.runs.schemas import RunDetailResponse, RunListItemResponse, RunStatusName
+from app.features.runs.schemas import (
+    RunDetailResponse,
+    RunListItemResponse,
+    RunStatusName,
+    StatsWindowName,
+    WebsiteStatsResponse,
+)
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
 
@@ -80,6 +92,11 @@ LimitQuery = Annotated[
             "than rejected; `<= 0` is a 422."
         ),
     ),
+]
+
+WindowQuery = Annotated[
+    StatsWindowName,
+    Query(description="Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422."),
 ]
 
 
@@ -143,3 +160,24 @@ async def get_run(
     no run.
     """
     return await service.get_run(id)
+
+
+@router.get("/websites/{id}/stats", response_model=WebsiteStatsResponse)
+async def get_website_stats(
+    id: UUID,
+    user_id: CurrentUserId,
+    service: RunServiceDep,
+    window: WindowQuery = "30d",
+) -> WebsiteStatsResponse:
+    """Return one website's run statistics over `window`, bucketed and zero-filled, plus a
+    whole-window summary. Any signed-in user, any website.
+
+    Not filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to
+    require authentication and is intentionally not passed to the service. `404` if `id`
+    names no website; an unrecognized `window` is a native `422` (`StatsWindowName` is a
+    `Literal`, so FastAPI rejects it before this handler runs).
+
+    The path parameter is `id`, not `website_id`, matching `list_runs` above
+    (ARCHITECTURE.md §10.3).
+    """
+    return await service.get_website_stats(id, window=window)

@@ -725,3 +725,40 @@ def parse(timestamp: str) -> datetime:
     exact — an assertion may compare for equality rather than for approximate closeness.
     """
     return datetime.fromisoformat(timestamp)
+
+
+# -----------------------------------------------------------------------------------------
+# EXPLAIN plan helpers, shared by every feature suite that pins a query's plan shape as an
+# acceptance criterion rather than merely trusting the planner.
+#
+# Promoted out of `tests/test_runs_api.py` (PER-155) once a second suite,
+# `tests/test_stats_api.py` (PER-156), needed the same two generic pieces — the same
+# "promote once a second suite needs it" precedent the seed helpers above document. Only the
+# generic mechanics move here: running `EXPLAIN (FORMAT JSON)` and flattening the resulting
+# tree. Each suite keeps its OWN assertion helper(s) over the flattened nodes, because what
+# shape counts as "correct" differs — `test_runs_api.py`'s keyset queries must land on
+# `Index Scan`/`Index Only Scan` with no plain `Sort`; `test_stats_api.py`'s aggregate is
+# selective enough for the planner to prefer a `Bitmap Index Scan` under a `Bitmap Heap
+# Scan` instead, which is a different, and equally correct, way of using the same index.
+# -----------------------------------------------------------------------------------------
+
+
+async def explain_plan(pool: Pool, query: str, *args: Any) -> dict[str, Any]:
+    """Run `EXPLAIN (FORMAT JSON)` on `query` and return its top-level `Plan` node.
+
+    `fetchval` returns the JSON document as `str` (asyncpg does not decode the `json`
+    pseudo-type produced by `EXPLAIN` into a `dict` any more than it does `jsonb` — see
+    `RunService._parse_stats`), so this parses it explicitly.
+    """
+    raw = await pool.fetchval(f"EXPLAIN (FORMAT JSON) {query}", *args)
+    (wrapper,) = json.loads(raw)
+    plan: dict[str, Any] = wrapper["Plan"]
+    return plan
+
+
+def plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten a plan tree into every node it contains, parent first."""
+    nodes = [plan]
+    for child in plan.get("Plans", []):
+        nodes.extend(plan_nodes(child))
+    return nodes

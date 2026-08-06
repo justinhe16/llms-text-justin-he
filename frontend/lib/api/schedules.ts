@@ -20,9 +20,9 @@
 // anything but its default. There is nothing to "add" here later so much as a new field to
 // generate the day that milestone ships — this file should not anticipate it.
 //
-// `getStats(id, window)` is still ABSENT — `GET /websites/{id}/stats` does not exist yet
-// (PER-156, a later wave); see lib/api/websites.ts's header comment for the rest of what's
-// still missing.
+// `getStats(id, window)` is still ABSENT — `GET /websites/{id}/stats` shipped with PER-156,
+// on backend/app/api/routers/runs.py, but no typed helper or Trends tab reads it yet; see
+// lib/api/websites.ts's header comment for the rest of what's still missing.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";

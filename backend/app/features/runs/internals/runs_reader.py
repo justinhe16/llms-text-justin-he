@@ -74,12 +74,23 @@ call time. That is what lets the EXPLAIN test import "the exact SQL string the r
 as a plain module constant and assert against it directly — a query built at call time has
 no single string a test could import without re-deriving it, which is exactly the kind of
 drift this module docstring is trying to prevent two paragraphs up.
+
+## `_WEBSITE_STATS` is the one exception to "no computed expressions in a SELECT"
+
+The "plain columns only" rule two sections up exists to keep the four keyset-pagination
+queries above on `runs_website_id_started_at_idx` — a computed sort key cannot use that
+index. `_WEBSITE_STATS` (`website_stats`, below) is a bucketed aggregate with no keyset
+`ORDER BY` to protect: its `WHERE` is still a plain indexed range on `(website_id,
+started_at)`, but its `SELECT` computes averages, `date_trunc` buckets, and a zero-filled
+`generate_series` join on purpose, because there is no index ordering downstream of an
+aggregate for a computed column to break.
 """
 
 from typing import Any, Final
 from uuid import UUID
 
 from app.features.runs.internals.run_cursor import RunCursor
+from app.features.runs.internals.stats_window import StatsWindow
 from app.features.runs.schemas import RunStatusName
 from app.infrastructure.db.base_repository import Reader
 
@@ -142,6 +153,104 @@ _LIST_BY_WEBSITE_AFTER_CURSOR_WITH_STATUS: Final = f"""
     LIMIT $5
 """
 
+# `GET /websites/{id}/stats` — one aggregate query, no per-bucket queries. See
+# `internals/stats_window.py` for how the five parameters below are derived from `?window=`.
+#
+# Params: $1 website_id (uuid), $2 window start (timestamptz, inclusive), $3 window end
+# (timestamptz, exclusive), $4 step (interval, one bucket wide), $5 bucket field (text,
+# 'hour' | 'day').
+#
+# Why this exact shape, since none of it is obvious from the SQL alone:
+#
+# * `per_bucket` aggregates real rows and is THEN left-joined onto `buckets`. The obvious
+#   alternative — `FROM buckets LEFT JOIN scoped ... GROUP BY` — makes `count(*)` return 1
+#   for an empty bucket, which is the single easiest way to ship a wrong zero-fill.
+#   Aggregating first and `COALESCE`-ing after cannot have that bug.
+# * `totals` is a separate single-row CTE `CROSS JOIN`ed onto every series row. That returns
+#   both response shapes from one query, and a one-row aggregate always produces a row even
+#   over zero input, so the series is still fully zero-filled for a website with no runs.
+#   Cost is a handful of repeated columns over at most 168 rows.
+# * Deliberately NOT `json_agg`. `to_jsonb(timestamptz)` renders using the session
+#   `TimeZone`, so bucket timestamps would come back offset-rendered rather than UTC, and
+#   asyncpg hands json/jsonb back as `str`, requiring a `json.loads`. Plain columns keep
+#   every value a native asyncpg type (`datetime` with `tzinfo=utc`, `int`, `float`).
+# * `AS MATERIALIZED` documents the intent: `runs` is scanned once and the result feeds both
+#   aggregates. (Postgres already materializes a CTE referenced twice; saying so keeps it
+#   true if that ever changes.)
+# * `avg(duration_ms)` relies on `AVG` skipping NULLs, so the denominator is completed runs
+#   only, while `count(*)` still counts failed and in-flight runs in `runs`/`total_runs`. The
+#   outer `COALESCE(..., 0)` fires only when a bucket has zero completed runs. This is the
+#   subtlest thing in the query: `avg(pages_crawled)` below counts every in-window run,
+#   missing stats as `0`, while `avg(duration_ms)` counts only completed ones. Both are
+#   correct for what each one means, but they are not the same population.
+# * `jsonb_typeof(...) = 'number'` rather than a bare cast: `stats` is `NULL` for runs that
+#   predate the crawler and for runs that failed during fetch, and a non-numeric value would
+#   make a bare `::numeric` cast raise. The guard makes the query total over any real data.
+# * `date_trunc($5, ..., 'UTC')` — the three-argument form pins bucketing to UTC instead of
+#   inheriting the session `TimeZone`.
+_WEBSITE_STATS: Final = """
+    WITH buckets AS (
+        SELECT generate_series($2::timestamptz, $3::timestamptz - $4::interval, $4::interval)
+               AS bucket_start
+    ),
+    scoped AS MATERIALIZED (
+        SELECT
+            date_trunc($5::text, r.started_at, 'UTC') AS bucket_start,
+            r.status,
+            r.started_at,
+            CASE WHEN jsonb_typeof(r.stats -> 'pages_crawled') = 'number'
+                 THEN (r.stats ->> 'pages_crawled')::numeric
+                 ELSE 0
+            END AS pages_crawled,
+            CASE WHEN r.status = 'completed' AND r.completed_at IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
+                 ELSE NULL
+            END AS duration_ms
+        FROM runs r
+        WHERE r.website_id = $1::uuid
+          AND r.started_at >= $2::timestamptz
+          AND r.started_at <  $3::timestamptz
+    ),
+    per_bucket AS (
+        SELECT
+            bucket_start,
+            count(*) AS runs,
+            count(*) FILTER (WHERE status = 'completed') AS completed,
+            count(*) FILTER (WHERE status = 'failed') AS failed,
+            avg(pages_crawled) AS avg_pages,
+            avg(duration_ms) AS avg_duration_ms
+        FROM scoped
+        GROUP BY bucket_start
+    ),
+    totals AS (
+        SELECT
+            count(*) AS total_runs,
+            count(*) FILTER (WHERE status = 'completed') AS total_completed,
+            count(*) FILTER (WHERE status = 'failed') AS total_failed,
+            avg(pages_crawled) AS total_avg_pages,
+            avg(duration_ms) AS total_avg_duration_ms,
+            max(started_at) AS last_run_at
+        FROM scoped
+    )
+    SELECT
+        b.bucket_start,
+        COALESCE(p.runs, 0)::bigint AS runs,
+        COALESCE(p.completed, 0)::bigint AS completed,
+        COALESCE(p.failed, 0)::bigint AS failed,
+        COALESCE(p.avg_pages, 0)::double precision AS avg_pages,
+        COALESCE(p.avg_duration_ms, 0)::double precision AS avg_duration_ms,
+        t.total_runs,
+        t.total_completed,
+        t.total_failed,
+        COALESCE(t.total_avg_pages, 0)::double precision AS total_avg_pages,
+        COALESCE(t.total_avg_duration_ms, 0)::double precision AS total_avg_duration_ms,
+        t.last_run_at
+    FROM buckets b
+    LEFT JOIN per_bucket p ON p.bucket_start = b.bucket_start
+    CROSS JOIN totals t
+    ORDER BY b.bucket_start
+"""
+
 
 class RunsReader(Reader):
     """Reads for the runs feature. Private to it — only `RunService` calls this."""
@@ -193,4 +302,16 @@ class RunsReader(Reader):
             cursor.run_id,
             status,
             limit,
+        )
+
+    async def website_stats(self, website_id: UUID, *, window: StatsWindow) -> list[dict[str, Any]]:
+        """Return one row per bucket in `window`, zero-filled, with the website's totals
+        cross-joined onto every row. See `_WEBSITE_STATS` above for the query, and
+        `RunService.get_website_stats` / `_to_stats` for how a row becomes a response.
+
+        Never returns an empty list: `generate_series` in `_WEBSITE_STATS` always yields
+        exactly `window.bucket_count` rows, even for a website with zero runs in range.
+        """
+        return await self.fetch_all(
+            _WEBSITE_STATS, website_id, window.start, window.end, window.step, window.bucket
         )
