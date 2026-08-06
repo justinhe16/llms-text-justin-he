@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef } from "react";
 import { useMutation, useQueryClient, type UseMutationOptions } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -44,14 +45,52 @@ export type PutScheduleInput = {
  * lib/api/fetcher.ts's `extractErrorMessage`), so a `403` from a non-owner reads as the
  * actual reason rather than "Request failed with status 403".
  */
+/** Identifies one dispatch of this mutation, so a response can tell whether a newer write
+ * has overtaken it. */
+type PutScheduleContext = { requestId: number };
+
 export function usePutSchedule(
-  options?: Pick<UseMutationOptions<Schedule, Error, PutScheduleInput>, "onSuccess" | "onError">
+  options?: Pick<
+    UseMutationOptions<Schedule, Error, PutScheduleInput, PutScheduleContext>,
+    "onSuccess" | "onError"
+  >
 ) {
   const queryClient = useQueryClient();
 
+  // Two writes to this endpoint really can overlap — the debounce in
+  // lib/crawls/use-schedule-editor.ts is a timer, not a lock, so a change made while a
+  // request is on the wire starts a second one. Counting dispatches is what lets the older
+  // response recognise that it is no longer the truth.
+  const dispatchCount = useRef(0);
+
   return useMutation({
     mutationFn: (input: PutScheduleInput) => putSchedule(input.websiteId, input.body),
+    onMutate: (): PutScheduleContext => {
+      dispatchCount.current += 1;
+      return { requestId: dispatchCount.current };
+    },
     onSuccess: (data, variables, onMutateResult, context) => {
+      // The response *is* the new schedule — `PUT` echoes the row it just wrote, including
+      // the `next_run_at` the server recomputed. Seeding the cache with it before
+      // invalidating closes a window that is short but very visible: `invalidateQueries`
+      // only *marks* the key stale and starts a refetch, so for the round-trip that follows,
+      // any component reading this key still gets the pre-write value. On a panel whose
+      // controls have already moved to the new setting (lib/crawls/use-schedule-editor.ts),
+      // that reads as the toggle snapping back and then forward again.
+      //
+      // The invalidation below is kept rather than replaced. `setQueryData` updates this one
+      // key from one response; the refetch is what reconciles anything the server changed
+      // that the response does not carry, and keeps the "server is the source of truth"
+      // property this codebase relies on everywhere else.
+      //
+      // Guarded by `requestId`, because responses can arrive out of order: if the older of
+      // two overlapping writes resolves last, writing its body here would regress the cache
+      // to a superseded value and flicker the panel back to it until the refetch corrects
+      // it. Only the newest dispatch is allowed to seed the cache; an overtaken response
+      // still invalidates, which is exactly the right amount of work for it to do.
+      if (onMutateResult.requestId === dispatchCount.current) {
+        queryClient.setQueryData(queryKeys.schedules.detail(variables.websiteId), data);
+      }
       queryClient.invalidateQueries({
         queryKey: queryKeys.schedules.detail(variables.websiteId),
       });

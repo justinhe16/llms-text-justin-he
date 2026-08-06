@@ -41,6 +41,45 @@ export function formatRelativeTime(iso: string, now: number): string {
   return `${Math.floor(elapsed / YEAR_MS)}y ago`;
 }
 
+/**
+ * "due now" / "in 12m" / "in 4h 12m" / "in 6d 3h" — the future-facing counterpart to
+ * `formatRelativeTime` above, and the reason that function could not simply be reused for a
+ * schedule's `next_run_at`: it clamps *every* future timestamp to "now" on purpose, so a run
+ * due in four hours would render as "now" rather than as a countdown.
+ *
+ * Two units, never three. "in 6d 3h 41m" is a number nobody reads to the end, and the third
+ * unit is always the one that changes fastest — so it would also be the one making the line
+ * repaint for no benefit. The larger unit alone ("in 6d") loses the distinction between a run
+ * due tonight and one due tomorrow morning, which is exactly what somebody checking this
+ * panel wants to know.
+ *
+ * A timestamp already in the past reads "due now" rather than counting upward. That state is
+ * real — the cron tick fires on an interval, so a schedule can genuinely sit a little past due
+ * — and "due now" describes it correctly, where "3m ago" would suggest the run had happened.
+ */
+export function formatCountdown(iso: string, now: number): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "unknown";
+
+  const remaining = then - now;
+
+  // Symmetric with `NOW_THRESHOLD_MS` on the past side: under a minute either way is "now",
+  // and the shared clock only ticks every ten seconds regardless (see use-now.ts).
+  if (remaining < NOW_THRESHOLD_MS) return "due now";
+
+  if (remaining < HOUR_MS) return `in ${Math.floor(remaining / MINUTE_MS)}m`;
+
+  if (remaining < DAY_MS) {
+    const hours = Math.floor(remaining / HOUR_MS);
+    const minutes = Math.floor((remaining % HOUR_MS) / MINUTE_MS);
+    return minutes === 0 ? `in ${hours}h` : `in ${hours}h ${minutes}m`;
+  }
+
+  const days = Math.floor(remaining / DAY_MS);
+  const hours = Math.floor((remaining % DAY_MS) / HOUR_MS);
+  return hours === 0 ? `in ${days}d` : `in ${days}d ${hours}h`;
+}
+
 // Built once rather than per call: constructing an Intl formatter is the expensive part,
 // and a table of rows re-rendering on every poll tick would otherwise build one per cell
 // per tick. `undefined` for the locale means "whatever the browser is set to", which is
