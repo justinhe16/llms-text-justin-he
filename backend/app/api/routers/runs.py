@@ -1,5 +1,5 @@
-"""HTTP handlers for `/websites/{id}/runs` and `/runs/{id}`. Thin by contract
-(ARCHITECTURE.md §3.2).
+"""HTTP handlers for `/websites/{id}/runs`, `/runs/{id}`, and `/websites/{id}/stats`. Thin
+by contract (ARCHITECTURE.md §3.2).
 
 Every handler below parses its input, calls exactly one service method, and returns the
 result. There is no `if`, no `for`, no SQL, and no second service call anywhere in this
@@ -8,19 +8,25 @@ file. The one thing that looks like logic — `parse_cursor` — is a router-lev
 FastAPI cannot validate declaratively (an opaque, feature-owned cursor format) into either
 a typed `RunCursor` or a `422`, before any service method runs. It contains no business
 rule about runs — it is `decode_cursor` plus one `try`/`except` translating its one
-exception type into HTTP.
+exception type into HTTP. `WindowQuery`, `get_website_stats`'s query parameter, needs no
+such parser: `StatsWindowName` is a `Literal`, so FastAPI itself turns an unrecognized
+`?window=` into a `422` declaratively.
 
 **Authentication vs. authorization, visible in the signatures — same pattern as
 `websites.py`.** Every handler takes `CurrentUserId`, so every endpoint is `401` without a
-valid token. `trigger_run` is now the exception to "reads are unscoped, writes are owned"
-that this module used to be able to say applied to nothing here — it passes `user_id` on to
-`RunService.trigger_run`, which calls `require_owner` with it, because it is the one WRITE
-in this router (ARCHITECTURE.md §4.2). `list_runs` and `get_run` still take `CurrentUserId`
-purely to require a token and still deliberately never pass it anywhere: they are reads, and
-reads in this codebase are unscoped by caller (ARCHITECTURE.md §4.1). Any signed-in user may
-read any website's run history and any run's full detail including its `llms_txt` —
-`user_id` on those two exists only so this feature's tests for "a non-owner can read this"
-are meaningful rather than vacuous.
+valid token. `trigger_run` is the one handler that passes that id on to its service, because
+it is the one WRITE in this router and writes are ownership-checked — `RunService.trigger_run`
+hands it straight to `require_owner` (ARCHITECTURE.md §4.2). The three reads — `list_runs`,
+`get_run`, and `get_website_stats` — all still take `CurrentUserId` purely to require a token
+and deliberately never thread it any further, because reads in this codebase are unscoped by
+caller (ARCHITECTURE.md §4.1): any signed-in user may read any website's run history, any
+run's full detail including its `llms_txt`, and any website's run statistics. That asymmetry
+is the authorization contract in miniature, and it is what makes this feature's tests for "a
+non-owner can read this, but cannot trigger this" meaningful rather than vacuous.
+
+`GET /websites/{id}/stats` lives here rather than in a new `stats` feature module because
+the aggregate it runs reads exactly one table, `runs`, which this feature already owns —
+see `app.features.runs.service.RunService.get_website_stats` for the full reasoning.
 """
 
 from typing import Annotated
@@ -38,7 +44,9 @@ from app.features.runs.schemas import (
     RunLimitExceededResponse,
     RunListItemResponse,
     RunStatusName,
+    StatsWindowName,
     TriggerRunResponse,
+    WebsiteStatsResponse,
 )
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
@@ -103,6 +111,11 @@ LimitQuery = Annotated[
             "than rejected; `<= 0` is a 422."
         ),
     ),
+]
+
+WindowQuery = Annotated[
+    StatsWindowName,
+    Query(description="Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422."),
 ]
 
 
@@ -214,6 +227,27 @@ async def get_run(
     no run.
     """
     return await service.get_run(id)
+
+
+@router.get("/websites/{id}/stats", response_model=WebsiteStatsResponse)
+async def get_website_stats(
+    id: UUID,
+    user_id: CurrentUserId,
+    service: RunServiceDep,
+    window: WindowQuery = "30d",
+) -> WebsiteStatsResponse:
+    """Return one website's run statistics over `window`, bucketed and zero-filled, plus a
+    whole-window summary. Any signed-in user, any website.
+
+    Not filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to
+    require authentication and is intentionally not passed to the service. `404` if `id`
+    names no website; an unrecognized `window` is a native `422` (`StatsWindowName` is a
+    `Literal`, so FastAPI rejects it before this handler runs).
+
+    The path parameter is `id`, not `website_id`, matching `list_runs` above
+    (ARCHITECTURE.md §10.3).
+    """
+    return await service.get_website_stats(id, window=window)
 
 
 @router.post(

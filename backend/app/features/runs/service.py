@@ -10,11 +10,12 @@ beside these methods; it does not retrofit one into `list_runs` or `get_run`." T
 what happened: `list_runs` and `get_run` are unchanged, and everything new lives in
 `trigger_run` and the private helpers beside it.
 
-**Reads are still unscoped, exactly as before.** `list_runs` and `get_run` never look at who
-is asking — `CurrentUserId` is threaded through `app.api.routers.runs` purely to require a
-token (ARCHITECTURE.md §4.1). `require_owner` now appears in this file for the first time,
-but only inside `trigger_run`, because that is the one method here that writes; there is
-still no ownership check on either read, and there should never be one.
+**Reads are still unscoped, the same rule `websites/service.py` follows.** `list_runs`,
+`get_run`, and `get_website_stats` never look at who is asking — `CurrentUserId` is threaded
+through `app.api.routers.runs` purely to require a token (ARCHITECTURE.md §4.1).
+`require_owner` appears in this file for the first time in PER-160, but only inside
+`trigger_run`, because that is the one method here that writes; there is still no ownership
+check on any of the three reads, and there should never be one.
 
 **`RunService` depends on `WebsiteService`, never on `WebsitesReader`.** `list_runs` and
 `trigger_run` both have to 404 on an unknown website before anything else about it means
@@ -128,13 +129,18 @@ from app.features.runs.internals.run_limits import (
 )
 from app.features.runs.internals.runs_reader import RunsReader
 from app.features.runs.internals.runs_writer import RunsWriter
+from app.features.runs.internals.stats_window import StatsWindow, resolve_window
 from app.features.runs.schemas import (
     RunAlreadyInFlightDetail,
     RunDetailResponse,
     RunLimitExceededDetail,
     RunListItemResponse,
+    RunStatsPoint,
+    RunStatsTotals,
     RunStatusName,
+    StatsWindowName,
     TriggerRunResponse,
+    WebsiteStatsResponse,
 )
 from app.features.websites.service import WebsiteService
 from app.infrastructure.db.transaction import transaction
@@ -297,6 +303,51 @@ def _daily_limit_exceeded(limit: int, resets_at: datetime, now: datetime) -> HTT
         # `mode="json"` again: `resets_at` is a `datetime` here, and the same
         # not-JSON-serializable trap applies to it as to the UUID above.
         detail=detail.model_dump(mode="json"),
+    )
+
+
+def _to_stats(window: StatsWindow, rows: list[dict[str, Any]]) -> WebsiteStatsResponse:
+    """Build the full `GET /websites/{id}/stats` body from `_WEBSITE_STATS`'s rows.
+
+    `rows` is never empty — `RunsReader.website_stats`'s `generate_series` always yields
+    `window.bucket_count` of them — so `totals` is read off `rows[0]` rather than recomputed
+    in Python from the series. The `assert` below documents that invariant instead of silently
+    indexing into a list that could, in principle, be empty.
+
+    All PRESENTATION rounding happens here, in exactly one place, never in SQL: `avg(...)`
+    already zero-filled every empty bucket and the whole-window totals, so this only rounds
+    values SQL already computed correctly.
+    """
+    assert rows, "generate_series always yields window.bucket_count rows"
+
+    series = [
+        RunStatsPoint(
+            t=row["bucket_start"],
+            runs=row["runs"],
+            completed=row["completed"],
+            failed=row["failed"],
+            avg_pages=round(row["avg_pages"], 2),
+            avg_duration_ms=round(row["avg_duration_ms"]),
+        )
+        for row in rows
+    ]
+
+    total_runs = rows[0]["total_runs"]
+    total_completed = rows[0]["total_completed"]
+    totals = RunStatsTotals(
+        total_runs=total_runs,
+        completed=total_completed,
+        failed=rows[0]["total_failed"],
+        # `None`, never `0.0`, when there are no runs to compute a rate over — see
+        # `RunStatsTotals.success_rate`.
+        success_rate=round(total_completed / total_runs, 4) if total_runs > 0 else None,
+        avg_duration_ms=round(rows[0]["total_avg_duration_ms"]),
+        avg_pages=round(rows[0]["total_avg_pages"], 2),
+        last_run_at=rows[0]["last_run_at"],
+    )
+
+    return WebsiteStatsResponse(
+        window=window.name, bucket=window.bucket, series=series, totals=totals
     )
 
 
@@ -525,3 +576,24 @@ class RunService:
                 run_id,
                 exc_info=True,
             )
+
+    async def get_website_stats(
+        self, website_id: UUID, *, window: StatsWindowName
+    ) -> WebsiteStatsResponse:
+        """Return `website_id`'s run statistics over `window`, pre-aggregated into fixed,
+        zero-filled buckets plus a whole-window summary — one query, no per-bucket queries.
+
+        Reuses `WebsiteService.get_website` purely for its `404`, exactly like `list_runs`
+        above — its return value is unused here (ARCHITECTURE.md §3.1: a feature calls
+        another feature's service, never its reader). Never scoped by caller: reads are
+        unscoped in this codebase (ARCHITECTURE.md §4.1), and there is no `require_owner`
+        call anywhere in this path.
+
+        Raises:
+            HTTPException: `404` if there is no website with that id.
+        """
+        await self._website_service.get_website(website_id)
+
+        resolved = resolve_window(window, datetime.now(UTC))
+        rows = await self._reader.website_stats(website_id, window=resolved)
+        return _to_stats(resolved, rows)

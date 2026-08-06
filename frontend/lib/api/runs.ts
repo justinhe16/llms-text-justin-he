@@ -4,10 +4,11 @@
 // endpoint list in this file, together with lib/api/websites.ts, lib/api/schedules.ts, and
 // lib/api/health.ts, is the entire inventory of what the frontend can ask the backend for.
 //
-// A trigger helper (`POST /websites/{id}/runs`) and any stats endpoint are deliberately
-// ABSENT. The runs feature (PER-155) shipped only its two read routes — see
-// backend/app/api/routers/runs.py, which declares exactly `GET /websites/{id}/runs` and `GET
-// /runs/{id}` and no more — and stats (PER-156) has not landed on the websites router either.
+// A trigger helper (`POST /websites/{id}/runs`) is deliberately ABSENT — the runs feature
+// (PER-155) shipped only its two read routes. `GET /websites/{id}/stats` (PER-156) has since
+// landed on backend/app/api/routers/runs.py alongside them, but this file has no `getStats`
+// helper for it yet — see lib/api/websites.ts's header comment for why writing one ahead of
+// a Trends tab that would call it would be premature.
 // Schedules are no longer in that list: `GET`/`PUT /websites/{id}/schedule` shipped with
 // PER-154 and live in `lib/api/schedules.ts`, not here or in `lib/api/websites.ts` — the
 // schedules feature owns its own response shapes, the same way this file owns

@@ -32,7 +32,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from asyncpg import Pool
-from conftest import TEST_USER_A_ID, seed_run, seed_website
+from conftest import TEST_USER_A_ID, explain_plan, plan_nodes, seed_run, seed_website
 from httpx import AsyncClient
 
 from app.features.runs.internals.run_cursor import (
@@ -521,32 +521,11 @@ async def _seed_many_runs_for_explain(pool: Pool, website_id: UUID) -> None:
     await pool.execute("ANALYZE runs")
 
 
-async def _explain_plan(pool: Pool, query: str, *args: Any) -> dict[str, Any]:
-    """Run `EXPLAIN (FORMAT JSON)` on `query` and return its top-level `Plan` node.
-
-    `fetchval` returns the JSON document as `str` (asyncpg does not decode the `json`
-    pseudo-type produced by `EXPLAIN` into a `dict` any more than it does `jsonb` — see
-    `RunService._parse_stats`), so this parses it explicitly.
-    """
-    raw = await pool.fetchval(f"EXPLAIN (FORMAT JSON) {query}", *args)
-    (wrapper,) = json.loads(raw)
-    plan: dict[str, Any] = wrapper["Plan"]
-    return plan
-
-
-def _plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten a plan tree into every node it contains, parent first."""
-    nodes = [plan]
-    for child in plan.get("Plans", []):
-        nodes.extend(_plan_nodes(child))
-    return nodes
-
-
 def _assert_uses_an_index_not_a_seq_scan(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """The baseline shape assertion every regime below must satisfy, and the ONLY one the
     `status='pending'` regime is held to — see that regime's comment for why.
     """
-    nodes = _plan_nodes(plan)
+    nodes = plan_nodes(plan)
     node_types = [node["Node Type"] for node in nodes]
     assert "Seq Scan" not in node_types, node_types
     assert any(t in ("Index Scan", "Index Only Scan") for t in node_types), node_types
@@ -588,7 +567,7 @@ async def test_history_query_plan_uses_the_composite_index_not_a_seq_scan(
     # by name: it is the only index that could possibly answer "this website's runs,
     # newest first" without a sort.
     _assert_uses_the_composite_index_via_its_natural_ordering(
-        await _explain_plan(websites_db, _LIST_BY_WEBSITE, website_id, page_probe_limit)
+        await explain_plan(websites_db, _LIST_BY_WEBSITE, website_id, page_probe_limit)
     )
 
     # Regime 2: status='completed' -- an extra Filter over the SAME Index Cond as regime 1
@@ -596,7 +575,7 @@ async def test_history_query_plan_uses_the_composite_index_not_a_seq_scan(
     # majority of seeded rows, so it is nowhere near selective enough to justify anything
     # but the composite index.
     _assert_uses_the_composite_index_via_its_natural_ordering(
-        await _explain_plan(
+        await explain_plan(
             websites_db, _LIST_BY_WEBSITE_WITH_STATUS, website_id, "completed", page_probe_limit
         )
     )
@@ -613,7 +592,7 @@ async def test_history_query_plan_uses_the_composite_index_not_a_seq_scan(
     # Asserting a plan shape stronger than "used an index, not a sequential scan" here
     # would make this test flaky across environments for a difference that is not a bug.
     _assert_uses_an_index_not_a_seq_scan(
-        await _explain_plan(
+        await explain_plan(
             websites_db, _LIST_BY_WEBSITE_WITH_STATUS, website_id, "pending", page_probe_limit
         )
     )
@@ -660,7 +639,7 @@ async def test_the_keyset_cursor_bound_reaches_the_index_condition(websites_db: 
     )
     assert deep_row is not None
 
-    plan = await _explain_plan(
+    plan = await explain_plan(
         websites_db,
         _LIST_BY_WEBSITE_AFTER_CURSOR,
         website_id,

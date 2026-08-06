@@ -32,6 +32,13 @@ RunStatusName = Literal["pending", "processing", "completed", "failed"]
 # the UI.
 RunTriggerName = Literal["manual", "scheduled"]
 
+# The three windows `GET /websites/{id}/stats` accepts, and the `date_trunc` field each one
+# buckets on. Both `Literal`, not `enum.Enum`, for the same reason as the two above: it
+# renders as an OpenAPI enum and an unrecognized value is a 422 that names the valid options.
+# See `app.features.runs.internals.stats_window` for the window -> bucket -> step mapping.
+StatsWindowName = Literal["7d", "30d", "90d"]
+StatsBucketName = Literal["hour", "day"]
+
 
 class RunListItemResponse(BaseModel):
     """One row of `GET /websites/{id}/runs`.
@@ -173,3 +180,77 @@ class RunLimitExceededResponse(BaseModel):
     `RunAlreadyInFlightResponse` above."""
 
     detail: RunLimitExceededDetail
+
+
+class RunStatsPoint(BaseModel):
+    """One bucket of `GET /websites/{id}/stats`'s `series`.
+
+    Every bucket in the requested window appears exactly once, in order — including buckets
+    with zero runs, which report zeroes rather than being omitted (`RunsReader.
+    website_stats`'s `_WEBSITE_STATS` zero-fills them with `generate_series`). `avg_pages`
+    and `avg_duration_ms` are therefore never `null`: see `service.py`'s `_to_stats` for the
+    rounding that turns SQL's already-zero-filled averages into these two fields.
+    """
+
+    t: datetime
+    """This bucket's start, UTC. The field is named `t`, not `bucket_start`, because it is
+    the ticket's own wire name."""
+
+    runs: int
+    """Every run that started in this bucket, regardless of status — pending, processing,
+    completed, or failed all count here."""
+
+    completed: int
+    failed: int
+
+    avg_pages: float
+    """Mean `pages_crawled` (from `runs.stats`) over every run in this bucket, completed or
+    not — a run with no usable stats contributes `0`, not a gap in the denominator. See
+    `internals/runs_reader.py`'s `_WEBSITE_STATS` for why this average and `avg_duration_ms`
+    below use different populations."""
+
+    avg_duration_ms: int
+    """Mean duration over only this bucket's COMPLETED runs — failed and in-flight runs have
+    no meaningful duration and are excluded from the denominator, not counted as zero. An
+    `int`: sub-millisecond precision on an averaged crawl duration is noise."""
+
+
+class RunStatsTotals(BaseModel):
+    """The whole-window summary alongside `series` in `GET /websites/{id}/stats`.
+
+    Field names are `completed`/`failed`, matching `RunStatsPoint` above — not
+    `total_completed`/`total_failed` — because they are still counts of completed/failed
+    runs, merely summed over the whole window instead of one bucket.
+    """
+
+    total_runs: int
+    completed: int
+    failed: int
+
+    success_rate: float | None
+    """`completed / total_runs`, rounded, or `None` — never `0.0` — when `total_runs == 0`.
+    A website with no runs yet has no success rate to report; `0.0` would misreport it as
+    100% failure."""
+
+    avg_duration_ms: int
+    """Same population rule as `RunStatsPoint.avg_duration_ms`, over the whole window."""
+
+    avg_pages: float
+
+    last_run_at: datetime | None
+    """The most recent `started_at` in the window, or `None` — never a fabricated
+    value — when `total_runs == 0`."""
+
+
+class WebsiteStatsResponse(BaseModel):
+    """The full body of `GET /websites/{id}/stats`.
+
+    `window` and `bucket` echo the request back (`bucket` is derived from `window`, never
+    supplied by the caller — see `internals/stats_window.resolve_window`), so a client that
+    only stores the response still knows what it is looking at.
+    """
+
+    window: StatsWindowName
+    bucket: StatsBucketName
+    series: list[RunStatsPoint]
+    totals: RunStatsTotals
