@@ -250,6 +250,47 @@ async def test_a_public_ipv6_literal_is_allowed() -> None:
     assert target.connect_url == f"http://[{PUBLIC_V6}]/"
 
 
+async def test_a_zone_id_on_a_private_ipv6_literal_does_not_smuggle_it_past_the_guard() -> None:
+    """A scoped-address suffix must not change how the base 128 bits are classified.
+
+    `ipaddress` parses `fe80::1%eth0` as a link-local address with a `scope_id`, and the
+    interesting question is whether attaching a zone makes the guard reason about a
+    different value than the address itself. It must not: the zone is routing metadata, not
+    part of the address.
+    """
+    for url in ("http://[fe80::1%25eth0]/", "http://[fec0::1%25eth0]/", "http://[::1%25lo0]/"):
+        with pytest.raises(SsrfBlockedError):
+            await validate_url(url)
+
+
+async def test_a_zone_id_on_a_public_ipv6_literal_survives_into_a_well_formed_connect_url() -> None:
+    """The allowed half of the case above, and the reason it is worth pinning.
+
+    `connect_url` is assembled by string interpolation into `[...]`, so an address whose
+    text contains a `%` is exactly the shape that would produce a malformed URL if the
+    brackets were ever dropped or the zone escaped them. `ip_address()` rejects `/`, `@`
+    and `]` inside a zone id, so there is no way to break out of the brackets — this test
+    exists so that stays true, and so the zoned form is known to round-trip rather than
+    merely assumed to.
+
+    Note the `%25` that survives into the parsed address rather than becoming a bare `%`.
+    RFC 6874 says a zone id is percent-ENCODED inside a URI (`%25eth0` on the wire meaning
+    `%eth0`), and `urlsplit().hostname` does not percent-decode, so what reaches
+    `ip_address()` is the literal text `...%25eth0` and the resulting `scope_id` is the
+    slightly surprising `"25eth0"`. Harmless — the zone is never used for anything, and only
+    the base 128 bits are ever classified — but asserted rather than tidied away, because
+    "decode the host first" is precisely the change that must never be made here: it is what
+    would turn a percent-encoded loopback (`http://%31%32%37.0.0.1/`) back into an address,
+    and this guard's safety rests on the host text never being decoded before it is
+    classified.
+    """
+    target = await validate_url(f"http://[{PUBLIC_V6}%25eth0]/")
+
+    assert target.ip == f"{PUBLIC_V6}%25eth0"
+    assert target.connect_url == f"http://[{PUBLIC_V6}%25eth0]/"
+    assert target.host_header == f"{PUBLIC_V6}%25eth0"
+
+
 async def test_explicit_default_https_port_is_allowed_and_omitted_from_the_host_header() -> None:
     resolver = _fake_resolver({"public.test": [PUBLIC_V4]})
     target = await validate_url("https://public.test:443/", resolver=resolver)

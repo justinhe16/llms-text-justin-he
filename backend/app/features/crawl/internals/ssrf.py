@@ -208,14 +208,20 @@ def _classify(address: IPv4Address | IPv6Address) -> str | None:
         return f"{address} is an unspecified address"
     # DEPRECATED IPv6 SITE-LOCAL (fec0::/10), AND THE ONE GAP THIS FUNCTION HAD.
     #
-    # Measured on this project's interpreter, `fec0::1` answers False to every single check
-    # above — including `is_global`, which is `not is_private` for IPv6, and `fec0::/10` is
-    # not in `ipaddress`'s IPv6 private-networks list. RFC 3879 deprecated the range in
-    # 2004, but "deprecated" is a statement about what new deployments should do, not about
-    # what a resolver will hand back or what an internal network still answers on, and
-    # `is_site_local` is a real property precisely because the range is still out there.
-    # An `is_global`-only guard, and the `is_global`-plus-named-properties guard this
-    # function had before it, both let it through.
+    # Measured on this project's pinned interpreter (CPython 3.12.13), `fec0::1` answers
+    # every check above like this:
+    #
+    #     is_global    True    is_private     False   is_loopback    False
+    #     is_reserved  False   is_link_local  False   is_multicast   False
+    #     is_unspecified False                        is_site_local  True
+    #
+    # So this range is not merely *missed* by `is_global` — it is affirmatively reported as
+    # GLOBAL, and every other named check above passes it too. `is_site_local` is the only
+    # property in the standard library that identifies it, which makes this line the entire
+    # defense against `fec0::/10` rather than one more redundant layer over `is_global`.
+    # RFC 3879 deprecated the range in 2004, but "deprecated" describes what new deployments
+    # should do — not what a resolver will hand back, or what an internal network still
+    # answers on.
     if isinstance(address, IPv6Address) and address.is_site_local:
         return f"{address} is a deprecated site-local address"
     return None
@@ -347,8 +353,17 @@ async def validate_url(
         # socket.gaierror is a subclass of OSError; catching OSError covers both it and
         # any other resolver failure (e.g. a fake resolver raising a plain OSError in
         # tests) with one branch.
-        except OSError as error:
-            raise SsrfBlockedError(url, f"DNS resolution for {host!r} failed: {error}") from None
+        except OSError:
+            # The resolver's own message is deliberately NOT interpolated. Every
+            # `SsrfBlockedError.reason` is treated as safe to display verbatim — it is
+            # written straight into `runs.error`, which every signed-in user can read
+            # (ARCHITECTURE.md §4.1) — and that guarantee holds only while every reason is
+            # a string this module composed itself. A `socket.gaierror`'s text comes from
+            # the platform resolver, so it is the one value here that this module does not
+            # control the content of. It is generic library text in practice; excluding it
+            # costs nothing and keeps "safe verbatim" true by construction rather than by
+            # inspection of whatever libc happens to say.
+            raise SsrfBlockedError(url, f"DNS resolution for {host!r} failed") from None
         if not resolved:
             raise SsrfBlockedError(url, f"DNS resolution for {host!r} returned no addresses")
         addresses = []

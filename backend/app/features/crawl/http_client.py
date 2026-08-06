@@ -33,8 +33,20 @@ def build_crawl_client(settings: Settings) -> httpx.AsyncClient:
     ticket exists to guarantee.
 
     Constructing this client opens no socket and makes no network call, which is why
-    `open_worker_resources` (app/worker/settings.py, a later phase) can call this
-    unconditionally in `on_startup` without a way for it to fail.
+    `open_worker_resources` (app/worker/settings.py) can call this unconditionally in
+    `on_startup` without a way for it to fail.
+
+    **Known, accepted, and worth writing down: httpcore pools connections by
+    `(scheme, host, port)` of the URL actually dialed — which, for this client, is the
+    validated IP.** Two different hostnames that resolve to the same IP and port (a shared
+    CDN edge, say) can therefore share one keep-alive connection, so the second request's
+    `Host` header travels over a TLS session negotiated with the first hostname's SNI. This
+    is NOT an SSRF hole: both hostnames must already have passed `validate_url()`
+    independently, and no address the guard refused becomes reachable this way. It is a
+    response-attribution wrinkle on shared-hosting IPs, in the same family as this client's
+    cookie jar being keyed on the dialed IP rather than the origin host. Both are follow-ups
+    for the ticket that makes the frontier span more than one host; today a run fetches a
+    single site, so neither can arise.
     """
     timeout = httpx.Timeout(settings.crawl_request_timeout_s)
     limits = httpx.Limits(
