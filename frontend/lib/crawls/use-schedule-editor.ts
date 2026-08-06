@@ -157,10 +157,24 @@ export function useScheduleEditor({
     const body = draftToBody(draft);
     if (body === null) return;
 
-    // Back where we started — toggled on and off again inside the window, say. There is
-    // nothing to persist, and firing a no-op `PUT` would still bump `updated_at` and
-    // invalidate every mounted websites list for a change nobody made.
-    if (sameBody(body, serverBody)) {
+    // "Back where we started" — toggled on and then off again, say. Usually there is nothing
+    // to persist, and firing a no-op `PUT` would still bump `updated_at` and invalidate every
+    // mounted websites list for a change nobody made.
+    //
+    // But that is only true if the server is going to STAY at `serverBody`, and it will not
+    // while a request is in flight carrying something else. `serverBody` is the last
+    // *response*, not the value the server is about to hold. Revert inside a round-trip and
+    // this branch would compare the user's newest intent against a snapshot the in-flight
+    // write is about to invalidate, discard it as "no change", and let the abandoned write
+    // land and win — leaving the panel showing the setting the user just undid, with nothing
+    // left to correct it. So when an in-flight write disagrees with `serverBody`, returning
+    // to `serverBody` is a real change and has to be sent like any other.
+    const inFlightMovesServerAway =
+      isPending &&
+      latestSentBody.current !== null &&
+      !sameBody(latestSentBody.current, serverBody);
+
+    if (sameBody(body, serverBody) && !inFlightMovesServerAway) {
       unsentBody.current = null;
       setDraft(null);
       return;
