@@ -2,7 +2,8 @@ import type { LucideIcon } from "lucide-react";
 
 /**
  * A tab that exists in the shell but whose feature has not been built yet — the Schedule
- * and Trends panels, until PER-168 and PER-169 land.
+ * panel, until PER-168 lands. Trends was the other one; PER-169 has replaced it, so this
+ * component now has exactly one call site left.
  *
  * ## Why these are rendered at all
  *
@@ -14,8 +15,8 @@ import type { LucideIcon } from "lucide-react";
  *
  * Swap the `<PlaceholderTab .../>` for the real panel in
  * `components/crawls/website-detail.tsx` and delete nothing else. This component takes no
- * dependency on either feature, and neither feature needs to touch it — when both have
- * landed, this file has no call sites left and should go with the second of them.
+ * dependency on either feature, and neither feature needs to touch it — once PER-168 replaces
+ * the last one, this file has no call sites left and should be deleted along with it.
  */
 export function PlaceholderTab({
   icon: Icon,

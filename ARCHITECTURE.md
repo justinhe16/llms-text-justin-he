@@ -877,6 +877,18 @@ rather than errors to report at all.
 If a dark theme is ever wanted, it is a designed feature with its own ticket — not something
 that accumulates one `dark:` class at a time.
 
+**One generated primitive has to be re-edited every time it is regenerated.**
+`frontend/components/ui/chart.tsx` ships from the shadcn registry with two-theme support: a
+`THEMES = { light: "", dark: ".dark" }` map, a `theme` alternative to `color` in its config
+type, and a `ChartStyle` that emits one CSS block per theme, the second prefixed `.dark`.
+That half is deleted in this repo, and the file carries a `LOCAL EDIT` comment saying so.
+
+It is worth knowing *why* the usual guardrail does not cover this one. `app/globals.css`'s
+`@custom-variant dark (&:not(*))` neuters Tailwind's `dark:` **variant** — but what this
+component emits is a raw `.dark [data-chart=…]` selector inside a `<style>` tag, which never
+passes through Tailwind at all. The dead ruleset would ship on every chart and no static gate
+would say a word. Re-running `npx shadcn@latest add chart` restores it; remove it again.
+
 ### 8.6 Data fetching
 
 **The generated client is the contract.** `frontend/lib/api/openapi.json` is a checked-in
@@ -911,13 +923,24 @@ backend, because it only ever reads the JSON already in the repo. Both checks fa
 **The query key factory.** `frontend/lib/query/query-keys.ts` is the only place a React
 Query cache key is constructed — `queryKeys.websites.all`, `.list(include?)`,
 `.detail(id)`, the mirroring `queryKeys.runs.all`, `.list(websiteId, options?)`,
-`.detail(id)`, and `queryKeys.schedules.detail(websiteId)` — so that invalidating "every
-website" or "this one website" (or "every run" or "this one run", or "this one website's
-schedule") is a call to a function here rather than an array literal a caller has to get
-byte-for-byte right at every call site. `schedules` has no `.all`/`.list` of its own: a
-schedule is 1:1 with a website and has no independent id anywhere in the API surface, so
-`websiteId` alone is both the scope and the whole key, unlike `runs`, which is genuinely a
-collection per website.
+`.detail(id)`, `queryKeys.schedules.detail(websiteId)`, and
+`queryKeys.stats.detail(websiteId, window)` — so that invalidating "every website" or "this
+one website" (or "every run" or "this one run", or "this one website's schedule") is a call
+to a function here rather than an array literal a caller has to get byte-for-byte right at
+every call site. `schedules` has no `.all`/`.list` of its own: a schedule is 1:1 with a
+website and has no independent id anywhere in the API surface, so `websiteId` alone is both
+the scope and the whole key, unlike `runs`, which is genuinely a collection per website.
+
+`stats` (`GET /websites/{id}/stats`, the Trends tab) is a separate root rather than a
+`runs.*` key, even though `lib/api/runs.ts` owns its `getStats` helper and it aggregates the
+very same rows. `runs.forWebsite(id)` exists to be invalidated and is a prefix of
+`["runs", "list", websiteId]`; nesting stats under `runs` would either fall outside that
+prefix, making the nesting decorative, or inside it, so that every "this website's history
+changed" invalidation also dropped an aggregate the Trends tab may be rendering. Its
+`window` is part of the key for the reason `include` is part of `websites.list`: `?window=7d`
+and `?window=90d` are different responses with different `bucket` fields and different
+series lengths, and one key for both would render 7d's hourly buckets under day labels until
+the refetch landed.
 
 `runs` carries two further keys, both added for the detail page. `.infinite(websiteId,
 filters?)` is the same list read through `useInfiniteQuery` rather than `useQuery`
