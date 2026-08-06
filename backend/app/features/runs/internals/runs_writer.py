@@ -1,4 +1,4 @@
-"""Every write in the runs feature — six statements, which arrived from three directions.
+"""Every write in the runs feature — seven statements, which arrived from four directions.
 
 `POST /websites/{id}/runs` owns `insert_manual` and `mark_failed`: create a `pending` run,
 and undo it if enqueueing the job afterwards fails. The crawl worker
@@ -8,7 +8,11 @@ a successful crawl's artifact, Storage location, and stats; `mark_processing_fai
 a terminal failure for a crawl that never produces one. The cron tick
 (`ScheduleService.run_due_schedules`, reached only through `RunService.create_scheduled_run`
 — ARCHITECTURE.md §3.1) owns `insert_scheduled`: the same shape as `insert_manual`, with the
-two differences `_INSERT_SCHEDULED`'s comment names.
+two differences `_INSERT_SCHEDULED`'s comment names. The stuck-run reaper
+(`RunService.reap_stuck_runs`, PER-166) is the fourth direction, and it introduced no
+statement of its own except `return_processing_to_pending` — it reuses
+`mark_processing_failed` for the runs it gives up on, because "a claimed run that will never
+finish" is the same write whether the worker noticed or the reaper did.
 
 **Why there are two "mark this failed" statements rather than one.** They guard on different
 statuses, and that is the whole of the difference: `mark_failed` fires on the enqueue-failure
@@ -104,19 +108,67 @@ _MARK_FAILED: Final = """
 
 # THE WORKER'S IDEMPOTENCY GUARD, and the reason it is a conditional UPDATE rather than a
 # SELECT followed by an UPDATE. arq can deliver the same job more than once, and
-# `WorkerSettings.MAX_JOBS = 2` (app/worker/settings.py) means two of them can be in flight
-# on one machine at the same moment. Both workers may issue this statement; Postgres's row
-# lock serializes them, and only the one whose UPDATE actually matches `status = 'pending'`
-# gets a row back from `RETURNING`. Read-then-write cannot make that guarantee at any
-# isolation level this application runs at — both readers would see `pending` and both would
-# proceed to crawl the same run.
+# `MAX_JOBS = 2` (app/worker/policy.py) means two of them can be in flight on one machine at
+# the same moment. Both workers may issue this statement; Postgres's row lock serializes
+# them, and only the one whose UPDATE actually matches `status = 'pending'` gets a row back
+# from `RETURNING`. Read-then-write cannot make that guarantee at any isolation level this
+# application runs at — both readers would see `pending` and both would proceed to crawl the
+# same run.
+#
+# `attempts = attempts + 1` AND `claimed_at = now()` RIDE ON THIS EXACT STATEMENT, and that
+# is the whole reason the retry budget is trustworthy. Both are incremented by the same
+# conditional UPDATE that wins the claim, inside the same row lock, so there is no window in
+# which a run is `processing` with a stale attempt count or an unset claim time — and no way
+# for a job that LOST the race to inflate either number, because its UPDATE matches zero
+# rows. Doing it as a second statement would reintroduce exactly the read-then-write hazard
+# the paragraph above rejects.
+#
+# `RETURNING attempts`, not `id`: the caller needs the number this claim just produced (is
+# this the last attempt? what does the error message say?), and reading it back with a
+# separate SELECT would be a second round trip returning a value that could already have
+# moved.
 #
 # The enum is cast explicitly, matching `_LIST_BY_WEBSITE_WITH_STATUS` in
 # `runs_reader.py` and `seed_run` in `tests/conftest.py`.
 _CLAIM_PENDING: Final = """
     UPDATE runs
-    SET status = 'processing'::run_status
+    SET status = 'processing'::run_status,
+        attempts = attempts + 1,
+        claimed_at = now()
     WHERE id = $1 AND status = 'pending'::run_status
+    RETURNING attempts
+"""
+
+# THE ONLY STATEMENT IN THIS CODEBASE THAT MOVES A RUN BACKWARDS. Guarded on `processing`,
+# like the two terminal writes below it, and for the same reason: it is the undo for a claim
+# this worker made and then could not act on, so a row that has already reached a terminal
+# state by some other path must be left exactly where it is.
+#
+# Two callers, one meaning — "this attempt did not happen, put the run back in the queue":
+#
+#   * `RunService.release_claim` — `crawl_task` was cancelled (a deploy's SIGTERM, or arq's
+#     `job_timeout`) with retries still on the run's budget, or a transient failure is about
+#     to be retried. Returning the row to `pending` is what lets the redelivered job claim it
+#     again; leaving it `processing` would make the retry a no-op and strand the run until
+#     the reaper noticed, minutes later.
+#   * `RunService.reap_stuck_runs` — the reaper found a run whose worker never came back.
+#
+# `attempts` is deliberately NOT decremented. The attempt was really made: a worker really
+# claimed the row, really opened sockets, and really consumed a slot. Rolling the counter
+# back would let a run that is cancelled on every deploy retry forever, which is precisely
+# the unbounded loop `MAX_ATTEMPTS` exists to prevent.
+#
+# `claimed_at = NULL` IS cleared, because it means "when the CURRENT processing attempt was
+# claimed" and there is no longer one. That also keeps the reaper's staleness predicate
+# honest: the next claim stamps a fresh time, so the run gets a full threshold from when
+# work actually restarted rather than inheriting the abandoned attempt's clock.
+#
+# `error` and `completed_at` are untouched: this is not a failure, it is a re-queue.
+_RETURN_PROCESSING_TO_PENDING: Final = """
+    UPDATE runs
+    SET status = 'pending'::run_status,
+        claimed_at = NULL
+    WHERE id = $1 AND status = 'processing'::run_status
     RETURNING id
 """
 
@@ -252,20 +304,37 @@ class RunsWriter(Writer):
         """
         return await self.execute(_MARK_FAILED, run_id, error, completed_at)
 
-    async def claim_pending(self, run_id: UUID) -> bool:
-        """Atomically flip `run_id` from `pending` to `processing`.
+    async def claim_pending(self, run_id: UUID) -> int | None:
+        """Atomically flip `run_id` from `pending` to `processing`, counting the attempt.
 
         The correctness guard the crawl worker takes before it fetches a single byte. See
-        `_CLAIM_PENDING` for why this must be one conditional statement.
+        `_CLAIM_PENDING` for why this must be one conditional statement, and why `attempts`
+        and `claimed_at` are written by it rather than beside it.
 
         Returns:
-            `True` if this call won the race and the row is now `processing` under it;
-            `False` if the row was not `pending` at all — already claimed by another worker,
-            already terminal, or the id does not exist. The caller cannot tell those three
-            apart from this return value alone, and does not need to: all three mean "do not
-            crawl."
+            The run's `attempts` value AFTER this claim — 1 on a first attempt, 2 on a
+            retry, and so on — if this call won the race and the row is now `processing`
+            under it. `None` if the row was not `pending` at all: already claimed by another
+            worker, already terminal, or the id does not exist. The caller cannot tell those
+            three apart from this return value alone, and does not need to: all three mean
+            "do not crawl."
         """
         row = await self.fetch_one(_CLAIM_PENDING, run_id)
+        return None if row is None else int(row["attempts"])
+
+    async def return_processing_to_pending(self, run_id: UUID) -> bool:
+        """Hand a claimed run back to the queue, but only if it is still `processing`.
+
+        See `_RETURN_PROCESSING_TO_PENDING` for the two callers, for why `attempts` is not
+        decremented, and for why `claimed_at` is.
+
+        Returns:
+            `True` if the row was `processing` and is now `pending`; `False` if it was not —
+            something else reached a terminal state first, which is the case the guard exists
+            to leave alone rather than overwrite. `RunService` logs the `False` case rather
+            than raising on it.
+        """
+        row = await self.fetch_one(_RETURN_PROCESSING_TO_PENDING, run_id)
         return row is not None
 
     async def mark_processing_completed(

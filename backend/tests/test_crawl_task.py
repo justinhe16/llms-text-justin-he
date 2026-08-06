@@ -30,6 +30,7 @@ from asyncpg import Pool
 from conftest import TEST_USER_A_ID, FakeStorage, seed_run, seed_website
 
 from app.worker.jobs import crawl_task
+from app.worker.policy import MAX_ATTEMPTS
 
 
 _NOW = datetime.now(UTC)
@@ -112,8 +113,19 @@ async def test_a_malformed_run_id_returns_rather_than_raising(websites_db: Pool)
 
 
 async def test_seed_url_failure_leaves_the_run_failed(websites_db: Pool) -> None:
+    """A connect error on the seed is RETRYABLE (PER-166), so this run is seeded one attempt
+    short of the cap: the claim takes it to `MAX_ATTEMPTS` and the failure is therefore the
+    terminal one, which is the case this test has always been about. The budget-remaining
+    half — the same failure returning the run to `pending` and asking arq for a redelivery —
+    lives in tests/test_crawl_retry.py."""
     website_id = await seed_website(websites_db, TEST_USER_A_ID, f"http://{_SEED_IP}/seed-fails")
-    run_id = await seed_run(websites_db, website_id, started_at=_NOW, status="pending")
+    run_id = await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        status="pending",
+        attempts=MAX_ATTEMPTS - 1,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("simulated connection failure", request=request)
@@ -125,12 +137,15 @@ async def test_seed_url_failure_leaves_the_run_failed(websites_db: Pool) -> None
     assert result == "no outcome"
 
     row = await websites_db.fetchrow(
-        "SELECT status, error, completed_at FROM runs WHERE id = $1", run_id
+        "SELECT status, error, completed_at, attempts FROM runs WHERE id = $1", run_id
     )
     assert row is not None
     assert row["status"] == "failed"
     assert row["completed_at"] is not None
-    assert row["error"] == "Could not connect to the site."
+    assert row["attempts"] == MAX_ATTEMPTS
+    # The attempt count is IN the message, which is what lets the UI tell a site that has
+    # been down all morning apart from one that blipped once.
+    assert row["error"] == f"Failed after {MAX_ATTEMPTS} attempts: Could not connect to the site."
 
 
 async def test_the_recorded_error_never_leaks_exception_internals(websites_db: Pool) -> None:
@@ -139,7 +154,15 @@ async def test_the_recorded_error_never_leaks_exception_internals(websites_db: P
     puts dangerous content INSIDE the underlying exception's own message instead, so it only
     passes if `_safe_error_message` actually replaces `str(exc)` rather than including it."""
     website_id = await seed_website(websites_db, TEST_USER_A_ID, f"http://{_SEED_IP}/seed-leaks")
-    run_id = await seed_run(websites_db, website_id, started_at=_NOW, status="pending")
+    # One attempt short of the cap, so this failure is terminal and actually writes a row —
+    # see `test_seed_url_failure_leaves_the_run_failed` above.
+    run_id = await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        status="pending",
+        attempts=MAX_ATTEMPTS - 1,
+    )
 
     dangerous_detail = (
         "Connection to 10.1.2.3 refused: httpx.ConnectError Traceback (most recent call last): ..."

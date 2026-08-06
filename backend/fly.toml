@@ -36,15 +36,20 @@ primary_region = "sjc"  # closest region to the Supabase project in AWS us-west-
 # too. That is harmless (uvicorn drains in well under a second) and the worker is what the
 # number is sized for.
 #
-# It is the outermost of three nested shutdown budgets, and it has to stay the largest or
-# it truncates the ones inside it:
+# It is the outer of two nested SHUTDOWN budgets, and it has to stay the larger or it
+# truncates the one inside it:
 #
-#   arq job_timeout (180s) < arq job_completion_wait (200s) < kill_timeout (240s) <= 300s
+#   arq job_completion_wait (200s) < kill_timeout (240s) <= 300s, Fly's ceiling
 #
-# The middle value is what actually makes SIGTERM graceful — see app/worker/settings.py.
-# 300s is Fly's ceiling for this key, which is what bounds the whole ladder. If a crawl
-# ever needs longer than 180s, every number here moves together, and the ceiling means the
-# real answer at that point is checkpointing the job, not a bigger timeout.
+# `job_completion_wait` is what actually makes SIGTERM graceful — see app/worker/policy.py.
+#
+# **arq's `job_timeout` is NOT part of this ladder, and PER-166 is what took it out.** It
+# was 180s, below both numbers above, and the comment here used to include it. It now sits
+# at 600s, deliberately above the 300s crawl cap so the application-level budget ends a
+# long crawl rather than arq's cancellation — which cannot fit inside a drain budget that
+# Fly caps at 300s. A job still running when the drain expires is cancelled, and that is
+# now recoverable rather than terminal: the run is handed back to `pending` and the
+# stuck-run reaper sweeps it if even that write does not land.
 kill_timeout = "240s"
 
 # ONE IMAGE, TWO COMMANDS. The Dockerfile sets no ENTRYPOINT, so each line below is the

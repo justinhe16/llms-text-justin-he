@@ -134,6 +134,30 @@ model Run {
   startedAt   DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
   completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
 
+  /// How many times a worker has CLAIMED this run, incremented by `RunsWriter.claim_pending`
+  /// inside the same atomic `pending -> processing` UPDATE. It counts attempts that actually
+  /// STARTED, not jobs that were queued — an enqueue that never reached a worker leaves this
+  /// at its previous value, which is exactly what makes it a retry budget rather than a
+  /// queue-depth statistic. The stuck-run reaper's requeue-or-fail decision reads it, and so
+  /// does the terminal error message ("Failed after 3 attempts: …").
+  ///
+  /// Deliberately NOT arq's `ctx["job_try"]`. That counter is per arq job id, resets whenever
+  /// a job is re-enqueued under a new id, and is invisible to the reaper — which runs in a
+  /// different process from the job it is rescuing and has only the database to go on.
+  attempts Int @default(0)
+
+  /// When the run's current `processing` attempt was claimed — written by `claim_pending`
+  /// alongside `attempts`, cleared when the reaper hands a run back to `pending`.
+  ///
+  /// THE REAPER'S STALENESS CLOCK, and the reason it is not `started_at`. `started_at` is set
+  /// at INSERT, which is when the run was ENQUEUED, not when a worker picked it up. Those two
+  /// instants are the same only when the queue is empty: `max_jobs = 2` against a batch of up
+  /// to `DUE_BATCH_LIMIT` scheduled runs can leave a run legitimately `pending` for an hour,
+  /// and a reaper measuring from `started_at` would then reap it moments after a worker
+  /// finally claimed it — duplicating a crawl that was progressing fine, which is the one
+  /// outcome the reaper's threshold exists to avoid.
+  claimedAt DateTime? @map("claimed_at") @db.Timestamptz(6)
+
   /// The generated artifact. Null until the run completes.
   llmsTxt String? @map("llms_txt")
 

@@ -655,6 +655,8 @@ async def seed_run(
     llms_txt: str | None = None,
     storage_path: str | None = None,
     error: str | None = None,
+    attempts: int = 0,
+    claimed_at: datetime | None = None,
 ) -> UUID:
     """Insert a run directly.
 
@@ -667,14 +669,22 @@ async def seed_run(
     `llms_txt`, `storage_path`, and `error` default to `None`, matching a run that has not
     (yet, or ever) recorded them; `tests/test_runs_api.py` passes them explicitly to
     exercise `RunDetailResponse`.
+
+    `attempts` and `claimed_at` (PER-166) default to what a freshly-inserted, never-claimed
+    run holds — `0` and `NULL` — which is exactly what `RunsWriter.insert_manual` produces,
+    so no existing caller had to change. They are settable because the retry policy and the
+    reaper both branch on them, and neither is reachable otherwise: `attempts` is only ever
+    written by `claim_pending`, so a test that wanted a run on its LAST attempt would
+    otherwise have to run two real crawls to get there, and a test that wanted a run
+    abandoned fifteen minutes ago would have to wait fifteen minutes.
     """
     encoded = json.dumps(stats) if isinstance(stats, dict) else stats
     run_id: UUID = await pool.fetchval(
         """
         INSERT INTO runs
             (website_id, "trigger", status, started_at, completed_at, stats,
-             llms_txt, storage_path, error)
-        VALUES ($1, $2::run_trigger, $3::run_status, $4, $5, $6::jsonb, $7, $8, $9)
+             llms_txt, storage_path, error, attempts, claimed_at)
+        VALUES ($1, $2::run_trigger, $3::run_status, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
         RETURNING id
         """,
         website_id,
@@ -686,6 +696,8 @@ async def seed_run(
         llms_txt,
         storage_path,
         error,
+        attempts,
+        claimed_at,
     )
     return run_id
 

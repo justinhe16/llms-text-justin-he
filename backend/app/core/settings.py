@@ -74,16 +74,25 @@ class Settings(BaseSettings):
     # configured the same way.
     crawl_max_pages: int = Field(default=100, ge=1)
 
-    # The crawl's OWN wall-clock budget — but not the number that actually lands first in
-    # a deployed worker. `WorkerSettings.job_timeout` (app/worker/settings.py) is 180s, and
-    # arq cancels the whole job at that mark regardless of what this field says, so a
-    # 300-second crawl budget here is an outer bound that a crawl running inside arq will
-    # rarely reach on its own terms — `asyncio.CancelledError` from arq's own timeout lands
-    # first. Do not "fix" that by raising `job_timeout`: it is ordered against
-    # `job_completion_wait` (200s) and fly.toml's `kill_timeout` (240s), and
-    # tests/test_worker_settings.py asserts that ladder. `CancelledError` is deliberately
-    # never caught by the crawl service — the stuck-run reaper (a later, reliability
-    # ticket) is what notices a run arq cut off mid-flight, not this field.
+    # The crawl's OWN wall-clock budget, and — since PER-166 — the number that actually
+    # lands first in a deployed worker. `job_timeout` (app/worker/policy.py) sits at 600s,
+    # twice this, so the application-level cap is what ends a long crawl: `crawl_site`'s own
+    # `asyncio.timeout` fires, the run records a clean `failed` with a sanitized message, and
+    # `runs.stats` says which cap stopped it.
+    #
+    # **An earlier revision of this comment said the opposite, and told you not to fix it.**
+    # `job_timeout` was 180s — BELOW this cap — so arq cancelled every long crawl before its
+    # own budget expired, and the note here said not to raise it because it was ordered
+    # against `job_completion_wait` (200s) and fly.toml's `kill_timeout` (240s). That
+    # ordering constraint turned out to be the thing that was wrong, not the timeout; see
+    # `JOB_COMPLETION_WAIT_SECONDS` in app/worker/policy.py for why it was unsatisfiable
+    # alongside a crawl cap this size, and tests/test_worker_settings.py for the two
+    # assertions that replaced it.
+    #
+    # arq's timeout is now the outer backstop for a genuinely wedged job. When it does fire,
+    # `CancelledError` is caught by `CrawlService.execute_run`, which hands the run back to
+    # `pending` (or fails it, if the retry budget is spent) and re-raises — and the stuck-run
+    # reaper sweeps the row if even that write does not land.
     crawl_max_wall_clock_s: float = Field(default=300.0, gt=0)
 
     crawl_max_bytes: int = Field(default=52_428_800, ge=1)  # 50 MiB across the whole run
@@ -128,16 +137,19 @@ class Settings(BaseSettings):
     supabase_storage_bucket: str = Field(default="crawl-payloads", min_length=1)
 
     # The Storage upload's own timeout — deliberately NOT `crawl_request_timeout_s`, and
-    # deliberately BELOW `WorkerSettings.JOB_TIMEOUT_SECONDS` (180s, app/worker/settings.py).
-    # A crawl fetch is one page; an upload can be a multi-megabyte compressed payload, so it
-    # gets its own, larger budget. Sitting below the job timeout is what decides which of two
-    # things happens to a hung upload: below 180s, `SupabaseStorage.upload` raises its own
-    # `StorageUploadError` first, `CrawlService` catches it, and the run ends `failed` with a
-    # sanitized message. At or above 180s, arq's job timeout fires first instead, which
-    # delivers a bare `CancelledError` that `CrawlService.execute_run` deliberately does not
-    # catch (see that module's docstring) — the run is left `processing` for the stuck-run
-    # reaper rather than recorded as a clean failure. 120s leaves 60s of headroom under that
-    # line without eating meaningfully into the budget a real upload needs.
+    # deliberately below `JOB_TIMEOUT_SECONDS` (600s, app/worker/policy.py). A crawl fetch is
+    # one page; an upload can be a multi-megabyte compressed payload, so it gets its own,
+    # larger budget. Sitting below the job timeout is what decides which of two things
+    # happens to a hung upload: under it, `SupabaseStorage.upload` raises its own
+    # `StorageUploadError` first, which `CrawlService` classifies as RETRYABLE — the run goes
+    # back to `pending` for another attempt, or ends `failed` if the budget is spent. Above
+    # it, arq's job timeout fires first instead and delivers a `CancelledError`, which is a
+    # coarser signal: it says the job stopped, not what stopped it, so the run is handed back
+    # or failed without a message that names Storage at all.
+    #
+    # 120s was chosen against the old 180s job timeout, and PER-166's raise to 600s only
+    # widens the margin — it is left alone deliberately rather than scaled up with it,
+    # because the number a real upload needs did not change.
     storage_upload_timeout_s: float = Field(default=120.0, gt=0)
 
     def validate_required_secrets(self) -> None:

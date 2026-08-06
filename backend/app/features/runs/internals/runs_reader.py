@@ -141,6 +141,8 @@ from datetime import datetime
 from typing import Any, Final
 from uuid import UUID
 
+from asyncpg import Pool
+
 from app.features.runs.internals.run_cursor import RunCursor
 from app.features.runs.internals.stats_window import StatsWindow
 from app.features.runs.schemas import RunStatusName
@@ -238,6 +240,76 @@ _WEBSITE_IDS_WITH_ACTIVE_RUNS: Final = """
     SELECT DISTINCT website_id
     FROM runs
     WHERE website_id = ANY($1::uuid[]) AND status IN ('pending', 'processing')
+"""
+
+# THE STUCK-RUN REAPER'S SCAN (`RunService.reap_stuck_runs`). Like `SchedulesReader.lock_due`
+# — and unlike every other statement in this file — this is the `SELECT` half of a
+# read-then-write, not an unscoped API read, and it locks the rows it returns.
+#
+# **ONE query for both classes of stranded run, not two.** The reaper rescues two different
+# states, and the leading `status IN ('pending', 'processing')` is what lets it ask about
+# both in a single index-eligible scan:
+#
+#   * `processing` past the staleness threshold — a worker claimed the run and never came
+#     back. An OOM kill, a machine restart, a deploy whose drain budget expired mid-crawl,
+#     or `RunService.record_failure`'s own write failing against an unreachable Postgres,
+#     which leaves the row `processing` with nothing left in that process able to fix it.
+#   * `pending` past the orphan threshold — the insert-then-enqueue ordering that both
+#     `RunService.trigger_run` and the cron tick commit to (see `runs/service.py`'s module
+#     docstring) can leave a committed row with no job behind it.
+#
+# `status IN ('pending', 'processing')` IS WRITTEN CHARACTER FOR CHARACTER identical to
+# `_ACTIVE_FOR_WEBSITE`'s and `_WEBSITE_IDS_WITH_ACTIVE_RUNS`'s, for the reason those two
+# state: that textual match is what lets the planner recognize this WHERE clause as exactly
+# what `runs_status_active_idx`'s partial predicate answers. Splitting the reaper into two
+# queries — one `WHERE status = 'processing'`, one `WHERE status = 'pending'` — would have
+# read more cleanly and would have relied on the planner PROVING that each implies the
+# index's `IN` list, which is a weaker guarantee than matching it. The per-status conditions
+# therefore sit in a second, parenthesized clause underneath, filtering rows the index has
+# already narrowed to the in-flight ones.
+#
+# `COALESCE(claimed_at, started_at)` on the `processing` branch, never a bare `claimed_at`.
+# `claimed_at` is written by `RunsWriter.claim_pending`, so every row claimed before PER-166's
+# migration has it `NULL` — and `NULL < $1` is not true, which would make exactly the runs
+# stranded by the OLD code permanently invisible to the reaper built to rescue them. The
+# fallback also bounds the damage of any future path that reaches `processing` without
+# stamping a claim: such a row is reaped late rather than never.
+#
+# `started_at` on the `pending` branch, because that is the only clock a run that was never
+# claimed has — `claimed_at` is `NULL` by definition there, and `_RETURN_PROCESSING_TO_PENDING`
+# clears it again whenever the reaper hands a run back.
+#
+# `FOR UPDATE SKIP LOCKED`, for two distinct reasons, and the second is the load-bearing one:
+#
+#   1. Two reapers — two worker machines, or one pass overlapping its successor — must not
+#      both act on the same row. Note that the guarded writes underneath would already make a
+#      double-act harmless rather than corrupting, since every statement in `runs_writer.py`
+#      names the status it may leave, so this is defence in depth rather than the only
+#      defence.
+#   2. **The reaper must never BLOCK on a row a worker is actively transitioning.** A plain
+#      `FOR UPDATE` would queue behind `claim_pending`'s or `mark_processing_completed`'s row
+#      lock and hold a pooled connection until that transaction ended — and the reaper scans
+#      the whole table, so it meets those locks constantly. `SKIP LOCKED` skips the row
+#      instead, which costs nothing: a row someone else holds is by definition a row
+#      something is still working on, and if it really is stuck the next pass finds it five
+#      minutes later. tests/test_run_reaper.py drives exactly that case with a lock held from
+#      a separate connection, because it is the mutation the two-concurrent-reapers test
+#      cannot see.
+#
+# `ORDER BY started_at` puts the longest-stranded runs first, so a pass that hits `LIMIT $3`
+# makes progress in a fair order rather than starving the same runs behind newer ones on
+# every wake-up — the same argument `SchedulesReader._LOCK_DUE` makes for its own ordering.
+_LOCK_REAPABLE: Final = """
+    SELECT id, website_id, status, attempts
+    FROM runs
+    WHERE status IN ('pending', 'processing')
+      AND (
+            (status = 'processing' AND COALESCE(claimed_at, started_at) < $1)
+         OR (status = 'pending' AND started_at < $2)
+      )
+    ORDER BY started_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3
 """
 
 # The per-user concurrency cap. `trigger = 'manual'` is the one filter that makes this query
@@ -450,6 +522,48 @@ class RunsReader(Reader):
             return set()
         rows = await self.fetch_all(_WEBSITE_IDS_WITH_ACTIVE_RUNS, list(website_ids))
         return {row["website_id"] for row in rows}
+
+    async def lock_reapable(
+        self, *, stuck_before: datetime, orphaned_before: datetime, limit: int
+    ) -> list[dict[str, Any]]:
+        """Lock and return up to `limit` stranded runs, longest-stranded first.
+
+        **Must be constructed with the `Connection` a `transaction()` block yields, never
+        with the pool** — the identical requirement `SchedulesReader.lock_due` documents, for
+        the identical reason: `FOR UPDATE` has no meaning outside a transaction, so run
+        through the pool this statement would take its row locks and hand the connection
+        (and the locks with it) straight back before the caller saw a single row.
+
+        Args:
+            stuck_before: A `processing` run whose claim is older than this is treated as
+                abandoned. Derived from `STUCK_AFTER_SECONDS` (`app/worker/policy.py`), which
+                is `job_timeout` plus a deliberately generous grace margin.
+            orphaned_before: A `pending` run created before this is treated as having no job
+                behind it. Derived from `ORPHANED_PENDING_AFTER_SECONDS`.
+            limit: The most rows one pass may take on — `REAP_BATCH_LIMIT` (`runs/service.py`)
+                in production, a smaller number in tests that want to exercise the cap.
+
+        Returns:
+            One dict per locked row with `id`, `website_id`, `status`, and `attempts`. The
+            caller branches on `status`, which is why it is selected rather than inferred
+            from which threshold the row must have crossed — a row can satisfy neither
+            branch by the time it is read back if the two thresholds are ever configured to
+            overlap, and guessing would be the kind of quiet mistake this reaper exists to
+            clean up.
+
+        Raises:
+            RuntimeError: if this reader was constructed with a `Pool` rather than a
+                `Connection` — see above.
+        """
+        if isinstance(self._db, Pool):
+            raise RuntimeError(
+                "RunsReader.lock_reapable() was called on a Pool. FOR UPDATE SKIP LOCKED "
+                "only holds its locks for the life of a transaction, and a Pool call "
+                "acquires and releases a connection (and therefore the lock) before the "
+                "caller can do anything with the rows — construct RunsReader from the "
+                "Connection yielded by transaction() instead."
+            )
+        return await self.fetch_all(_LOCK_REAPABLE, stuck_before, orphaned_before, limit)
 
     async def count_active_manual_for_user(self, user_id: UUID) -> int:
         """Count `user_id`'s in-flight MANUAL runs, across every website they own.

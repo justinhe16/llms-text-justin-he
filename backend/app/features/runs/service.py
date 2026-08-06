@@ -22,6 +22,14 @@ retrofit one into `list_runs` or `get_run`." That is exactly what happened, twic
   have already happened, both happen BETWEEN them, and a network call must never run inside a
   transaction (ARCHITECTURE.md §5.1).
 
+* `release_claim` and `reap_stuck_runs` — PER-166's recovery pair, and the reason this
+  service now has a method nothing HTTP can reach at all. `release_claim` hands a claimed run
+  back to `pending` when the worker holding it is cancelled or hits a transient failure with
+  retries left; `reap_stuck_runs` is the cron-driven backstop for every run whose worker
+  never got that far. They share one statement (`RunsWriter.return_processing_to_pending`) on
+  purpose: a run rescued by its own worker and a run rescued five minutes later by the reaper
+  must land in the same state, or the two paths will drift.
+
 `list_runs`, `get_run`, and `get_website_stats` are unchanged by any of it, and open no
 transaction of their own.
 
@@ -153,6 +161,7 @@ or a run exist whose schedule never advanced.
 import json
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
@@ -224,6 +233,77 @@ _ENQUEUE_FAILED_DETAIL = "Could not start this run right now. Please try again s
 # HTTP response — distinct wording is not required, but keeping it separate from the detail
 # above means a future reword of one is not forced to consider the other.
 _ENQUEUE_FAILED_ERROR = "Failed to enqueue the crawl job for this run."
+
+# The most stranded runs one reaper pass may lock and act on, mirroring `DUE_BATCH_LIMIT`
+# (`schedules/service.py`) and bounding the same thing: how long one pass can hold a
+# transaction open. 100 rather than the tick's 50 because the reaper's per-row work is a
+# single guarded UPDATE rather than an INSERT plus two batched advances, and because a
+# backlog of stranded runs is by definition already a bad day — clearing it in fewer passes
+# is worth the slightly longer transaction. If a pass ever fills this batch, the remainder
+# waits five minutes; they have already been stranded for at least fifteen.
+REAP_BATCH_LIMIT: Final = 100
+
+
+def crawl_job_id(run_id: UUID, attempts: int) -> str:
+    """The deterministic arq job id the reaper enqueues `crawl_task` under.
+
+    Public so that a test can assert the id the reaper actually used rather than
+    reconstructing the format string by hand — the same reason `CRAWL_TASK_JOB_NAME` is a
+    named constant. See `RunService._enqueue_reaped` for why only the reaper passes a job id,
+    and why `attempts` is part of it.
+    """
+    return f"crawl:{run_id}:{attempts}"
+
+
+def _interrupted_error(attempts: int) -> str:
+    """What `runs.error` says about a run the reaper gave up on.
+
+    The attempt count is in the sentence for the reason every terminal message in this system
+    carries one: it is what lets a reader — and the UI — tell "this site was briefly
+    unreachable once" apart from "this has failed every time we have tried", which are the
+    same status and very different problems.
+    """
+    return f"Run was interrupted and did not complete after {attempts} attempt(s)."
+
+
+@dataclass(frozen=True)
+class ReaperSummary:
+    """What one call to `RunService.reap_stuck_runs` did, for its log line and for tests.
+
+    Lives here rather than in `schemas.py` for the reason `ScheduleService`'s `TickSummary`
+    does: it is not a response shape any HTTP endpoint returns, it is internal bookkeeping
+    for the worker's own log and for `tests/test_run_reaper.py` to assert against.
+    """
+
+    # How many rows `RunsReader.lock_reapable` locked — the batch this pass had to make a
+    # decision about, across both classes of stranded run.
+    examined: int
+
+    # `processing` runs with attempts left, handed back to `pending`.
+    requeued: int
+
+    # `pending` runs old enough to be presumed to have no job behind them. No write; they
+    # were already in the right state.
+    orphans_swept: int
+
+    # `processing` runs that had exhausted `max_attempts` and were marked `failed`.
+    failed: int
+
+    # How many of `requeued + orphans_swept` actually put a new job on the queue.
+    enqueued: int
+
+    # How many did not, because arq already had a job under the same deterministic id — the
+    # orphan sweep's anti-amplification guard doing its job, not an error. See
+    # `_enqueue_reaped`.
+    already_queued: int
+
+    # How many enqueue attempts raised. Each one leaves its run `pending` for the next pass,
+    # deliberately un-failed.
+    enqueue_failures: int
+
+    # `True` when `examined == REAP_BATCH_LIMIT`: this pass's batch was full, so there MAY be
+    # more stranded runs it never looked at.
+    limit_reached: bool
 
 
 def _duration_ms(started_at: datetime, completed_at: datetime | None) -> int | None:
@@ -648,23 +728,291 @@ class RunService:
         rows = await self._reader.website_stats(website_id, window=resolved)
         return _to_stats(resolved, rows)
 
-    async def claim_for_processing(self, run_id: UUID) -> bool:
+    async def claim_for_processing(self, run_id: UUID) -> int | None:
         """Atomically flip `run_id` from `pending` to `processing`, or refuse to.
 
         The correctness guard `app.features.crawl.service.CrawlService.execute_run` relies
-        on before it fetches a single byte: `arq`'s `MAX_JOBS = 2`
-        (`app/worker/settings.py`) makes concurrent delivery of the same job a real
-        scenario, and only a single, atomic conditional `UPDATE` — never a `SELECT` followed
-        by an `UPDATE` — can guarantee that at most one caller ever sees `True` for a given
-        `run_id`.
+        on before it fetches a single byte: `arq`'s `MAX_JOBS = 2` (`app/worker/policy.py`)
+        makes concurrent delivery of the same job a real scenario, and only a single, atomic
+        conditional `UPDATE` — never a `SELECT` followed by an `UPDATE` — can guarantee that
+        at most one caller ever comes away with the claim for a given `run_id`.
 
         Returns:
-            `True` if this call won the race and the row is now `processing`; `False` if it
-            was not `pending` — already claimed, already terminal, or nonexistent. The
-            caller treats every `False` the same way: do not crawl.
+            The run's `attempts` value AFTER this claim (1 on a first attempt, 2 on a retry)
+            if this call won the race and the row is now `processing`; `None` if it was not
+            `pending` — already claimed, already terminal, or nonexistent. The caller treats
+            every `None` the same way: do not crawl. The number matters because the retry
+            policy is counted against `runs.attempts`, not against arq's per-job-id
+            `ctx["job_try"]` — see `app/worker/policy.py`'s `MAX_ATTEMPTS` for why the run's
+            own counter is the only one a reaper in another process can read.
         """
         async with transaction(self._pool) as tx:
             return await RunsWriter(tx).claim_pending(run_id)
+
+    async def release_claim(self, run_id: UUID) -> bool:
+        """Hand a claimed run back to the queue: `processing` -> `pending`, attempts intact.
+
+        Called by `app.features.crawl.service.CrawlService` on the two paths where an attempt
+        ends without producing an outcome AND without being terminal: a transient failure
+        with budget left to retry, and a cancellation (a deploy's SIGTERM, or arq's
+        `job_timeout`) on a run that has not exhausted its attempts.
+
+        **This is the same statement the reaper uses**, deliberately — see
+        `internals/runs_writer.py`'s `_RETURN_PROCESSING_TO_PENDING`. A run rescued by the
+        worker that was crawling it and a run rescued five minutes later by the reaper end up
+        in exactly the same state, because it is exactly the same write; the only difference
+        is how long the user waited.
+
+        Returns:
+            `True` if the row was `processing` and is now `pending`. `False` if it was not —
+            logged at WARNING rather than raised, because by the time this is called the
+            attempt is already over and there is nothing this method could usefully do about
+            a row something else already moved.
+        """
+        async with transaction(self._pool) as tx:
+            released = await RunsWriter(tx).return_processing_to_pending(run_id)
+        if not released:
+            logger.warning(
+                "Run %s was no longer processing when its claim was released; leaving it "
+                "alone — something else reached a terminal state first",
+                run_id,
+            )
+        return released
+
+    async def reap_stuck_runs(
+        self,
+        queue: ArqRedis,
+        *,
+        stuck_before: datetime,
+        orphaned_before: datetime,
+        max_attempts: int,
+    ) -> ReaperSummary:
+        """The stuck-run reaper. Rescue every run nothing is acting on any more.
+
+        Called every `REAPER_INTERVAL_MINUTES` by `app.worker.jobs.reaper_tick`, registered
+        as the second arq cron job in `app/worker/settings.py`. Not reachable from any HTTP
+        route.
+
+        **The deadlock this exists to break.** A run stuck in `processing` does not merely
+        look broken in the UI. `RunService.trigger_run`'s duplicate-run guard refuses to
+        start a new run for a website that has one in flight, so a single stranded row makes
+        that website permanently un-crawlable — every trigger answers `409` against a run
+        that will never finish. Nothing else in this system can recover from that; there is
+        no user-facing cancel, and the worker that stranded the row is, by definition, gone.
+
+        **It rescues `RunService.record_failure`'s own failure, which nothing else can.**
+        That method opens a transaction and writes a terminal row; if Postgres is unreachable
+        at exactly that moment the write raises, the exception propagates out of the job, and
+        the run stays `processing` forever — the process that knew what happened has no way
+        left to record it. This reaper is the only thing that closes that hole, which is why
+        it reads the database rather than trusting any in-process bookkeeping.
+
+        **Ordering, and it is the same ordering the cron tick commits to:**
+
+        ```python
+        async with transaction(self._pool) as tx:
+            rows = await RunsReader(tx).lock_reapable(...)   # FOR UPDATE SKIP LOCKED
+            ...                                              # guarded UPDATEs only
+        # COMMITTED HERE. Nothing above this line touched the network.
+        await self._enqueue_reaped(to_enqueue, queue)
+        ```
+
+        The Redis enqueue happens strictly after the commit (ARCHITECTURE.md §5.1): holding
+        up to `REAP_BATCH_LIMIT` row locks across an unreachable Redis would turn a queue
+        outage into a `runs`-table outage for every crawl worker and every API read in the
+        system.
+
+        **Two decisions, one per class of stranded run:**
+
+        * A `processing` run whose claim is older than `stuck_before` is either handed back
+          to `pending` and re-enqueued (it has attempts left) or marked `failed` (it does
+          not). `attempts` is what decides, and it is never rolled back — a run cancelled by
+          every deploy must eventually stop retrying rather than loop forever.
+        * A `pending` run older than `orphaned_before` is re-enqueued with no write at all.
+          It is already in the state it should be in; what it is missing is a job.
+
+        Args:
+            queue: arq's own `ArqRedis` pool, handed in by `reaper_tick` from `ctx["redis"]`
+                — the same relationship `ScheduleService.run_due_schedules` has to it.
+            stuck_before: `processing` runs claimed before this instant are abandoned.
+            orphaned_before: `pending` runs created before this instant have no job.
+            max_attempts: The retry budget, `MAX_ATTEMPTS` from `app/worker/policy.py`.
+                Passed in rather than imported: ARCHITECTURE.md §3.3 forbids anything under
+                `app/features/` from importing `app/worker/`, and a test wants to set it to 1
+                without touching global state.
+
+        Returns:
+            A `ReaperSummary`, whose counts are for the log line and for tests — never for a
+            caller to branch on.
+        """
+        to_enqueue: list[tuple[UUID, int]] = []
+        requeued = 0
+        orphans = 0
+        failed = 0
+
+        async with transaction(self._pool) as tx:
+            rows = await RunsReader(tx).lock_reapable(
+                stuck_before=stuck_before,
+                orphaned_before=orphaned_before,
+                limit=REAP_BATCH_LIMIT,
+            )
+            writer = RunsWriter(tx)
+            for row in rows:
+                run_id: UUID = row["id"]
+                attempts: int = row["attempts"]
+
+                if row["status"] == "pending":
+                    # No write: the row is already in the state it should be in. What it is
+                    # missing is a job, and that is not something a transaction can hand it.
+                    orphans += 1
+                    to_enqueue.append((run_id, attempts))
+                    continue
+
+                if attempts >= max_attempts:
+                    await writer.mark_processing_failed(run_id, _interrupted_error(attempts))
+                    failed += 1
+                    # `run_id` in `extra=` and not only in the message: `reaper_tick` binds a
+                    # tick id, not a run id, and one pass can give up on several runs, so
+                    # this is the one line that ties a terminal failure to its run. ERROR
+                    # rather than WARNING because a terminal failure IS the incident record —
+                    # there is no error-tracking service holding a second copy
+                    # (ARCHITECTURE.md §3.8).
+                    logger.error(
+                        "Reaper: giving up on run %s after %d attempt(s); it was interrupted "
+                        "and never recorded an outcome",
+                        run_id,
+                        attempts,
+                        extra={"run_id": str(run_id), "attempts": attempts},
+                    )
+                    continue
+
+                if await writer.return_processing_to_pending(run_id):
+                    requeued += 1
+                    to_enqueue.append((run_id, attempts))
+                    logger.warning(
+                        "Reaper: run %s was abandoned mid-flight after %d attempt(s); "
+                        "returning it to the queue",
+                        run_id,
+                        attempts,
+                        extra={"run_id": str(run_id), "attempts": attempts},
+                    )
+        # COMMITTED HERE. Nothing above this line touched the network — see the docstring.
+
+        enqueued, already_queued, enqueue_failures = await self._enqueue_reaped(to_enqueue, queue)
+
+        summary = ReaperSummary(
+            examined=len(rows),
+            requeued=requeued,
+            orphans_swept=orphans,
+            failed=failed,
+            enqueued=enqueued,
+            already_queued=already_queued,
+            enqueue_failures=enqueue_failures,
+            limit_reached=len(rows) == REAP_BATCH_LIMIT,
+        )
+        # One line per pass, every pass, including the overwhelmingly common all-zero one:
+        # "is the reaper actually running?" has to be answerable from the log alone, and a
+        # job that logs only when it finds something is indistinguishable from a job that
+        # stopped firing. INFO, with the same numbers repeated in `extra=` so a `jq` filter
+        # can select on e.g. `failed > 0` without parsing the message back apart.
+        logger.info(
+            "Reaper: examined=%d requeued=%d orphans_swept=%d failed=%d enqueued=%d "
+            "already_queued=%d enqueue_failures=%d limit_reached=%s",
+            summary.examined,
+            summary.requeued,
+            summary.orphans_swept,
+            summary.failed,
+            summary.enqueued,
+            summary.already_queued,
+            summary.enqueue_failures,
+            summary.limit_reached,
+            extra={
+                "examined": summary.examined,
+                "requeued": summary.requeued,
+                "orphans_swept": summary.orphans_swept,
+                "failed": summary.failed,
+                "enqueued": summary.enqueued,
+                "already_queued": summary.already_queued,
+                "enqueue_failures": summary.enqueue_failures,
+                "limit_reached": summary.limit_reached,
+            },
+        )
+        if summary.limit_reached:
+            logger.warning(
+                "Reaper hit its batch limit (%d) — there may be more stranded runs than this "
+                "pass could examine. The next pass, five minutes later, takes the rest; a "
+                "sustained full batch means something is stranding runs faster than they can "
+                "be rescued, which is a different problem from a slow reaper.",
+                REAP_BATCH_LIMIT,
+                extra={"examined": summary.examined, "batch_limit": REAP_BATCH_LIMIT},
+            )
+        return summary
+
+    async def _enqueue_reaped(
+        self, runs: list[tuple[UUID, int]], queue: ArqRedis
+    ) -> tuple[int, int, int]:
+        """Enqueue `crawl_task` for every `(run_id, attempts)` pair, under a DETERMINISTIC
+        job id, and return `(enqueued, already_queued, failures)`.
+
+        **`_job_id` is what keeps the orphan sweep from amplifying.** A `pending` run is
+        re-enqueued with no write to show for it, so nothing stops the NEXT pass, five
+        minutes later, from finding the same row and enqueuing a second job — and the pass
+        after that a third. `f"crawl:{run_id}:{attempts}"` closes that: arq refuses to
+        enqueue a job whose id already exists and returns `None` instead, so every pass after
+        the first is a no-op rather than another job. Without it, a genuinely backlogged
+        queue (a `pending` run legitimately waiting behind `MAX_JOBS = 2` for an hour) would
+        collect one junk job every five minutes for as long as the backlog lasted.
+
+        `attempts` is part of the id, not decoration. It is what makes the id unique per
+        ATTEMPT rather than per run, so that a run legitimately re-enqueued after a later
+        claim is not silently deduplicated against a job from a previous attempt whose result
+        key is still in Redis (arq keeps results for `keep_result`, an hour by default). The
+        pairing is safe in the other direction too: `attempts` only ever increases, and it
+        increases exactly when a job claims the run, so the reaper can never need the same
+        `(run_id, attempts)` id twice for two different pieces of work.
+
+        This is deliberately the ONLY enqueue site in the codebase that passes `_job_id`.
+        `trigger_run` and the cron tick each enqueue exactly once for a freshly-inserted run,
+        so they have nothing to deduplicate against; giving them ids would buy nothing and
+        would put a second, subtler failure mode (a stale result key silently swallowing a
+        real enqueue) on the two paths a user actually waits on. The cost of leaving them
+        alone is bounded and one-off: the first sweep of a run that IS still queued under
+        arq's own random id adds one duplicate job, which `claim_pending` absorbs — every
+        sweep after that dedupes against this id.
+
+        Broad `except Exception`, not `except RedisError`, for the reason
+        `ScheduleService._enqueue` gives for its own loop. A failure here is counted and the
+        loop continues; unlike the tick's enqueue path, it does NOT mark the run failed. The
+        run is legitimately `pending` and the next pass will try again in five minutes, which
+        is a strictly better answer than converting a transient Redis blip into a terminal
+        failure on a run that has done nothing wrong.
+        """
+        enqueued = 0
+        already_queued = 0
+        failures = 0
+        for run_id, attempts in runs:
+            try:
+                job = await queue.enqueue_job(
+                    CRAWL_TASK_JOB_NAME, str(run_id), _job_id=crawl_job_id(run_id, attempts)
+                )
+            except Exception:
+                failures += 1
+                # `exc_info=True` logs the real cause; `REDIS_URL` is never interpolated into
+                # this message or any other (ARCHITECTURE.md §9.4).
+                logger.error(
+                    "Reaper: failed to enqueue %s for run %s; it stays pending and the next "
+                    "pass will try again",
+                    CRAWL_TASK_JOB_NAME,
+                    run_id,
+                    exc_info=True,
+                    extra={"run_id": str(run_id)},
+                )
+                continue
+            if job is None:
+                already_queued += 1
+            else:
+                enqueued += 1
+        return enqueued, already_queued, failures
 
     async def record_success(
         self, run_id: UUID, *, llms_txt: str, storage_path: str, stats: dict[str, Any]
@@ -776,3 +1124,20 @@ class RunService:
             `RunsReader.website_ids_with_active_runs` for why this is a `set`.
         """
         return await RunsReader(connection).website_ids_with_active_runs(website_ids)
+
+
+def build_run_service(pool: Pool, settings: Settings) -> RunService:
+    """Build a `RunService` for the worker, from what `app.worker.jobs.reaper_tick` has on
+    `ctx`: the process-wide pool and the module `Settings`.
+
+    Mirrors `app.features.crawl.service.build_crawl_service` and
+    `app.features.schedules.service.build_schedule_service`, and exists for the same reason
+    both of those do — the router-level provider (`app.api.routers.runs.get_run_service`) is
+    wired for FastAPI's dependency injection, which does not exist inside an arq cron job.
+
+    Constructs its own `WebsiteService` because `RunService` requires one, even though the
+    reaper never reaches a method that uses it: the reaper touches `runs` alone. Handing it
+    the same `Settings` the API path gets, rather than a stripped-down stand-in, is what keeps
+    a worker-built `RunService` from quietly diverging from a request-built one.
+    """
+    return RunService(pool, WebsiteService(pool), settings)
