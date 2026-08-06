@@ -30,7 +30,14 @@ from uuid import UUID, uuid4
 import pytest
 from arq.connections import ArqRedis
 from asyncpg import Pool
-from conftest import TEST_QUEUE_NAME, TEST_USER_A_ID, TEST_USER_B_ID, seed_run, seed_website
+from conftest import (
+    TEST_QUEUE_NAME,
+    TEST_USER_A_ID,
+    TEST_USER_B_ID,
+    seed_run,
+    seed_schedule,
+    seed_website,
+)
 from fastapi import FastAPI, HTTPException
 from httpx import AsyncClient
 
@@ -220,6 +227,75 @@ async def test_an_active_run_on_the_same_website_is_409(
     assert detail["status"] == status
     assert await _run_count_for_website(websites_db, website_id) == 1
     assert await queue_override.queued_jobs(queue_name=TEST_QUEUE_NAME) == []
+
+
+@pytest.mark.parametrize("active_status", ["pending", "processing"])
+async def test_an_active_scheduled_run_on_the_same_website_also_blocks(
+    user_client: AsyncClient, websites_db: Pool, queue_override: ArqRedis, active_status: str
+) -> None:
+    """The duplicate guard has NO trigger filter, and this is what pins that.
+
+    `_ACTIVE_FOR_WEBSITE` (`internals/runs_reader.py`) deliberately does not filter by
+    trigger: two concurrent crawls of one website are wasteful whatever started them, so a
+    scheduled run already in flight blocks a manual trigger of the same site just as a manual
+    one does. That is the OPPOSITE of the per-user concurrency cap, which counts manual runs
+    only — the asymmetry is argued at length in that module and in `service.py`, and until
+    this test existed it was argued in prose alone. An accidental `AND trigger = 'manual'`
+    added to that one query would leave every other test in this file green.
+    """
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, f"https://scheduled-active-{active_status}.example"
+    )
+    schedule_id = await seed_schedule(websites_db, website_id)
+    existing = await seed_run(
+        websites_db, website_id, started_at=_NOW, status=active_status, trigger="scheduled"
+    )
+    await websites_db.execute(
+        "UPDATE runs SET schedule_id = $1 WHERE id = $2", schedule_id, existing
+    )
+
+    response = await user_client.post(f"/websites/{website_id}/runs")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["run_id"] == str(existing)
+    assert detail["status"] == active_status
+    assert await _run_count_for_website(websites_db, website_id) == 1
+    assert await queue_override.queued_jobs(queue_name=TEST_QUEUE_NAME) == []
+
+
+async def test_two_sequential_triggers_return_202_then_409_with_the_first_runs_id(
+    user_client: AsyncClient, websites_db: Pool, queue_override: ArqRedis
+) -> None:
+    """The ticket's acceptance criterion, driven end to end through the API.
+
+    Every other 409 test in this file seeds the blocking run directly with `seed_run`, which
+    is this suite's deliberate convention (see the module docstring: a test that builds its
+    fixtures through the endpoint under test cannot tell "the guard is wrong" apart from "the
+    insert is wrong"). This one test breaks that convention ON PURPOSE, because the criterion
+    it covers is specifically about the endpoint's behaviour against ITS OWN prior write — a
+    double-click on "Run now" — and a seeded row cannot demonstrate that the id the first
+    POST returned is the id the second POST hands back.
+
+    Exactly one job is queued at the end: the 409 must not enqueue a second crawl.
+    """
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://double-click.example")
+
+    first = await user_client.post(f"/websites/{website_id}/runs")
+    second = await user_client.post(f"/websites/{website_id}/runs")
+
+    assert first.status_code == 202
+    first_run_id = first.json()["id"]
+
+    assert second.status_code == 409
+    detail = second.json()["detail"]
+    assert detail["code"] == "run_already_in_flight"
+    assert detail["run_id"] == first_run_id
+    assert detail["status"] == "pending"
+
+    assert await _run_count_for_website(websites_db, website_id) == 1
+    queued = await queue_override.queued_jobs(queue_name=TEST_QUEUE_NAME)
+    assert [(job.function, job.args) for job in queued] == [(CRAWL_TASK_JOB_NAME, (first_run_id,))]
 
 
 @pytest.mark.parametrize("previous_status", ["completed", "failed"])
