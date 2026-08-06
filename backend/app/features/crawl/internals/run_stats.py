@@ -17,9 +17,12 @@ from the write path, keeps `crawler.py`'s dict exactly as wide as the crawl loop
 gives PER-159's crawl loop nothing new to keep in sync with this ticket's writer.
 """
 
+import logging
 from collections.abc import Mapping
 from typing import Any, Final
 
+
+logger = logging.getLogger(__name__)
 
 RUN_STATS_VERSION: Final = 1
 """Which definition of `links_emitted` (and, by extension, of this whole dict's shape) a
@@ -61,4 +64,9 @@ def build_run_stats(crawl_stats: Mapping[str, Any], *, links_emitted: int) -> di
         because neither `"links_emitted"` nor `"version"` is a key `CrawlResult.stats` has
         ever produced.
     """
-    return {**crawl_stats, "links_emitted": links_emitted, "version": RUN_STATS_VERSION}
+    stats = {**crawl_stats, "links_emitted": links_emitted, "version": RUN_STATS_VERSION}
+    # "Generation complete, with stats" — passed as `extra=stats` rather than folded into the
+    # message text, so a `jq` filter can select on any of `pages_crawled`, `bytes_fetched`,
+    # `cap_hit`, etc. directly instead of parsing them back out of a rendered string.
+    logger.debug("crawl: generation complete", extra=stats)
+    return stats

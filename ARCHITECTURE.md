@@ -221,7 +221,7 @@ backend/app/worker/
 connection from arq. Nothing in `app/api/` or `app/features/` imports `app/worker/` — the
 dependency runs the other way, so the queue never enters a request path.
 
-Three properties of `WorkerSettings` are load-bearing enough to state here, because each
+Four properties of `WorkerSettings` are load-bearing enough to state here, because each
 fails silently rather than loudly:
 
 - **`poll_delay = 5`, not arq's 0.5.** An idle worker issues one Redis command per poll, and
@@ -232,6 +232,13 @@ fails silently rather than loudly:
   on Fly with no HTTP listener to fail a health check. A no-op job holds the place.
 - **`job_completion_wait` is non-zero.** It is the only thing that makes SIGTERM drain
   rather than cancel, and it has to nest inside `fly.toml`'s `kill_timeout`.
+- **`cron_jobs` registers the schedule tick, once a minute, with `max_tries=1`.** It is the
+  only writer of `schedules.last_run_at` besides the run pipeline itself, and it is the one
+  place in this codebase where more than one worker machine racing the same work is a real
+  scenario rather than a theoretical one. Its correctness under that scenario rests entirely
+  on `SchedulesReader.lock_due`'s `FOR UPDATE SKIP LOCKED`, not on arq's own best-effort
+  `unique=True` — a distinction that is invisible with a single worker and only starts to
+  matter the day a second one is added.
 
 Startup and shutdown hooks (`on_startup`/`on_shutdown`) open and close the asyncpg pool with
 **the same factory the API's lifespan uses**, and publish shared resources on arq's context
@@ -323,6 +330,63 @@ regardless of which bucket a deployment configures. The website-scoped prefix is
 for the same reason it is documented in `internals/payload.py`: it is what would make "delete
 everything a website ever produced" a single prefix-delete operation, the day that operation
 exists (§11 records that it does not yet).
+
+### 3.8 Logging and correlation ids
+
+**`fly logs` is the entire observability story, and that is a decision rather than a gap.**
+There is **no error-tracking service on either side of this system** — no Sentry, no
+equivalent, nothing like it in `backend/requirements.txt` or under `frontend/`. Backend
+errors surface as JSON `ERROR` lines in `fly logs`; frontend errors surface in Vercel's
+runtime logs. Adding an error-tracking service later is its own ticket and its own decision.
+It is not something a ticket re-introduces in passing, and a later ticket whose prose
+mentions one does not override this paragraph.
+
+Two consequences follow, and both are enforced in code rather than asked for politely:
+
+- **An `ERROR` line _is_ the incident record.** No second system holds a copy, so an
+  unhandled exception logs its **complete** traceback alongside its correlation id.
+  Truncating tracebacks to keep logs tidy would leave nothing to debug from.
+- **Every line has to be machine-readable**, because reading an interleaved stream by eye is
+  not a debugging strategy for a job system.
+
+`backend/app/core/logging.py` configures both processes. Every line is one JSON object on
+stdout carrying `ts` (ISO-8601 UTC), `level`, `logger`, `message`, and `process` — `app` or
+`worker`, matching `backend/fly.toml`'s `[processes]` keys — plus whatever the call site
+passed as `extra=`. `configure_logging()` is called once per process: from
+`app.main.create_app()` for the API, and at module import in `app/worker/settings.py` for the
+worker, which never imports `app.main`. It also pulls uvicorn's own loggers onto the same
+handler, so nothing the container prints is un-parseable. arq's half of that cannot be done
+from Python at import time — its CLI applies its own `dictConfig` afterwards — and is passed
+on the command line instead, as `--custom-log-dict app.worker.settings.ARQ_LOG_CONFIG`, in
+both `fly.toml` and `scripts/dev.sh`.
+
+**Correlation ids travel in `contextvars`, never in module globals and never as function
+arguments.** The API's middleware (`app/api/middleware/request_context.py`) accepts or
+generates an `X-Request-ID`, binds it, and echoes it on every response.
+`app.worker.jobs.crawl_task` binds `run_id` for the life of one crawl, and `schedule_tick`
+binds a `tick_id` for one cron tick. Everything logged beneath those scopes is tagged
+automatically — no service, reader, or `internals/` module is handed an id — so
+
+```
+fly logs --app llms-text-justin-he | jq 'select(.run_id == "…")'
+```
+
+reconstructs one crawl out of a stream shared with every other job. A module-level "current
+run id" would be shared by every task on the event loop, so two concurrent crawls
+(`max_jobs = 2`) would attribute each other's failures, which is worse than having no
+correlation id at all. `backend/tests/test_logging.py` proves that isolation under real
+concurrency rather than asserting it in a comment.
+
+The API additionally logs **one summary line per request** — method, path, status,
+`duration_ms`, and `user_id` when the request authenticated — at `ERROR` for 5xx, `WARNING`
+for the 4xx that mean something actually went wrong (409, 429), `INFO` otherwise, and `DEBUG`
+for `/health`, which Fly probes every ten seconds forever. The path never includes the query
+string, and nothing on that path reads the `Authorization` header.
+
+Finally, **a redaction filter runs on every record** before any handler formats it, rewriting
+bearer tokens, JWTs, credentialed connection strings, and named-credential assignments to
+`[REDACTED]`. It is insurance, not permission: §9.4 still forbids logging a secret, and a
+call site that does is still a bug — one the filter may not recognise.
 
 ---
 
@@ -693,6 +757,16 @@ never exist only in the README.
 ### 8.1 App Router and the BFF
 
 - **App Router only.** No `pages/` directory.
+- **MDX is for prose pages, and there is one.** `@next/mdx` is wired up in
+  `frontend/next.config.ts` — which is why `pageExtensions` lists `ts` and `tsx`
+  explicitly: setting that key replaces the default list rather than extending it, and
+  omitting them would unroute every other page in the app. `frontend/mdx-components.tsx`
+  maps each element onto the palette's own tokens; it sits at the project root under that
+  exact name because that is `@next/mdx`'s contract for the App Router, not a filing
+  decision. No remark or rehype plugins, and no `@tailwindcss/typography` — a typography
+  plugin brings its own colour opinions, including the `prose-invert` dark variant §8.5
+  forbids. `app/docs/page.mdx` is the only MDX page. A second prose page is fine; a docs
+  *site* (sidebar, search, version switcher) is a different ticket.
 - Route handlers under `app/api/[...path]/` proxy to FastAPI. This is a
   backend-for-frontend: the browser calls same-origin Next.js routes, and Next.js calls Fly
   server-side.
@@ -751,11 +825,22 @@ threat model would.
 | `components/ui/` | shadcn/ui primitives — generated, edited only when a primitive genuinely needs it |
 | `components/magicui/` | Magic UI components |
 | `components/crawls/` | App-specific composites built from the above |
+| `components/landing/` | The landing page's own composites — the URL field and the account chip |
 | `components/auth/` | Sign-in / sign-out affordances and the client-side identity hook |
 
-Feature composites go in `components/crawls/`. Do not put app-specific logic into
-`components/ui/`; those files should stay close to what the generator produced so they can
-be regenerated.
+Feature composites go in a directory named after the screen they belong to —
+`components/crawls/` for the crawls table and detail page, `components/landing/` for `/`.
+Do not put app-specific logic into `components/ui/`; those files should stay close to what
+the generator produced so they can be regenerated. `components/magicui/` follows the same
+rule, with one deliberate carve-out: retuning a Magic UI component for this light palette,
+or adding the `asChild` escape hatch `components/ui/button.tsx` already has, is a change to
+the primitive itself and belongs there — building a landing-page-shaped wrapper around it
+does not.
+
+**A screen's chrome is not shared by default.** `components/crawls/crawls-header.tsx` is
+the app's header for signed-in screens; the landing page deliberately has none, and renders
+only a `UserMenu` in the corner when there is a session. Importing a header in order to
+hide most of it is how a page ends up with chrome nobody asked for.
 
 **A feature's non-visual logic lives in `lib/`, not in its components.** `lib/crawls/` is
 the first instance and sets the shape: the pure derivations behind the `/crawls` table
@@ -766,11 +851,20 @@ separation §3.1 draws on the backend, and it exists for the same reason: a func
 turns four run statuses into five row labels is testable, greppable and reusable on its
 own, and becomes none of those things once it is an `if` inside a `<td>`. The rule of
 thumb is that anything in `lib/<feature>/` should be readable without knowing what the
-screen looks like, and anything in `components/<feature>/` should be mostly markup. Note
-that this is a *feature's own* logic: shared plumbing every feature uses stays in
+screen looks like, and anything in `components/<feature>/` should be mostly markup.
+`lib/landing/` is the second instance and holds exactly two things for the same reasons:
+`site-url.ts`, the pure "is this an absolute http(s) URL" check, and `use-add-site.ts`, the
+create-website-then-trigger-run-then-navigate sequence with its five endings. Note that
+this is a *feature's own* logic: shared plumbing every feature uses stays in
 `lib/api/`, `lib/query/`, `lib/auth/` and `lib/supabase/`, and a feature directory must
 never grow a second copy of something those already own — a second fetcher, a second
-query-key shape, or a second answer to "is this run still active" (§8.6).
+query-key shape, or a second answer to "is this run still active" (§8.6). `use-add-site.ts`
+is the worked example: it orchestrates, and every request it makes goes through
+`lib/query/`'s existing `useCreateWebsite` and `useTriggerRun` so that the cache
+invalidations stay defined once. What it *did* add to those two hooks is a
+`toastOnError` option, defaulting to the existing behaviour — because the landing page
+renders each failure under the field that caused it, and its two `409`s are navigations
+rather than errors to report at all.
 
 ### 8.5 Light theme only
 
@@ -782,6 +876,18 @@ query-key shape, or a second answer to "is this run still active" (§8.6).
 
 If a dark theme is ever wanted, it is a designed feature with its own ticket — not something
 that accumulates one `dark:` class at a time.
+
+**One generated primitive has to be re-edited every time it is regenerated.**
+`frontend/components/ui/chart.tsx` ships from the shadcn registry with two-theme support: a
+`THEMES = { light: "", dark: ".dark" }` map, a `theme` alternative to `color` in its config
+type, and a `ChartStyle` that emits one CSS block per theme, the second prefixed `.dark`.
+That half is deleted in this repo, and the file carries a `LOCAL EDIT` comment saying so.
+
+It is worth knowing *why* the usual guardrail does not cover this one. `app/globals.css`'s
+`@custom-variant dark (&:not(*))` neuters Tailwind's `dark:` **variant** — but what this
+component emits is a raw `.dark [data-chart=…]` selector inside a `<style>` tag, which never
+passes through Tailwind at all. The dead ruleset would ship on every chart and no static gate
+would say a word. Re-running `npx shadcn@latest add chart` restores it; remove it again.
 
 ### 8.6 Data fetching
 
@@ -817,13 +923,24 @@ backend, because it only ever reads the JSON already in the repo. Both checks fa
 **The query key factory.** `frontend/lib/query/query-keys.ts` is the only place a React
 Query cache key is constructed — `queryKeys.websites.all`, `.list(include?)`,
 `.detail(id)`, the mirroring `queryKeys.runs.all`, `.list(websiteId, options?)`,
-`.detail(id)`, and `queryKeys.schedules.detail(websiteId)` — so that invalidating "every
-website" or "this one website" (or "every run" or "this one run", or "this one website's
-schedule") is a call to a function here rather than an array literal a caller has to get
-byte-for-byte right at every call site. `schedules` has no `.all`/`.list` of its own: a
-schedule is 1:1 with a website and has no independent id anywhere in the API surface, so
-`websiteId` alone is both the scope and the whole key, unlike `runs`, which is genuinely a
-collection per website.
+`.detail(id)`, `queryKeys.schedules.detail(websiteId)`, and
+`queryKeys.stats.detail(websiteId, window)` — so that invalidating "every website" or "this
+one website" (or "every run" or "this one run", or "this one website's schedule") is a call
+to a function here rather than an array literal a caller has to get byte-for-byte right at
+every call site. `schedules` has no `.all`/`.list` of its own: a schedule is 1:1 with a
+website and has no independent id anywhere in the API surface, so `websiteId` alone is both
+the scope and the whole key, unlike `runs`, which is genuinely a collection per website.
+
+`stats` (`GET /websites/{id}/stats`, the Trends tab) is a separate root rather than a
+`runs.*` key, even though `lib/api/runs.ts` owns its `getStats` helper and it aggregates the
+very same rows. `runs.forWebsite(id)` exists to be invalidated and is a prefix of
+`["runs", "list", websiteId]`; nesting stats under `runs` would either fall outside that
+prefix, making the nesting decorative, or inside it, so that every "this website's history
+changed" invalidation also dropped an aggregate the Trends tab may be rendering. Its
+`window` is part of the key for the reason `include` is part of `websites.list`: `?window=7d`
+and `?window=90d` are different responses with different `bucket` fields and different
+series lengths, and one key for both would render 7d's hourly buckets under day labels until
+the refetch landed.
 
 `runs` carries two further keys, both added for the detail page. `.infinite(websiteId,
 filters?)` is the same list read through `useInfiniteQuery` rather than `useQuery`

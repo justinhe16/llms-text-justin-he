@@ -10,16 +10,20 @@
 // owner-only, and the four error shapes it can return are the reason `RunAlreadyInFlightDetail`
 // and `RunLimitExceededDetail` are exported below.
 //
-// Still ABSENT: `GET /websites/{id}/stats` (PER-156), which landed on
-// backend/app/api/routers/runs.py alongside the two reads here but has no `getStats` helper
-// yet — see lib/api/websites.ts's header comment for why writing one ahead of the Trends tab
-// that would call it would be premature. Schedules are not on the list at all: `GET`/`PUT
-// /websites/{id}/schedule` shipped with PER-154 and live in `lib/api/schedules.ts` — the
-// schedules feature owns its own response shapes, the same way this file owns
-// `RunListItemResponse` and friends. Writing `getStats` now would either hand-write a
-// response shape nothing generates or silently point at a path `paths` does not know about —
-// the latter is exactly what `PathsWithMethod` in fetcher.ts turns into a compile error,
-// which is the intended guardrail working correctly, not a gap to work around.
+// `getStats` (`GET /websites/{id}/stats`) is no longer absent either: PER-156 shipped the
+// route on backend/app/api/routers/runs.py alongside the two reads above, and PER-169's
+// Trends tab is the caller that needed it. It lives in THIS file rather than
+// lib/api/websites.ts despite its `/websites/…` path, for the same reason the backend put
+// the route on its runs router: what it returns is run statistics — counts, durations and
+// page averages of runs — and the website id in the path is only the scope. Schedules are
+// not on the list at all: `GET`/`PUT /websites/{id}/schedule` shipped with PER-154 and live
+// in `lib/api/schedules.ts` — the schedules feature owns its own response shapes, the same
+// way this file owns `RunListItemResponse` and friends.
+//
+// Nothing is on the absent list any more. When the next endpoint lands, add its helper here
+// or in the sibling file that owns its feature — never a hand-written response shape, and
+// never a path `paths` does not know about, which `PathsWithMethod` in fetcher.ts turns into
+// a compile error rather than a runtime 404.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";
@@ -32,6 +36,59 @@ export type RunListItem = components["schemas"]["RunListItemResponse"];
 export type RunDetail = components["schemas"]["RunDetailResponse"];
 export type RunPage = components["schemas"]["Page_RunListItemResponse_"];
 export type RunTrigger = components["schemas"]["RunListItemResponse"]["trigger"];
+
+// ---- Stats (`GET /websites/{id}/stats`, PER-156) ---------------------------------------
+
+/** The whole `GET /websites/{id}/stats` body: the echoed `window`/`bucket`, the `series`, and
+ * the whole-window `totals`. */
+export type WebsiteStats = components["schemas"]["WebsiteStatsResponse"];
+
+/**
+ * One bucket of `series`.
+ *
+ * Every bucket in the window is present exactly once, **including buckets with no runs**,
+ * which report zeroes rather than being omitted — the backend zero-fills them with
+ * `generate_series` (backend/app/features/runs/internals/runs_reader.py). `avg_pages` and
+ * `avg_duration_ms` are therefore `number`, never `null`, and a zero in either is a real
+ * measurement of a quiet hour rather than missing data. A chart must render those zeroes as
+ * zeroes and must not interpolate across them.
+ */
+export type StatsPoint = components["schemas"]["RunStatsPoint"];
+
+/**
+ * The whole-window summary.
+ *
+ * `success_rate` is the field to be careful with. It is a **fraction in `[0, 1]`**, not a
+ * percentage, and it is `null` — never `0` — when the window contains no runs at all
+ * (`service.py`'s `_to_stats`: `total_completed / total_runs if total_runs > 0 else None`).
+ * The backend draws that distinction deliberately, so "nothing ran" and "everything failed"
+ * cannot be confused, and a caller must read it with `??` rather than `||`: `0 || "—"` shows
+ * a dash for a genuine 0% success rate, which is precisely backwards.
+ *
+ * `last_run_at` is scoped to the window like everything else here, so it is `null` both for a
+ * website that has never run and for one whose runs are all older than the window. It cannot
+ * tell those two apart; a caller that needs to (the Trends tab does, to choose between two
+ * empty states) has to look at the run history instead.
+ */
+export type StatsTotals = components["schemas"]["RunStatsTotals"];
+
+/**
+ * The three windows `?window=` accepts. Read off the *response* type rather than the request
+ * parameter because the response echoes the resolved window back and the two unions are the
+ * same by construction — and this spelling stays a one-hop alias of generated code, which a
+ * hand-written `"7d" | "30d" | "90d"` would not.
+ */
+export type StatsWindow = WebsiteStats["window"];
+
+/**
+ * The bucket size the backend chose for a window — `hour` for 7d, `day` for 30d and 90d.
+ *
+ * Derived from `window` by the server (`internals/stats_window.py`) and never supplied by the
+ * caller, which is exactly why it is echoed back: a client formats its axis from **this
+ * field**, not from a second copy of the window→bucket mapping that could disagree with the
+ * one that actually produced the data.
+ */
+export type StatsBucket = WebsiteStats["bucket"];
 
 /**
  * The `202` body of `POST /websites/{id}/runs` — `{ id, status, started_at }` and nothing
@@ -127,4 +184,22 @@ export function getRun(id: string): Promise<RunDetail> {
  */
 export function triggerRun(websiteId: string): Promise<TriggeredRun> {
   return api.post("/websites/{id}/runs", { params: { id: websiteId } });
+}
+
+/**
+ * `GET /websites/{id}/stats?window=`. Unfiltered by caller identity like the two reads above
+ * (ARCHITECTURE.md §4.1) — any signed-in user may read any website's statistics.
+ *
+ * `window` is required *here* although the endpoint defaults it to `30d` server-side. The
+ * default is not the interesting part: the caller (lib/query/use-website-stats.ts) puts the
+ * window in the React Query cache key, and a helper that let it be omitted would make
+ * "fetched with no window" and "fetched with 30d" two keys for one response. Deciding the
+ * default in one place — `DEFAULT_STATS_WINDOW` in lib/crawls/use-detail-view.ts, which reads
+ * it off the URL — keeps the key and the request describing the same request.
+ *
+ * `404` if `id` names no website. An unrecognized `window` is a `422`, but `StatsWindow`
+ * makes that unreachable from TypeScript.
+ */
+export function getStats(websiteId: string, window: StatsWindow): Promise<WebsiteStats> {
+  return api.get("/websites/{id}/stats", { params: { id: websiteId }, query: { window } });
 }

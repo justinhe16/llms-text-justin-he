@@ -10,7 +10,7 @@
 // this repo elsewhere reaches for a literal type to protect (see `RunStatus` in
 // lib/api/run-status.ts for the same instinct applied to a different problem).
 
-import type { RunListOptions } from "@/lib/api/runs";
+import type { RunListOptions, StatsWindow } from "@/lib/api/runs";
 
 const websites = {
   // The root of every website-related key. `queryClient.invalidateQueries({ queryKey:
@@ -85,6 +85,24 @@ const schedules = {
   detail: (websiteId: string) => ["schedules", "detail", websiteId] as const,
 };
 
+// `GET /websites/{id}/stats` is run *statistics*, and `lib/api/runs.ts` owns its helper for
+// that reason — but its cache entries are deliberately NOT nested under `runs` above.
+//
+// `runs.forWebsite(id)` exists to be invalidated, and it is a prefix of `["runs", "list",
+// websiteId]`. Filing stats under the same root would either sit outside that prefix (making
+// the nesting decorative) or inside it (making every "this website's history changed"
+// invalidation also drop an aggregate the Trends tab may be rendering). A separate root says
+// what is true: these are two resources that happen to be about the same underlying rows.
+//
+// `window` is part of the key for the same reason `include` is part of `websites.list` —
+// `?window=7d` and `?window=90d` are different responses with different `bucket` fields and
+// different series lengths, and one key for both would let a switch to 90d render 7d's
+// hourly buckets under day labels until the refetch landed.
+const stats = {
+  detail: (websiteId: string, window: StatsWindow) =>
+    ["stats", "detail", websiteId, window] as const,
+};
+
 const health = {
   status: ["health"] as const,
 };
@@ -93,5 +111,6 @@ export const queryKeys = {
   websites,
   runs,
   schedules,
+  stats,
   health,
 };

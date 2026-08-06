@@ -25,14 +25,32 @@ exactly this reason. `crawl_task` accepts `str | UUID` and coerces with `UUID(st
 a malformed id is logged and the job returns rather than raising — the same "a worker must
 not raise at arq" contract `CrawlService.execute_run` itself follows for every other failure
 mode.
+
+**Each job binds its own correlation id, and that is the one thing a job does that is not
+"call one service method".** `crawl_task` opens `run_id_context(...)` around its body and
+`schedule_tick` opens `tick_id_context(...)` around its; both are `contextvar` scopes
+(`app.core.logging`), so every line logged anywhere beneath them — in `CrawlService`, in
+`internals/fetcher.py`, in `internals/ssrf.py` — carries the id automatically, with no
+function in between having to accept one. It belongs here, in the job, rather than in the
+service, because the job is the outermost thing that knows which run this is: a service
+method called from a route would have no run to bind, and binding it twice at different
+depths is how a correlation id starts disagreeing with itself.
+
+**`schedule_tick` is the second job, and it takes no arguments beyond `ctx`.** It is not
+enqueued by anything — arq's own cron scheduler calls it once a minute (`app/worker/
+settings.py`'s `cron_jobs`), which is what makes it a cron job rather than a task something
+else enqueues. It builds a `ScheduleService` from `ctx["db_pool"]` and the module `settings`
+and calls `ScheduleService.run_due_schedules`, exactly as thin as `crawl_task` above.
 """
 
 import logging
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from app.core.logging import run_id_context, tick_id_context
 from app.core.settings import settings
 from app.features.crawl.service import build_crawl_service
+from app.features.schedules.service import build_schedule_service
 
 
 logger = logging.getLogger(__name__)
@@ -106,20 +124,72 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
         logger.error("crawl_task: %r is not a valid run id; skipping", run_id)
         return "invalid run id"
 
-    service = build_crawl_service(ctx["db_pool"], ctx["http_client"], ctx["storage"], settings)
-    outcome = await service.execute_run(parsed_run_id)
+    # THE ONE PLACE `run_id` IS BOUND, and the reason nothing below it — not
+    # `CrawlService`, not `internals/fetcher.py`, not `internals/ssrf.py` — has to be handed
+    # a run id to log one. `run_id_context` sets a `contextvar`, which arq's job task
+    # inherits a private copy of, so two crawls running concurrently on the same worker
+    # (`max_jobs = 2`) can never show each other's id. See app/core/logging.py.
+    with run_id_context(str(parsed_run_id)):
+        service = build_crawl_service(ctx["db_pool"], ctx["http_client"], ctx["storage"], settings)
+        outcome = await service.execute_run(parsed_run_id)
 
-    if outcome is None:
+        if outcome is None:
+            logger.info("crawl_task: no outcome; see CrawlService's own logs for why")
+            return "no outcome"
+
         logger.info(
-            "crawl_task: run %s produced no outcome; see CrawlService's own logs for why",
-            parsed_run_id,
+            "crawl_task: fetched %d page(s)",
+            outcome.stats.get("pages_crawled", 0),
+            extra={
+                "pages_crawled": outcome.stats.get("pages_crawled", 0),
+                "storage_path": outcome.storage_path,
+            },
         )
-        return "no outcome"
+        return "ok"
 
-    logger.info(
-        "crawl_task: run %s fetched %d page(s), storage_path=%s",
-        parsed_run_id,
-        outcome.stats.get("pages_crawled", 0),
-        outcome.storage_path,
-    )
-    return "ok"
+
+async def schedule_tick(ctx: dict[Any, Any]) -> str:
+    """Run one cron tick: turn every due schedule into a `runs` row (or advance it past being
+    due), and enqueue `crawl_task` for each one. Thin by contract — see the module docstring.
+
+    `ctx["db_pool"]` is the same process-wide pool `crawl_task` reads, published once by
+    `app/worker/settings.py`'s `open_worker_resources`. `ctx["redis"]` is different from
+    both: it is **arq's own** `ArqRedis` connection pool, set by `arq.worker.Worker.main`
+    itself before `on_startup` ever runs (every job's `ctx` carries it, not just this one) —
+    not something `open_worker_resources` publishes, and not something this job opens for
+    itself. That is why `ScheduleService.run_due_schedules` takes a queue pool as a plain
+    argument rather than this job constructing one: the connection already exists, arq made
+    it, and reusing it is exactly what `crawl_task` does one line up for `ctx["http_client"]`.
+
+    **Never raises.** `ScheduleService.run_due_schedules` is wrapped in its own
+    `try`/`except Exception`, logged at `logger.error` with `exc_info=True`, and answered with
+    a short failure string — the same "a worker must not raise at arq" contract `crawl_task`
+    follows. `app/worker/settings.py` registers this cron job with `max_tries=1`: a tick that
+    fails is not retried immediately against whatever partially-advanced state it left behind;
+    the NEXT tick, one minute later, retries it against fresh state instead.
+    `asyncio.CancelledError` (arq's job timeout, or SIGTERM) is not caught here either, for the
+    same reason `crawl_task` does not catch it — a plain `except Exception` already lets it
+    propagate, since `CancelledError` is not a subclass of `Exception`.
+
+    Returns:
+        A short, human-readable outcome string for arq's job result, built from the tick's
+        `TickSummary` — never anything a caller is expected to parse.
+    """
+    # `crawl_task`'s `run_id_context` for a job that has no id of its own to bind. A tick is
+    # not addressed by anything — arq's scheduler calls it, nothing enqueues it — so the id
+    # is minted here, once per tick, purely so that the handful of lines one tick emits can
+    # be selected out of a stream shared with however many crawls are running beside it.
+    with tick_id_context(str(uuid4())):
+        try:
+            service = build_schedule_service(ctx["db_pool"], settings)
+            summary = await service.run_due_schedules(ctx["redis"])
+        except Exception:
+            logger.error("schedule_tick: cron tick failed", exc_info=True)
+            return "failed"
+
+        return (
+            f"examined={summary.examined} runs_created={summary.runs_created} "
+            f"skipped_active={summary.skipped_active} "
+            f"enqueue_failures={summary.enqueue_failures} "
+            f"limit_reached={summary.limit_reached}"
+        )

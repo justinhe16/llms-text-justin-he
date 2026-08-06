@@ -27,12 +27,15 @@ that section lands.
 
 import gzip
 import json
+import logging
 from collections.abc import Sequence
 from typing import Final
 from uuid import UUID
 
 from app.features.crawl.schemas import CrawledPage
 
+
+logger = logging.getLogger(__name__)
 
 PAYLOAD_CONTENT_TYPE: Final = "application/x-ndjson"
 """The `Content-Type` `SupabaseStorage.upload` sends for a crawl payload. Newline-delimited
@@ -98,4 +101,11 @@ def serialize_payload(pages: Sequence[CrawledPage]) -> bytes:
     times with two different objects."
     """
     raw = "".join(f"{_page_to_json_line(page)}\n" for page in pages).encode("utf-8")
-    return gzip.compress(raw, mtime=0)
+    result = gzip.compress(raw, mtime=0)
+    # The compressed bytes, never the payload itself: this is the same "no page content in
+    # `fly logs`" line CrawlService's own upload log draws — logging `result` or `raw` here
+    # would put every fetched page's text on stdout one call earlier than that line does.
+    logger.debug(
+        "crawl: serialized payload", extra={"pages": len(pages), "compressed_bytes": len(result)}
+    )
+    return result

@@ -17,22 +17,40 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
-from app.api.deps import CurrentUserId, DbPool
+from app.api.deps import CurrentUserId, DbPool, SettingsDep
+from app.features.runs.service import RunService
 from app.features.schedules.schemas import ScheduleResponse, UpsertScheduleRequest
 from app.features.schedules.service import ScheduleService
+from app.features.websites.service import WebsiteService
 
 
 router = APIRouter(tags=["schedules"])
 
 
-def get_schedule_service(pool: DbPool) -> ScheduleService:
+def get_schedule_service(pool: DbPool, settings: SettingsDep) -> ScheduleService:
     """Build the service for one request from the process-wide pool.
 
     Feature-specific wiring lives beside the feature's routes, exactly like
     `get_website_service` in `api/routers/websites.py` — see that function's docstring for
     why this does not live in `app.api.deps` instead.
+
+    Builds a `WebsiteService` and a `RunService` here too, mirroring `get_run_service`
+    (`api/routers/runs.py`): `ScheduleService.__init__` now requires a `RunService` because
+    the cron tick (`ScheduleService.run_due_schedules`) needs one to insert the `runs` rows a
+    schedule produces (ARCHITECTURE.md §3.1 — one feature calls another feature's service,
+    never its reader). Neither HTTP handler in this file — `get_schedule` nor
+    `upsert_schedule` — actually calls the tick, so every request built through this
+    dependency constructs a `RunService` it never uses. That is a deliberate, cheap cost, not
+    an oversight: `RunService.__init__` does no I/O, and the alternative — making the tick's
+    `RunService` an optional constructor argument, `None` in the two HTTP paths — would turn
+    `run_due_schedules` into a method that has to handle a collaborator that might not be
+    there, for a service that in production is `None` roughly half the time (every request
+    that never triggers the tick). One `ScheduleService` shape, always fully constructed, is
+    simpler to reason about than two.
     """
-    return ScheduleService(pool)
+    website_service = WebsiteService(pool)
+    run_service = RunService(pool, website_service, settings)
+    return ScheduleService(pool, run_service)
 
 
 ScheduleServiceDep = Annotated[ScheduleService, Depends(get_schedule_service)]

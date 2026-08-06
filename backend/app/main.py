@@ -11,6 +11,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.middleware.request_context import (
+    RequestContextMiddleware,
+    request_id_exception_handler,
+)
 from app.api.routers import health, runs, schedules, websites
 from app.core.auth.jwks import close_jwks_cache, create_jwks_client, open_jwks_cache
 from app.core.logging import configure_logging
@@ -91,14 +95,33 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Build the FastAPI application."""
     # Shared with the ARQ worker (app.core.logging), which configures logging for itself
-    # because it never imports this module.
-    configure_logging()
+    # because it never imports this module. `"app"` is the process name every line this
+    # process emits is tagged with, and it matches backend/fly.toml's `[processes]` key.
+    #
+    # First, before the FastAPI object exists: uvicorn has already configured its own
+    # loggers by the time it imports this module, and `configure_logging` is what pulls
+    # them onto the JSON handler, so anything logged between here and the first request is
+    # already structured.
+    configure_logging("app")
     app = FastAPI(
         title="llms-text API",
         description="Backend for llms-text: website registration, crawl runs, llms.txt generation",
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # Correlation ids, the X-Request-ID response header, and the one-line request summary.
+    # Added before any router, so it wraps every route this application will ever have
+    # rather than the ones that happened to be registered first. It adds no route and no
+    # schema of its own, so frontend/lib/api/openapi.json is unaffected by it.
+    app.add_middleware(RequestContextMiddleware)
+
+    # The 500 an *unhandled* exception produces is written by Starlette's
+    # ServerErrorMiddleware, which sits above every middleware added here — see the
+    # handler's own docstring for why that means the header has to be stamped again from
+    # inside it.
+    app.add_exception_handler(Exception, request_id_exception_handler)
+
     app.include_router(health.router)
     app.include_router(websites.router)
     app.include_router(runs.router)

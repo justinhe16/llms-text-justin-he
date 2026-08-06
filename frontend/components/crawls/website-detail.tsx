@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowLeft, ChartLine } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import Link from "next/link";
 
 import { Skeleton } from "@/components/ui/skeleton";
@@ -15,11 +15,11 @@ import { useWebsite } from "@/lib/query/use-website";
 import { CrawlOwner } from "./crawl-owner";
 import { CrawlsError } from "./crawls-error";
 import { OutputTab } from "./output-tab";
-import { PlaceholderTab } from "./placeholder-tab";
 import { RunNowButton } from "./run-now-button";
 import { RunStatusIndicator } from "./run-status-indicator";
 import { RunsTab } from "./runs-tab";
 import { ScheduleTab } from "./schedule-tab";
+import { TrendsTab } from "./trends-tab";
 
 const TAB_LABELS: Record<DetailTab, string> = {
   runs: "Runs",
@@ -50,7 +50,8 @@ const TAB_LABELS: Record<DetailTab, string> = {
  * asked to see.
  */
 export function WebsiteDetail({ websiteId }: { websiteId: string }) {
-  const { tab, selectedRunId, setTab, showRunOutput } = useDetailView();
+  const { tab, selectedRunId, statsWindow, setTab, showRunOutput, setStatsWindow } =
+    useDetailView();
   const { user } = useUser();
 
   const websiteQuery = useWebsite(websiteId);
@@ -72,6 +73,17 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
   // is running.
   const firstPage = runsQuery.data?.pages[0];
   const hasActiveRun = firstPage !== undefined && anyRunActive(firstPage);
+
+  // Whether this website has ever been crawled at all — `null` only while that is still
+  // loading. The Trends tab needs it because the stats endpoint is entirely window-scoped and
+  // cannot distinguish "nothing in the last 30 days" from "never run" (see `TrendsTab`).
+  //
+  // Derived from the run list this page already fetches, rather than a query of its own. Note
+  // that a *failed* run query yields `false` here, not `null`, which is the same call
+  // `headerStatus` above already makes with the same uncertainty — one page should not hold
+  // two opinions about whether this website has ever run, and the Runs tab reports the
+  // failure itself.
+  const hasEverRun = runsQuery.isPending ? null : runs.length > 0;
 
   const isOwner = user !== null && website !== undefined && user.id === website.user_id;
 
@@ -196,12 +208,17 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
               />
             </TabsContent>
 
-            {/* PER-169 replaces this element. */}
             <TabsContent value="trends" className="mt-6 min-w-0">
-              <PlaceholderTab
-                icon={ChartLine}
-                title="Trends"
-                description="Pages crawled and run duration over time, so a site that is quietly growing or slowing down is visible."
+              <TrendsTab
+                websiteId={websiteId}
+                window={statsWindow}
+                onWindowChange={setStatsWindow}
+                // Radix already unmounts an inactive panel, so this is belt-and-braces — but
+                // it is what actually holds the "no aggregate query on a page view that never
+                // opens Trends" guarantee, rather than leaving it to a mounting detail.
+                isActive={tab === "trends"}
+                hasEverRun={hasEverRun}
+                canRun={isOwner}
               />
             </TabsContent>
           </Tabs>

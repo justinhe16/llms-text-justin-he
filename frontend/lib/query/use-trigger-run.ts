@@ -82,13 +82,22 @@ export type TriggerRunFailure = {
  * and `use-put-schedule.ts`: a caller's own `onSuccess`/`onError` runs *after* this hook's,
  * never instead of it, so the invalidations and the toast have already happened by the time
  * the caller's callback sees the result.
+ *
+ * `toastOnError` defaults to `true` and exists for the same reason as its twin in
+ * `use-create-website.ts`: the landing page's submit flow renders every failure inline,
+ * under the URL field, and the `409` it handles is not an error the user has to clear at
+ * all — it navigates. A toast there would either duplicate the inline message or announce a
+ * failure at the exact moment the page is doing the right thing. Everything else this hook
+ * does, including the `TriggerRunFailure` handed to `onFailure`, is unaffected.
  */
 export function useTriggerRun(
   options?: Pick<UseMutationOptions<TriggeredRun, Error, string>, "onSuccess"> & {
     onFailure?: (failure: TriggerRunFailure, error: Error) => void;
+    toastOnError?: boolean;
   }
 ) {
   const queryClient = useQueryClient();
+  const toastOnError = options?.toastOnError ?? true;
 
   return useMutation({
     mutationFn: (websiteId: string) => triggerRun(websiteId),
@@ -100,7 +109,7 @@ export function useTriggerRun(
     },
 
     onError: (error: Error) => {
-      toast.error(error.message);
+      if (toastOnError) toast.error(error.message);
 
       const alreadyInFlight = isRunAlreadyInFlight(error);
       options?.onFailure?.(

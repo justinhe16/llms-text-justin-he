@@ -1,4 +1,5 @@
-"""`compute_next_run_at` — the one pure function that decides what a PUT does to a schedule.
+"""`compute_next_run_at` and `advance_next_run_at` — the two pure functions that decide what
+`next_run_at` becomes, from the two different directions something can change it.
 
 This module lives in `schedules/internals/` for the same reason `url_normalize.py` lives in
 `websites/internals/` (ARCHITECTURE.md §3.1): it is feature-owned logic with no I/O and no
@@ -10,10 +11,24 @@ already looked like, not just on what the client just sent. A function of `(curr
 new_state, now)` — with no database access — is the only way to make every branch of that
 decision exhaustively testable without a real transaction, and it is the shape the ticket
 asks for directly.
+
+**`compute_next_run_at` owns what a PUT does; `advance_next_run_at` owns what the cron tick
+does.** The two functions never call each other and share no code beyond both taking `now` as
+a required keyword argument — the same discipline for the same reason. `compute_next_run_at`
+decides whether a schedule needs a `next_run_at` at all, and if so, whether to keep the one it
+already had (row 5's starvation guard) or recompute one. `advance_next_run_at` is only ever
+called on a schedule the tick just locked because it WAS due, so there is no "keep the old
+value" branch to speak of — every call unconditionally schedules the next occurrence forward.
+Both always schedule from `now`, never from the stale `next_run_at` that made the row due in
+the first place, which is what stops a schedule that was missed during a worker outage from
+trying to "catch up" with a burst of back-to-back runs the moment the tick resumes — making
+that behaviour configurable is explicitly out of scope for this ticket.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from random import Random
+from typing import Final
 
 
 @dataclass(frozen=True)
@@ -119,3 +134,70 @@ def compute_next_run_at(
         return current.next_run_at
 
     return now + timedelta(minutes=new_state.interval_minutes)
+
+
+# How far a jittered `next_run_at` may drift from a plain `now + interval`, as a fraction of
+# the interval. 5% of a daily (1440-minute) schedule is about ±72 minutes; 5% of an hourly
+# (60-minute) one is about ±3 minutes — enough to break up a cohort of schedules created in
+# the same second (a common onboarding flow: several websites added back-to-back, all
+# defaulted to the same interval) without meaningfully changing when any one of them runs.
+MAX_JITTER_FRACTION: Final = 0.05
+
+
+def advance_next_run_at(*, now: datetime, interval_minutes: int, rng: Random) -> datetime:
+    """Derive the `next_run_at` the cron tick should persist for a schedule that just fired.
+
+    Returns `now + interval + offset`, where `offset` is drawn uniformly from
+    `[-MAX_JITTER_FRACTION * interval, +MAX_JITTER_FRACTION * interval]`.
+
+    **Why jitter exists at all.** Without it, every schedule created with the same interval at
+    the same moment — the onboarding flow described above, or a batch of websites added in one
+    sitting — fires in the same second forever: `advance_next_run_at` would otherwise recompute
+    `now + interval` from the SAME `now` (the tick's clock) for every one of them, on every
+    tick, and the cohort would never spread out. A one-time ±5% nudge, applied on every advance,
+    is enough to break that lockstep permanently without meaningfully changing how often any
+    individual schedule runs.
+
+    **Why the offset is computed in Python, and never `random()` in SQL.** The bound
+    (`MAX_JITTER_FRACTION`) is visible to a reviewer of this function rather than buried in a
+    query string, and the drawn value travels to `SchedulesWriter` as an ordinary bind
+    parameter — a plain `timestamptz` the writer never has to derive — which is what makes a
+    single tick's outcome deterministic and testable end to end: seed `rng` and every value
+    `advance_next_run_at` will produce for that tick is reproducible, which a SQL-side
+    `random()` could never be.
+
+    **How this relates to `compute_next_run_at`.** That function owns what a `PUT` does to
+    `next_run_at` — including, in its row 5, choosing NOT to move it at all. This function owns
+    what the cron tick does after a schedule fires, and it has no such branch: it is only ever
+    called on a schedule the tick just selected because it WAS due, so there is nothing to
+    preserve. Both always schedule forward from `now`, never from the stale `next_run_at` that
+    made the row due in the first place — which is what stops a schedule that was missed during
+    downtime from trying to catch up with a burst of runs the moment the tick resumes. Making
+    "catch up" configurable is explicitly out of scope for this ticket.
+
+    **Why no clamp is needed.** `ScheduleIntervalMinutes` (`schedules/schemas.py`) rejects
+    anything below 60 minutes at the API boundary, so the smallest interval this function ever
+    sees already tolerates a jitter window many times wider than the tick's own 60-second
+    cadence — the jittered result is always comfortably in the future, and there is no need to
+    clamp it away from `now`.
+
+    Args:
+        now: The one clock the whole tick runs off, captured once in the service — see
+            `ScheduleService.run_due_schedules` for why every write in a tick shares it.
+        interval_minutes: The schedule's own interval. `int`, matching the `schedules` column
+            and `CurrentSchedule.interval_minutes`, not `ScheduleIntervalMinutes` — a tick reads
+            whatever interval is already persisted, and does not re-validate it against the
+            API's current allowlist.
+        rng: A **required keyword argument with no default**, for the same reason `now` on
+            `compute_next_run_at` has none: it keeps this function pure, with no hidden call to
+            a module-level random source, so a test can drive it with `Random(seed)` and assert
+            an exact value instead of only a range.
+
+    Returns:
+        `now + timedelta(minutes=interval_minutes)`, offset by a uniformly-drawn jitter in
+        `[-5%, +5%]` of that interval, as a timezone-aware `datetime`.
+    """
+    interval = timedelta(minutes=interval_minutes)
+    max_offset_seconds = interval.total_seconds() * MAX_JITTER_FRACTION
+    offset = timedelta(seconds=rng.uniform(-max_offset_seconds, max_offset_seconds))
+    return now + interval + offset

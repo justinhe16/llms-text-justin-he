@@ -51,9 +51,16 @@ kill_timeout = "240s"
 # machine's whole command and replaces its CMD. The API's is identical to that CMD on
 # purpose: `docker run` on the image locally and the `app` process in production start the
 # same way, so there is no third startup path that only production exercises.
+#
+# `--custom-log-dict` on the worker is not decoration. Without it, `arq` installs its own
+# plain-text handler on the `arq` logger *after* it has imported WorkerSettings, and arq's
+# job lines become the only non-JSON output the worker produces — which breaks
+# `fly logs | jq` for everything, not just for arq's own lines. The dict it names lives in
+# app/worker/settings.py beside the settings class, and backend/tests/test_logging.py
+# asserts that this command still points at it.
 [processes]
   app = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
-  worker = "arq app.worker.settings.WorkerSettings"
+  worker = "arq app.worker.settings.WorkerSettings --custom-log-dict app.worker.settings.ARQ_LOG_CONFIG"
 
 [build]
   # Relative to this file. The deploy job runs flyctl from backend/, so the build context
