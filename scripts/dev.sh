@@ -24,6 +24,13 @@ cd "$repo_root"
 venv_dir="${VENV_DIR:-backend/.venv}"
 worker_module="${WORKER_MODULE:-app.worker.settings.WorkerSettings}"
 
+# Kept identical to backend/fly.toml's `worker` process command, so the local worker and
+# the deployed one log the same way. Without it arq attaches its own plain-text handler
+# after importing WorkerSettings and its job lines are the only non-JSON output the
+# process produces — see app/worker/settings.py's ARQ_LOG_CONFIG for the full mechanism.
+# backend/tests/test_logging.py asserts that this file and fly.toml still agree.
+worker_log_dict="${WORKER_LOG_DICT:-app.worker.settings.ARQ_LOG_CONFIG}"
+
 # Loopback by default, matching the deliberately loopback-only Redis binding in
 # docker-compose.yml: nothing in this project needs the dev API reachable from the LAN.
 # Both are overridable so a port already in use can be worked around without editing this
@@ -146,7 +153,8 @@ if [ ! -x "$venv_dir/bin/arq" ]; then
   echo "dev: 'arq' is not installed in $venv_dir. Run 'make setup' to refresh it." >&2
   exit 1
 fi
-run_prefixed worker "$c_worker" env PYTHONPATH=backend "$venv_dir/bin/arq" "$worker_module"
+run_prefixed worker "$c_worker" env PYTHONPATH=backend "$venv_dir/bin/arq" "$worker_module" \
+  --custom-log-dict "$worker_log_dict"
 
 # --- frontend (skipped when frontend/ is absent) --------------------------------------
 if [ -d frontend ]; then

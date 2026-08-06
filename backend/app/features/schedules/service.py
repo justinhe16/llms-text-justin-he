@@ -381,7 +381,11 @@ class ScheduleService:
         )
         # One line, every tick, with all five numbers: "why didn't my schedule fire?" should
         # be answerable from this log alone — was it even examined, and if so, did it run,
-        # get skipped for an active run, or fail to enqueue?
+        # get skipped for an active run, or fail to enqueue? `extra=` repeats the same five
+        # numbers already in the message, structured rather than prose, so a `jq` filter can
+        # select on e.g. `enqueue_failures > 0` across every tick without parsing the
+        # message string back apart — `tick_id` is already on the line for free, bound by
+        # `schedule_tick` around this whole call, so there is no reason to add it here too.
         logger.info(
             "Cron tick: examined=%d runs_created=%d skipped_active=%d enqueue_failures=%d "
             "limit_reached=%s",
@@ -390,6 +394,13 @@ class ScheduleService:
             summary.skipped_active,
             summary.enqueue_failures,
             summary.limit_reached,
+            extra={
+                "examined": summary.examined,
+                "runs_created": summary.runs_created,
+                "skipped_active": summary.skipped_active,
+                "enqueue_failures": summary.enqueue_failures,
+                "limit_reached": summary.limit_reached,
+            },
         )
         if summary.limit_reached:
             logger.warning(
@@ -397,6 +408,7 @@ class ScheduleService:
                 "this tick could examine. Sustained saturation means scaling workers, not "
                 "raising this number: see DUE_BATCH_LIMIT's own comment.",
                 DUE_BATCH_LIMIT,
+                extra={"examined": summary.examined, "batch_limit": DUE_BATCH_LIMIT},
             )
         return summary
 
@@ -441,11 +453,17 @@ class ScheduleService:
                 failures += 1
                 # `exc_info=True` logs the real cause for an operator; `REDIS_URL` is never
                 # interpolated into this message or any other (ARCHITECTURE.md §9.4).
+                # `run_id` is carried in `extra=` and not only in the message text because,
+                # unlike `CrawlService`, nothing here has bound it as a correlation id —
+                # `schedule_tick` only binds `tick_id`, and one tick can loop over several
+                # `run_ids` — so this is the one place in the whole batch that ties a
+                # specific failure back to the specific run it left `failed`.
                 logger.error(
                     "Cron tick: failed to enqueue %s for run %s",
                     CRAWL_TASK_JOB_NAME,
                     run_id,
                     exc_info=True,
+                    extra={"run_id": str(run_id)},
                 )
                 await self._runs.abandon_unqueued_run(run_id, datetime.now(UTC))
         return failures
