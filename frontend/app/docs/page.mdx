@@ -1,0 +1,127 @@
+# Documentation
+
+Everything llms-text does, in one page.
+
+{/* This page describes what the product DOES, in the present tense. It deliberately does not
+    describe build state — no "not built yet", no "coming soon", no naming of milestones. A
+    public page written against a roadmap goes stale the moment an unrelated change merges,
+    and nobody remembers to come back and fix it. Describe a capability and the sentence stays
+    true or gets edited by the change that alters the behaviour, which is the only edit anyone
+    will reliably make. */}
+
+> **What a run produces.** A run fetches the URL you give it and writes an `llms.txt` that
+> lists what it fetched. It does not follow links to the rest of the site, and the file is a
+> plain listing rather than a written summary — useful as a starting point, not as something
+> to publish unedited.
+
+## What is llms.txt
+
+`llms.txt` is a small Markdown file a website publishes at its root — `example.com/llms.txt` —
+that tells a large language model what the site is and which of its pages are worth reading.
+The convention is described at [llmstxt.org](https://llmstxt.org).
+
+The problem it solves is that a model reading a site through a browser or a crawler gets
+navigation, cookie banners, footers and duplicated boilerplate along with the content, and has
+to guess what matters. A hand-written index of the pages that do matter is smaller, cheaper to
+read, and says what the site's author would have said if asked.
+
+llms-text writes a first draft of that file for you. Point it at a URL and it fetches that
+page and writes an `llms.txt` naming what it found. Turning that draft into the curated index
+above — deciding which of a site's pages carry the content, and describing them — is still
+yours to do.
+
+## Adding a site
+
+Paste a URL into the box on the [home page](/) and press Enter. It has to be an absolute
+`http://` or `https://` URL — `https://example.com`, not `example.com`.
+
+That does two things: it registers the site, and it starts the first crawl immediately. You
+land on the site's page with a run already showing as **pending**, and the page updates itself
+as the run progresses — there is nothing to refresh and nothing else to press.
+
+Pasting a URL you have already added takes you straight to it rather than reporting an error.
+Two people can each add the same site; one person cannot add it twice.
+
+## Manual vs scheduled runs
+
+A **run** is one crawl of one site. A run is either manual or scheduled, and both produce the
+same thing.
+
+**Manual.** The **Run now** button on a site's page starts a run, and adding a site starts one
+too. Use it after you have changed the site and want the file regenerated.
+
+**Scheduled.** A schedule repeats a run on its own, at one of four intervals — these are the
+only four:
+
+- **Hourly** — a site that changes through the day: a changelog, a status page.
+- **Every 6 hours** — an active documentation site.
+- **Daily** — most sites.
+- **Weekly** — a site that rarely changes: a marketing site, a personal page.
+
+A site has at most one schedule, set through `PUT /websites/{id}/schedule` — see **API** at
+the end of this page. After the first one, fire times are not exact: each is nudged by up to
+±5% — about ±3 minutes on an hourly schedule, ±72 on a daily one — so that a batch of sites
+added in the same sitting does not settle into crawling in the same second forever. A schedule
+can be switched off without being deleted, and its run history outlives it.
+
+## Reading the output
+
+A finished run's `llms.txt` is on the site's **Output** tab, with line numbers, a **Copy**
+button and a **Download** button. The download is named after the site — `llms-example-com.txt`
+for `https://example.com` — so that saving several of them does not overwrite one file; rename
+it to `llms.txt` when you publish it.
+
+Publish it at the root of your site, so it answers at `https://your-site.com/llms.txt` as
+plain text. Where the file goes depends on your host — a `public/` or `static/` directory for
+most frameworks, the site root for anything served from disk. As the note at the top says,
+what a run writes is a listing rather than a curated index, so read it before you publish it.
+
+Runs are kept, so you can open an older one from the **Runs** tab and see what the file looked
+like before a change.
+
+## Limits
+
+Every crawl runs inside fixed caps, and there are two per-account caps on top of them. They
+are listed here so nobody has to discover one by hitting it.
+
+**Per crawl**
+
+- **100 pages** — the most a single run will fetch.
+- **50 MiB** — the total downloaded across the whole run (52,428,800 bytes).
+- **3 minutes** — how long a run gets. The crawler's own budget is 5 minutes, but the job
+  runner stops a job at 3, so 3 is the number that actually bites.
+
+The page and size caps are budgets, not errors: reaching one part-way through a crawl ends the
+run with whatever it already collected, so a big site gives you a partial file rather than no
+file.
+
+Two cases have nothing to salvage and so fail the run outright — when the very first page
+cannot be fetched, and when that page is itself over the size cap, which reports "The site's
+response was too large." The time limit is blunt in the same way: a run stopped at 3 minutes is
+cut off mid-flight rather than wrapped up neatly.
+
+**Per account**
+
+- **2 concurrent runs** — you can have two manual runs in flight at once. A third has to wait
+  for one of them to finish.
+- **50 runs per day** — across a rolling 24 hours, counting manual and scheduled runs
+  together. Reaching it refuses further **manual** runs; a schedule keeps firing, so a busy
+  schedule can spend the budget a manual run would then be refused for.
+
+Going over either one is answered immediately, with a message naming the cap you hit. The
+daily cap also says when it resets; the concurrent one does not, because "when a run you are
+already waiting on finishes" is not a time anybody can predict. Nothing is queued behind a cap
+and nothing is silently dropped.
+
+## API
+
+llms-text is a FastAPI service, and it publishes its own interactive OpenAPI documentation —
+every endpoint, every request and response shape, generated from the code that serves them.
+
+{/* A hyperlink a reader clicks, not a request this application makes. ARCHITECTURE.md §8.1
+    ("the browser never calls Fly") is about how this app fetches data — which is always
+    same-origin, through app/api/[...path]/. Nothing on this page fetches anything. */}
+
+[Browse the API documentation](https://llms-text-justin-he.fly.dev/docs)
+
+Running the stack locally, the same document is at `http://localhost:8000/docs`.

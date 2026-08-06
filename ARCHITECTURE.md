@@ -700,6 +700,16 @@ never exist only in the README.
 ### 8.1 App Router and the BFF
 
 - **App Router only.** No `pages/` directory.
+- **MDX is for prose pages, and there is one.** `@next/mdx` is wired up in
+  `frontend/next.config.ts` — which is why `pageExtensions` lists `ts` and `tsx`
+  explicitly: setting that key replaces the default list rather than extending it, and
+  omitting them would unroute every other page in the app. `frontend/mdx-components.tsx`
+  maps each element onto the palette's own tokens; it sits at the project root under that
+  exact name because that is `@next/mdx`'s contract for the App Router, not a filing
+  decision. No remark or rehype plugins, and no `@tailwindcss/typography` — a typography
+  plugin brings its own colour opinions, including the `prose-invert` dark variant §8.5
+  forbids. `app/docs/page.mdx` is the only MDX page. A second prose page is fine; a docs
+  *site* (sidebar, search, version switcher) is a different ticket.
 - Route handlers under `app/api/[...path]/` proxy to FastAPI. This is a
   backend-for-frontend: the browser calls same-origin Next.js routes, and Next.js calls Fly
   server-side.
@@ -758,11 +768,22 @@ threat model would.
 | `components/ui/` | shadcn/ui primitives — generated, edited only when a primitive genuinely needs it |
 | `components/magicui/` | Magic UI components |
 | `components/crawls/` | App-specific composites built from the above |
+| `components/landing/` | The landing page's own composites — the URL field and the account chip |
 | `components/auth/` | Sign-in / sign-out affordances and the client-side identity hook |
 
-Feature composites go in `components/crawls/`. Do not put app-specific logic into
-`components/ui/`; those files should stay close to what the generator produced so they can
-be regenerated.
+Feature composites go in a directory named after the screen they belong to —
+`components/crawls/` for the crawls table and detail page, `components/landing/` for `/`.
+Do not put app-specific logic into `components/ui/`; those files should stay close to what
+the generator produced so they can be regenerated. `components/magicui/` follows the same
+rule, with one deliberate carve-out: retuning a Magic UI component for this light palette,
+or adding the `asChild` escape hatch `components/ui/button.tsx` already has, is a change to
+the primitive itself and belongs there — building a landing-page-shaped wrapper around it
+does not.
+
+**A screen's chrome is not shared by default.** `components/crawls/crawls-header.tsx` is
+the app's header for signed-in screens; the landing page deliberately has none, and renders
+only a `UserMenu` in the corner when there is a session. Importing a header in order to
+hide most of it is how a page ends up with chrome nobody asked for.
 
 **A feature's non-visual logic lives in `lib/`, not in its components.** `lib/crawls/` is
 the first instance and sets the shape: the pure derivations behind the `/crawls` table
@@ -773,11 +794,20 @@ separation §3.1 draws on the backend, and it exists for the same reason: a func
 turns four run statuses into five row labels is testable, greppable and reusable on its
 own, and becomes none of those things once it is an `if` inside a `<td>`. The rule of
 thumb is that anything in `lib/<feature>/` should be readable without knowing what the
-screen looks like, and anything in `components/<feature>/` should be mostly markup. Note
-that this is a *feature's own* logic: shared plumbing every feature uses stays in
+screen looks like, and anything in `components/<feature>/` should be mostly markup.
+`lib/landing/` is the second instance and holds exactly two things for the same reasons:
+`site-url.ts`, the pure "is this an absolute http(s) URL" check, and `use-add-site.ts`, the
+create-website-then-trigger-run-then-navigate sequence with its five endings. Note that
+this is a *feature's own* logic: shared plumbing every feature uses stays in
 `lib/api/`, `lib/query/`, `lib/auth/` and `lib/supabase/`, and a feature directory must
 never grow a second copy of something those already own — a second fetcher, a second
-query-key shape, or a second answer to "is this run still active" (§8.6).
+query-key shape, or a second answer to "is this run still active" (§8.6). `use-add-site.ts`
+is the worked example: it orchestrates, and every request it makes goes through
+`lib/query/`'s existing `useCreateWebsite` and `useTriggerRun` so that the cache
+invalidations stay defined once. What it *did* add to those two hooks is a
+`toastOnError` option, defaulting to the existing behaviour — because the landing page
+renders each failure under the field that caused it, and its two `409`s are navigations
+rather than errors to report at all.
 
 ### 8.5 Light theme only
 
