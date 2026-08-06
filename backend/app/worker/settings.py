@@ -16,13 +16,15 @@ introduce a base class here, and do not set these from a loop or a mixin.
 import logging
 from typing import Any
 
+from arq import cron
+
 from app.core.logging import configure_logging
 from app.core.settings import settings
 from app.features.crawl.http_client import build_crawl_client
 from app.infrastructure.db.pool import close_pool, open_pool
 from app.infrastructure.queue.pool import redis_settings_from_url
 from app.infrastructure.storage.supabase_storage import build_storage_client, build_supabase_storage
-from app.worker.jobs import crawl_task, noop
+from app.worker.jobs import crawl_task, noop, schedule_tick
 
 
 logger = logging.getLogger(__name__)
@@ -127,11 +129,18 @@ async def close_worker_resources(ctx: dict[Any, Any]) -> None:
 #
 # An idle arq worker issues exactly one command per poll — a single ZRANGEBYSCORE over the
 # queue's sorted set (`Worker._poll_iteration`); the heartbeat beside it early-returns
-# until `health_check_interval` elapses, and there are no cron jobs. So the poll interval
-# alone sets the idle command rate, and Upstash bills per command:
+# until `health_check_interval` elapses. So the poll interval alone sets the idle command
+# rate, and Upstash bills per command:
 #
 #     poll_delay = 0.5 (arq's default)  ->  2 polls/s   x 86,400 s = 172,800 commands/day
 #     poll_delay = 5   (this setting)   ->  0.2 polls/s x 86,400 s =  17,280 commands/day
+#
+# An earlier revision of this comment justified "one command per poll" partly with "and
+# there are no cron jobs". `cron_jobs` below has since added one, and the arithmetic above
+# is unchanged — arq decides whether a cron job is due with local time math inside the same
+# poll iteration and only touches Redis on the minute it actually fires, so the tick adds
+# roughly one enqueue a minute rather than anything per poll. What would invalidate this
+# block is a SECOND cron job on a sub-minute schedule, not this one.
 #
 # Ten times cheaper, for doing nothing at all. What it costs is up to 5 seconds of latency
 # before a queued job starts, which is irrelevant against a crawl measured in tens of
@@ -148,6 +157,14 @@ POLL_DELAY_SECONDS = 5
 # `db_pool_max_size` per process — today up to 20, not 10 — and raising it raises both.
 # That is comfortable at two concurrent crawls and would not be at ten. If crawl
 # concurrency ever grows, the pool sizing needs to become per-process before this does.
+#
+# `schedule_tick` (the cron job below) draws from this same budget — arq runs cron jobs
+# through the same concurrency semaphore as queued ones. Two crawls already in flight
+# therefore DELAY a tick's execution rather than skipping it, by up to
+# JOB_TIMEOUT_SECONDS in the worst case. That is bounded and self-recovering (the crawl's
+# own hard caps end it, and the tick's work is idempotent — the schedules it did not get
+# to are still due), which is why this number does not need to grow to accommodate a job
+# that runs for milliseconds once a minute.
 MAX_JOBS = 2
 
 # How long one job may run before arq cancels it. Generous against a crawl measured in
@@ -171,6 +188,17 @@ JOB_TIMEOUT_SECONDS = 180
 # crawl. 300s is Fly's ceiling for `kill_timeout`, which is what bounds this whole ladder.
 JOB_COMPLETION_WAIT_SECONDS = 200
 
+# How long ONE cron tick may run before arq cancels it — deliberately much tighter than
+# JOB_TIMEOUT_SECONDS above, which governs `crawl_task`. A tick that has not finished in 50s
+# has not finished inside its own 60-second window (`cron_jobs` below fires one every
+# minute), so letting it run all the way to the 180s `job_timeout` would only delay the
+# signal that the tick is saturated — it would already be overdue for its NEXT run before
+# arq ever cancelled it. Cancelling loses nothing correctness-wise: `SchedulesReader.
+# lock_due`'s `FOR UPDATE SKIP LOCKED` makes two overlapping ticks safe rather than
+# corrupting (`schedules/internals/schedules_reader.py`), and an uncommitted transaction
+# simply rolls back, so the next tick redoes whatever work this one did not finish.
+CRON_TICK_TIMEOUT_SECONDS = 50
+
 
 class WorkerSettings:
     """Loaded by `arq app.worker.settings.WorkerSettings`.
@@ -192,6 +220,38 @@ class WorkerSettings:
     # "enqueue -> picked up" an observable event independent of whether a crawl itself
     # succeeds. See jobs.py.
     functions = [noop, crawl_task]
+
+    # THE CRON TICK. Declared directly on the class, like every other setting here — the
+    # module docstring's warning about inherited attributes applies just as much to
+    # `cron_jobs` as to `functions` or `poll_delay`, because `arq.worker.get_kwargs()` reads
+    # `WorkerSettings.__dict__` for this name exactly like every other one.
+    #
+    # `second=0` is what "every 60 seconds" means to arq's cron scheduler: it fires once,
+    # at second 0 of every minute, forever — not a `while True: sleep(60)` loop this process
+    # would have to keep alive itself. That is the whole reason this is a cron job and not a
+    # background task the worker starts by hand: arq's scheduler does not drift the way a
+    # sleep loop measured against its own wall-clock eventually does, and it survives a
+    # worker restart with no state to recover — the next minute boundary just fires it again.
+    #
+    # `max_tries=1`: a tick that raises is retried by the NEXT tick, one minute later,
+    # against WHATEVER STATE IS TRUE THEN — never immediately re-run against the same,
+    # possibly partially-advanced state that made it fail the first time. arq's default
+    # retry behaviour (backoff and re-run the same job) is right for a job with one clear
+    # unit of work to redo; it is wrong for a tick, which would otherwise retry a failure
+    # from a few seconds ago instead of re-evaluating what is due right now.
+    #
+    # `unique=True` (arq's own default, left unset here rather than restated) reduces
+    # duplicate ticks across more than one worker process, but it is NOT what makes this
+    # tick correct — it is a best-effort lock arq keeps in Redis, and this system does not
+    # lean on it. `FOR UPDATE SKIP LOCKED` (`SchedulesReader.lock_due`) is what makes two
+    # ticks running at the same instant, on the same worker or two different ones, safe
+    # rather than a source of duplicate runs — and it has to be, because arq's uniqueness
+    # guarantee is exactly as good as its connection to Redis at the moment it matters.
+    #
+    # `timeout=CRON_TICK_TIMEOUT_SECONDS` — see that constant's own comment.
+    cron_jobs = [
+        cron(schedule_tick, second=0, max_tries=1, timeout=CRON_TICK_TIMEOUT_SECONDS),
+    ]
 
     # Named differently from the settings they land on, rather than the `on_startup =
     # on_startup` the arq README shows: inside a class body that reads as a self-
