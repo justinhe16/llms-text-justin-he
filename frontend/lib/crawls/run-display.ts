@@ -62,35 +62,68 @@ export function formatDuration(durationMs: number | null | undefined): string | 
   return hours > 0 ? `${hours}h ${pad(minutes)}m` : `${minutes}m ${pad(seconds)}s`;
 }
 
+// The two filename stems this app's artifacts are downloaded under, keyed the same way the
+// Python side keys its own table — mirrors `_FILENAME_STEMS` in
+// `backend/app/features/runs/internals/artifact_filename.py` ("index" for the llms.txt
+// summary, "full" for the llms-full.txt expansion) so there is exactly one place on each
+// side of the wire that spells out which stem belongs to which artifact.
+const FILENAME_STEMS = {
+  index: "llms",
+  full: "llms-full",
+} as const;
+
 /**
- * The filename the Output tab's Download button saves under, derived from a website's
- * `origin` — `https://example.com` becomes `llms-example-com.txt`.
+ * The scheme-strip / non-alphanumeric-collapse / trim / lowercase chain both `llmsTxtFilename`
+ * and `llmsFullTxtFilename` need, parameterized by the stem the caller wants (`"llms"` vs.
+ * `"llms-full"`) rather than copy-pasted once per artifact.
  *
- * The ticket words this as `llms-{origin}.txt`, and this is that with the parts of an origin
- * a filename cannot contain removed. `https://example.com:8443` has a scheme separator and a
- * colon in it; `:` is illegal in a filename on Windows and reserved on macOS, and `/` would
- * be read as a path separator everywhere. Substituting rather than stripping keeps the port
- * distinguishable (`example-com-8443`) instead of silently gluing it to the host.
- *
- * This names only the local copy — the file's *contents* are the artifact unchanged — so a
- * user downloading three sites' artifacts gets three distinguishable files instead of
- * `llms.txt`, `llms (1).txt`, `llms (2).txt`.
- *
- * **A second implementation of this function exists in Python**, `artifact_filename` in
- * `backend/app/features/runs/internals/artifact_filename.py` — it names the download
- * `GET /runs/{id}/llms.txt` and `GET /runs/{id}/llms-full.txt` (PER-181) offer, and it must
- * agree with this function character for character or the same website's artifact lands in
- * a user's Downloads folder under two different names depending on which button produced
- * it. There is no seam between the two — this one names a `Blob` the browser already holds
- * and never makes a request — so what keeps them from drifting is
- * `backend/tests/test_artifact_filename.py`'s parity table, checked against both
- * implementations by hand whenever either one changes.
+ * `https://example.com:8443` has a scheme separator and a colon in it; `:` is illegal in a
+ * filename on Windows and reserved on macOS, and `/` would be read as a path separator
+ * everywhere. Substituting rather than stripping keeps the port distinguishable
+ * (`example-com-8443`) instead of silently gluing it to the host.
  */
-export function llmsTxtFilename(origin: string): string {
+function sanitizedArtifactFilename(origin: string, stem: string): string {
   const withoutScheme = origin.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
   const safe = withoutScheme
     .replace(/[^a-z0-9]+/gi, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase();
-  return `llms-${safe || "site"}.txt`;
+  return `${stem}-${safe || "site"}.txt`;
+}
+
+/**
+ * The filename the Output tab's Download button saves under, derived from a website's
+ * `origin` — `https://example.com` becomes `llms-example-com.txt`.
+ *
+ * The ticket words this as `llms-{origin}.txt`, and this is that with the parts of an origin
+ * a filename cannot contain removed — see `sanitizedArtifactFilename` above for exactly which
+ * parts and why.
+ *
+ * This names only the local copy — the file's *contents* are the artifact unchanged — so a
+ * user downloading three sites' artifacts gets three distinguishable files instead of
+ * `llms.txt`, `llms (1).txt`, `llms (2).txt`.
+ *
+ * **A second implementation of both this function and `llmsFullTxtFilename` below exists in
+ * Python**, `artifact_filename` in `backend/app/features/runs/internals/artifact_filename.py`
+ * — it names the downloads `GET /runs/{id}/llms.txt` and `GET /runs/{id}/llms-full.txt`
+ * (PER-181) offer, and each side must agree with its counterpart character for character or
+ * the same website's artifact lands in a user's Downloads folder under two different names
+ * depending on which button produced it. There is no seam between the two — this one names a
+ * `Blob` the browser already holds and never makes a request — so what keeps them from
+ * drifting is `backend/tests/test_artifact_filename.py`'s parity table, checked against both
+ * implementations by hand whenever either one changes.
+ */
+export function llmsTxtFilename(origin: string): string {
+  return sanitizedArtifactFilename(origin, FILENAME_STEMS.index);
+}
+
+/**
+ * The filename `useDownloadFullArtifact` (lib/crawls/use-download-full-artifact.ts) saves the
+ * `llms-full.txt` expansion under, derived from a website's `origin` the same way
+ * `llmsTxtFilename` derives the index's — `https://example.com:8443` becomes
+ * `llms-full-example-com-8443.txt`. See `sanitizedArtifactFilename` above for the shared
+ * chain, and `llmsTxtFilename`'s own docstring for the Python parity this function keeps too.
+ */
+export function llmsFullTxtFilename(origin: string): string {
+  return sanitizedArtifactFilename(origin, FILENAME_STEMS.full);
 }

@@ -20,6 +20,18 @@
 // in `lib/api/schedules.ts` — the schedules feature owns its own response shapes, the same
 // way this file owns `RunListItemResponse` and friends.
 //
+// `getLlmsTxt` (`GET /runs/{id}/llms.txt`) and `getLlmsFullTxt` (`GET /runs/{id}/llms-full.txt`)
+// round out the pair PER-181 shipped alongside `getRun` above: each downloads one of a run's
+// two artifacts as `text/plain` rather than a JSON body, which is exactly the case
+// `lib/api/fetcher.ts`'s `SuccessBodyOf` grew a second branch for, so `api.get` still resolves
+// each call to `Promise<string>` instead of silently to `Promise<void>`. PER-182's "Download
+// full" button (`components/crawls/download-full-button.tsx`, via
+// `lib/crawls/use-download-full-artifact.ts`) is the caller that needed `getLlmsFullTxt`.
+// `getLlmsTxt` has no caller yet — the Output tab's existing Download button already holds
+// `llms_txt` in memory from `GET /runs/{id}` and builds its `Blob` from that, with no request
+// of its own — and it is listed here honestly rather than pretending otherwise, because this
+// file's inventory of what the frontend can ask `/runs/{id}/…` for is meant to be complete.
+//
 // Nothing is on the absent list any more. When the next endpoint lands, add its helper here
 // or in the sibling file that owns its feature — never a hand-written response shape, and
 // never a path `paths` does not know about, which `PathsWithMethod` in fetcher.ts turns into
@@ -202,4 +214,39 @@ export function triggerRun(websiteId: string): Promise<TriggeredRun> {
  */
 export function getStats(websiteId: string, window: StatsWindow): Promise<WebsiteStats> {
   return api.get("/websites/{id}/stats", { params: { id: websiteId }, query: { window } });
+}
+
+// ---- Artifact downloads (`GET /runs/{id}/llms.txt`, `GET /runs/{id}/llms-full.txt`, PER-181) -
+
+/**
+ * `GET /runs/{id}/llms.txt`. Unfiltered by caller identity (ARCHITECTURE.md §4.1) — any
+ * signed-in user may download any run's index. Two distinguishable `404`s share the one
+ * status code: no run exists with `id`, or that run exists but has not produced this
+ * artifact — still `pending`/`processing`, or it `failed` — and the two cases answer with
+ * different `detail` strings (`RunService.get_llms_txt`).
+ *
+ * No caller yet, and that is worth saying plainly rather than leaving this looking dead: the
+ * Output tab's Download button already holds `llms_txt` in memory from `GET /runs/{id}` and
+ * builds its `Blob` from that content directly, so it never needs this route. This helper
+ * exists so the inventory above stays complete — it is the other half of the pair
+ * `getLlmsFullTxt` below completes.
+ */
+export function getLlmsTxt(id: string): Promise<string> {
+  return api.get("/runs/{id}/llms.txt", { params: { id } });
+}
+
+/**
+ * `GET /runs/{id}/llms-full.txt`. Unfiltered by caller identity (ARCHITECTURE.md §4.1), the
+ * same contract as `getLlmsTxt` above, including its two distinguishable `404`s — no such
+ * run, or that run has not produced this artifact yet — see `RunService.get_llms_full_txt`.
+ *
+ * `llms_full_txt` is deliberately absent from `RunDetail`/`RunDetailResponse`: `useRun`
+ * (lib/query/use-run.ts) polls `GET /runs/{id}` every three seconds while a run is active, and
+ * riding a second, potentially large artifact along on every poll tick would be wasted
+ * bandwidth for a tab nobody has opened. This route is the only way to fetch it, and
+ * `useDownloadFullArtifact` (lib/crawls/use-download-full-artifact.ts) is the one caller — the
+ * Output tab's "Download full" button.
+ */
+export function getLlmsFullTxt(id: string): Promise<string> {
+  return api.get("/runs/{id}/llms-full.txt", { params: { id } });
 }
