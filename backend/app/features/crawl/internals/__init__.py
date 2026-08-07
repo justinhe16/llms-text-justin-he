@@ -15,12 +15,13 @@ private, table-free I/O:
 * `sitemap.py` — `discover_sitemap_urls`, which fills that frontier before the loop runs:
   `/sitemap.xml`, then `/sitemap_index.xml`, then whatever `robots.txt` declares, every fetch
   going through `fetcher.py` (and therefore `ssrf.py`) exactly like the crawl loop's own.
-* `llms_txt.py` — `generate_llms_txt`, the stub seam (ARCHITECTURE.md §3.4, CLAUDE.md #9).
 
 Beside those sit this feature's **pure** modules, which do no I/O at all and are listed
 separately for exactly that reason: `payload.py` (the bytes a run's pages are stored as),
 `run_stats.py` (the `dict` `runs.stats` persists), `extract.py` (`extract_content`, one
-page's HTML parsed into a title, a description, and a markdown body), and `url_ranking.py`
+page's HTML parsed into a title, a description, and a markdown body), `llms_txt.py`
+(`generate_llms_txt` and `generate_llms_full_txt`, the two artifacts a run publishes, plus
+the two counts `runs.stats` records about them — ARCHITECTURE.md §3.4), and `url_ranking.py`
 (`select_urls`, a list of discovered URLs ranked and cut down to the ones worth spending a
 run's page budget on). `extract.py` is called by `fetcher.py`, once per fetched page that
 looks like HTML (PER-177). `url_ranking.py` is called by `service.py`, over whatever

@@ -62,20 +62,27 @@ FastAPI server-side. There is **no CORS configuration in this repo** — if you 
 headers, you have accidentally called the API from the client. `API_URL` is server-only and
 must never be prefixed `NEXT_PUBLIC_`.
 
-**9. Real crawling logic is out of scope.** That milestone has not been designed. Everything
+**9. Artifact generation lives behind one pair of functions, and calls no model.** Everything
 downstream of a fetched page stays behind one seam:
 
 ```python
-def generate_llms_txt(pages: list[CrawledPage]) -> str:
+def generate_llms_txt(pages: list[CrawledPage]) -> str:      # the llms.txt index
+    ...
+
+def generate_llms_full_txt(pages: list[CrawledPage]) -> str: # the llms-full.txt expansion
     ...
 ```
 
-It lives in `backend/app/features/crawl/internals/llms_txt.py`, and it is a stub returning
-deterministic placeholder output. `CrawledPage`, not `Page` — `app.core.pagination.Page` is
-already taken (ARCHITECTURE.md §3.4).
+They live in `backend/app/features/crawl/internals/llms_txt.py`. **They are no longer stubs**
+— PER-179 replaced the placeholder with the real llmstxt.org format — but they are still
+pure, deterministic and **model-free**, and that last part is a rule rather than a status
+report: the model-assisted pass is a layer *above* these functions, and this deterministic
+path is the fallback it degrades to when its flag is off or its API call fails. Nothing in
+this module may grow a network call. `CrawledPage`, not `Page` — `app.core.pagination.Page`
+is already taken (ARCHITECTURE.md §3.4).
 
-Build against that signature. Do not scatter crawling, parsing, or LLM-calling logic through
-the services in anticipation of a design that does not exist yet.
+Build against those signatures, and do not widen them without a ticket that redesigns the
+seam. Do not scatter crawling, parsing, or LLM-calling logic through the services.
 
 ---
 
