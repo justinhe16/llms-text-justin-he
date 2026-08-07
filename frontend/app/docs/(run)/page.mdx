@@ -54,8 +54,8 @@ priority order:
 4. The `<a href>` links on the seed page
 
 The first source returning at least one same-origin URL wins. Source 4 runs only when the
-first three return nothing, and it reads the seed page alone — no second level, no recursion.
-It keeps same-origin links and stops at 10,000.
+first three return nothing, and it reads the seed page alone. There is no second level and no
+recursion. It keeps same-origin links and stops at 10,000.
 
 Discovery fetches at most 5 sitemap documents and accepts at most 50,000 URLs. It spends at
 most 25% of the run's byte budget, which is 12.5 MiB. It reads `<loc>`, `<lastmod>` and
@@ -73,15 +73,14 @@ that cannot be read — missing, unreachable, or not parseable — allows everyt
 at any discovery source is logged and skipped. Discovery returns an empty list on total
 failure, and the run continues with the seed page alone.
 
-This ordering is not novel. [Firecrawl](https://firecrawl.dev) and most tools that turn a site
-into an `llms.txt` read the sitemap first and fall back to page links, because a sitemap is the
-site's own statement of what it considers canonical and costs one request to read. Discovery
-here follows that shape and departs from it in two places: it never recurses past the seed
-page, where a general crawler follows links to a configured depth, and it does not supplement
-the frontier with search results or with pages cached from an earlier run. It reads
-`robots.txt` fully — `Disallow`, `Allow`, and `Crawl-delay`, not only `Sitemap:` lines — which
-aligns it with the prior art rather than departing from it. The borrowing is more literal
-further down the pipeline — the prompt under Summarize is Firecrawl's, word for word.
+[Firecrawl](https://firecrawl.dev) and most tools that turn a site into an `llms.txt` read the
+sitemap first and fall back to page links, because a sitemap is the site's own statement of
+what it considers canonical and costs one request to read. Discovery reads the same sources in
+the same order. It differs in two places: it never recurses past the seed page, where a
+general crawler follows links to a configured depth, and it does not supplement the frontier
+with search results or with pages cached from an earlier run. It reads `robots.txt` in full —
+`Disallow`, `Allow` and `Crawl-delay`, not only `Sitemap:` lines — as the prior art does. The
+prompt under Summarize is Firecrawl's, word for word.
 
 ## Selection
 
@@ -112,8 +111,8 @@ asks for more, up to 10 seconds.
 Every URL passes an SSRF check before a socket opens. The check requires an `http` or `https`
 scheme, port 80 or 443, and no embedded credentials. It resolves the host and refuses the URL
 when any resolved address is private, loopback, link-local, multicast, reserved, or a cloud
-metadata address. It resolves the host once and connects to that address. One resolution
-closes the window in which a name changes between the check and the connection.
+metadata address. It resolves the host once and connects to that address. Resolving once
+prevents the address changing between the check and the connection.
 
 Redirects are followed for up to 5 hops. Every hop is checked again before it is followed. A
 redirect from `https` to `http` is refused. Response bodies are counted against the byte
@@ -133,9 +132,9 @@ from `llms.txt`.
 
 ## Summarize
 
-A configuration flag gates this stage. The deployed service sets `CRAWL_ENRICH_WITH_LLM` to
-`false`, so the stage is inactive. Each page keeps the title and description that extraction
-produced, and a run completes without calling a model.
+This stage is off in the deployed service. `CRAWL_ENRICH_WITH_LLM` is `false`. Each page keeps
+the title and description that extraction produced, and a run completes without calling a
+model.
 
 Where the flag is `true`, each page's first 4,000 characters go to Claude Haiku 4.5. The model
 returns a 3–4 word title and a 9–10 word description for that page. Ten requests run at a

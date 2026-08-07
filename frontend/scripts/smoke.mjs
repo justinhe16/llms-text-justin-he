@@ -50,6 +50,33 @@
  *      is the media feature this repository allows; `prefers-color-scheme` is the banned
  *      one, and assertion 7 above covers it.)
  *
+ * Then the tab nav PER-192 added, and `/docs/architecture`, whose topology is wired to its
+ * prose the same string-id way the pipeline is:
+ *
+ *  14. `/docs`'s tab nav renders two links, `aria-current="page"` on the active one and no
+ *      value on the other, with no `role="tablist"` anywhere on the page. A `startsWith`
+ *      regression in `DocsTabs` would light both tabs the moment `/docs/architecture`
+ *      existed, and this is the assertion that catches it from the `/docs` side.
+ *  15. THE DEEP-LINK GATE: `/docs#fetch` — a published, external link — still lands on the
+ *      Fetch heading after the route-group restructure that moved the run tab under
+ *      `app/docs/(run)/`. `next build` has no opinion about a URL fragment; only a real
+ *      browser navigation proves the anchor still resolves.
+ *  16. `GET /docs/architecture` returns 200, and its diagram renders seven nodes and seven
+ *      beams — a different count from the pipeline's seven nodes and six beams, because a
+ *      topology is a graph and not every node has exactly one neighbour below it.
+ *  17. Every node id in `lib/docs/architecture.ts` resolves to an `h2` on the rendered page —
+ *      the same anchor gate as assertion 10, for the second file that can drift the same way.
+ *  18. Every topology beam lands on the centres of the nodes ITS EDGE names, paired by the
+ *      `data-arch-edges` list rather than by array adjacency. The pipeline's beam *i* always
+ *      connects node *i* and node *i+1*; the topology's does not (`api` feeds both `redis`
+ *      and `supabase`), so this pairing has to come from the edge list, not from position.
+ *  19. The worker→anthropic edge is the only dashed beam. A regression that lost the dash
+ *      would silently reclassify a call this deployment never makes as one that happens; a
+ *      regression that dashed every beam would make the distinction meaningless.
+ *  20. Clicking each of the seven topology nodes scrolls to its section (several nodes share
+ *      one — that is expected), the diagram is static under `prefers-reduced-motion:
+ *      reduce`, and it renders with no horizontal overflow at 375px, beams still aligned.
+ *
  * USAGE
  *
  *     npm run build && npm run smoke        # starts `next start` itself
@@ -251,22 +278,33 @@ async function probePage() {
 }
 
 /**
- * Everything measured on `/docs`: the diagram's nodes, its beams, and whether each node's id
- * resolves to a heading in the prose column.
+ * Everything measured about one diagram: its nodes, its beams, and whether each node's
+ * section id resolves to a heading in the prose column.
  *
- * The beams are selected as *direct* `<svg>` children of the diagram container — the seven
- * icons are `<svg>` too, but they are nested inside the buttons.
+ * Generalized over the two diagrams PER-192 leaves this repository with, rather than one
+ * probe per diagram, because the two differ only in their attribute names:
+ * `containerAttr`/`nodeAttr` select the container and its nodes; `sectionAttr` reads the
+ * heading id a node scrolls to, falling back to the node's own id when absent — the pipeline
+ * diagram has no separate `data-docs-section`, because there a node's id IS the section id;
+ * `edgesAttr`, when given, reads the `data-arch-edges` encoding straight off the container,
+ * for `checkArchitecture`'s edge-driven beam pairing below.
+ *
+ * The beams are selected as *direct* `<svg>` children of the diagram container — every icon
+ * inside a node button is an `<svg>` too, but nested, never a direct child.
  */
-function probeDocs() {
-  const container = document.querySelector("[data-docs-diagram]");
+function probeDiagram({ containerAttr, nodeAttr, sectionAttr, edgesAttr }) {
+  const container = document.querySelector(`[${containerAttr}]`);
   if (!container) return { container: false };
 
   const containerRect = container.getBoundingClientRect();
-  const nodes = [...container.querySelectorAll("[data-docs-node]")].map((button) => {
+  const nodes = [...container.querySelectorAll(`[${nodeAttr}]`)].map((button) => {
     const rect = button.getBoundingClientRect();
-    const heading = document.getElementById(button.dataset.docsNode);
+    const id = button.getAttribute(nodeAttr);
+    const sectionId = sectionAttr ? button.getAttribute(sectionAttr) : id;
+    const heading = document.getElementById(sectionId);
     return {
-      id: button.dataset.docsNode,
+      id,
+      sectionId,
       // The accessible name is the button's own text (visible label + an sr-only
       // continuation), never an aria-label — see `description` in lib/docs/sections.ts.
       name: (button.textContent ?? "").trim(),
@@ -280,9 +318,16 @@ function probeDocs() {
     d: svg.querySelector("path")?.getAttribute("d") ?? "",
     // The animated beam draws a second path plus a <linearGradient>; the static one does not.
     gradients: svg.querySelectorAll("linearGradient").length,
+    // "none" for an ordinary beam, "4px, 4px" (or similar) for the one PER-192 draws dashed.
+    dash: getComputedStyle(svg.querySelector("path") ?? svg).strokeDasharray,
   }));
 
-  return { container: true, nodes, beams };
+  return {
+    container: true,
+    nodes,
+    beams,
+    edges: edgesAttr ? container.getAttribute(edgesAttr) : null,
+  };
 }
 
 /** `M x,y Q cx,cy ex,ey` → its endpoints, or null when the path never got measured. */
@@ -311,7 +356,10 @@ async function checkDocs(page) {
     // Reported by the assertions below, with the measurements attached.
   });
 
-  const docs = await page.evaluate(probeDocs);
+  const docs = await page.evaluate(probeDiagram, {
+    containerAttr: "data-docs-diagram",
+    nodeAttr: "data-docs-node",
+  });
   if (!docs.container) {
     check(false, "the /docs diagram renders", "no [data-docs-diagram] in the document");
     return;
@@ -422,12 +470,300 @@ async function checkDocs(page) {
     unlit.join(", "),
   );
 
-  const reduced = await page.evaluate(probeDocs);
+  const reduced = await page.evaluate(probeDiagram, {
+    containerAttr: "data-docs-diagram",
+    nodeAttr: "data-docs-node",
+  });
   check(
     reduced.beams.length === 6 && reduced.beams.every((beam) => beam.gradients === 0),
     "beams are static under prefers-reduced-motion: reduce",
     JSON.stringify(reduced.beams.map((beam) => beam.gradients)),
   );
+  await page.emulateMediaFeatures([
+    { name: "prefers-color-scheme", value: "light" },
+    { name: "prefers-reduced-motion", value: "no-preference" },
+  ]);
+
+  // 14. The tab nav is two links, aria-current on the active one, and no tablist anywhere.
+  const tabs = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-docs-tab]")].map((a) => ({
+      tag: a.tagName,
+      href: a.getAttribute("data-docs-tab"),
+      current: a.getAttribute("aria-current"),
+    })),
+  );
+  const hasTablist = await page.evaluate(
+    () => document.querySelector('[role="tablist"]') !== null,
+  );
+  check(
+    tabs.length === 2 &&
+      tabs[0]?.current === "page" &&
+      tabs[1]?.current === null &&
+      tabs.every((tab) => tab.tag === "A") &&
+      !hasTablist,
+    "/docs renders two tab links with aria-current on the active one and no role=tablist",
+    JSON.stringify(tabs),
+  );
+
+  // 15. THE DEEP-LINK GATE. /docs#fetch is already a published link; the route group must
+  //     not break it. `next build` has no opinion about a hash.
+  await page.goto(`${BASE_URL}/docs#fetch`, { waitUntil: "load" });
+  await page.evaluate(() => document.fonts.ready);
+  const anchor = await page.evaluate(() => {
+    const heading = document.getElementById("fetch");
+    return heading ? { scrollY: window.scrollY, top: heading.getBoundingClientRect().top } : null;
+  });
+  // The band is deliberately loose: headings carry scroll-mt-24 (96px) and the font swap
+  // moves things, so the point is "the anchor resolved and the document scrolled", not a
+  // pixel.
+  check(
+    anchor !== null && anchor.scrollY > 0 && anchor.top > -50 && anchor.top < 200,
+    "/docs#fetch lands on the Fetch heading",
+    JSON.stringify(anchor),
+  );
+}
+
+/** The `data-arch-edges` container attribute, parsed back into `{ from, to }` pairs. */
+function parseArchEdges(edgesAttr) {
+  return (edgesAttr ?? "")
+    .split(",")
+    .filter(Boolean)
+    .map((pair) => {
+      const [from, to] = pair.split(">");
+      return { from, to };
+    });
+}
+
+/** Every beam's endpoints checked against the centres its edge names, not against array
+ *  adjacency — the topology is a graph, so beam *i* does not necessarily connect node *i*
+ *  and node *i+1* the way the pipeline's beams do. */
+function misalignedArchBeams(diagram) {
+  const byId = new Map(diagram.nodes.map((node) => [node.id, node]));
+  const edges = parseArchEdges(diagram.edges);
+  return diagram.beams
+    .map((beam, index) => {
+      const edge = edges[index];
+      const points = beamEndpoints(beam.d);
+      const from = edge && byId.get(edge.from);
+      const to = edge && byId.get(edge.to);
+      if (!points || !from || !to) return `beam ${index}: unmeasured (d="${beam.d}")`;
+      const drift = Math.max(
+        Math.abs(points.startX - from.centerX),
+        Math.abs(points.startY - from.centerY),
+        Math.abs(points.endX - to.centerX),
+        Math.abs(points.endY - to.centerY),
+      );
+      // One pixel of slack for sub-pixel layout, same tolerance checkDocs uses.
+      return drift <= 1 ? null : `${edge.from}→${edge.to} out by ${drift.toFixed(1)}px`;
+    })
+    .filter(Boolean);
+}
+
+/** Assertions 16-20: `/docs/architecture`'s topology diagram, its anchors, its beams, and the
+ *  tab nav's state on this route. Run from `main()` immediately after `checkDocs`, on the
+ *  same `page`, so the console-error and bad-response listeners set up there cover this route
+ *  too. */
+async function checkArchitecture(page) {
+  const ARCH_NODE_COUNT = 7;
+  const ARCH_BEAM_COUNT = 7;
+
+  const response = await page.goto(`${BASE_URL}/docs/architecture`, { waitUntil: "load" });
+  check(
+    response?.status() === 200,
+    "GET /docs/architecture returns 200",
+    `got ${response?.status()}`,
+  );
+
+  await page.evaluate(() => document.fonts.ready);
+  await page
+    .waitForFunction(
+      () => {
+        const container = document.querySelector("[data-arch-diagram]");
+        const svg = container?.querySelector(":scope > svg path");
+        return Boolean(svg?.getAttribute("d"));
+      },
+      { timeout: 10_000 },
+    )
+    .catch(() => {
+      // Reported by the assertions below, with the measurements attached.
+    });
+
+  const arch = await page.evaluate(probeDiagram, {
+    containerAttr: "data-arch-diagram",
+    nodeAttr: "data-arch-node",
+    sectionAttr: "data-arch-section",
+    edgesAttr: "data-arch-edges",
+  });
+  if (!arch.container) {
+    check(false, "the /docs/architecture diagram renders", "no [data-arch-diagram] in the document");
+    return;
+  }
+
+  check(
+    arch.nodes.length === ARCH_NODE_COUNT,
+    "/docs/architecture renders seven topology nodes",
+    `got ${arch.nodes.length}`,
+  );
+  check(
+    arch.beams.length === ARCH_BEAM_COUNT,
+    "/docs/architecture renders seven beams",
+    `got ${arch.beams.length}`,
+  );
+
+  // THE ANCHOR GATE — the same argument as assertion 10, for the second file that can drift
+  // the same way: lib/docs/architecture.ts names a sectionId, rehype-slug derives the actual
+  // heading id from app/docs/architecture/page.mdx's text, and nothing type-checks the join.
+  const dead = arch.nodes.filter((node) => node.headingTag !== "H2");
+  check(
+    dead.length === 0 && arch.nodes.length > 0,
+    "every topology node's section id resolves to an h2 heading",
+    dead.length > 0
+      ? `no <h2 id> for: ${dead.map((node) => `${node.id}->${node.sectionId}`).join(", ")} — a ` +
+          "heading in app/docs/architecture/page.mdx was renamed, or lib/docs/architecture.ts " +
+          "names a sectionId rehype-slug never generated"
+      : "the diagram rendered no nodes at all",
+  );
+
+  check(
+    // `.length > 0` is not redundant — see the identical guard in checkDocs.
+    arch.nodes.length > 0 && arch.nodes.every((node) => (node.name ?? "").length > 0),
+    "every topology node has an accessible name",
+    arch.nodes
+      .filter((node) => !(node.name ?? "").length)
+      .map((node) => node.id)
+      .join(", "),
+  );
+
+  const edges = parseArchEdges(arch.edges);
+  check(
+    edges.length === ARCH_BEAM_COUNT,
+    "the diagram publishes one edge per beam",
+    `${edges.length} edges vs ${arch.beams.length} beams`,
+  );
+
+  const misaligned = misalignedArchBeams(arch);
+  check(
+    misaligned.length === 0,
+    "every topology beam lands on the centres of the nodes its edge names",
+    misaligned.join(", "),
+  );
+
+  // The dashed edge: worker→anthropic, and only it. Catches both a lost dash and a dash that
+  // leaked onto every beam.
+  const dashedIndexes = edges
+    .map((edge, index) => (edge.to === "anthropic" ? index : -1))
+    .filter((index) => index >= 0);
+  check(
+    dashedIndexes.length === 1 &&
+      arch.beams[dashedIndexes[0]]?.dash !== "none" &&
+      arch.beams.filter((_, index) => index !== dashedIndexes[0]).every((beam) => beam.dash === "none"),
+    "the Anthropic edge is the only dashed beam",
+    JSON.stringify(arch.beams.map((beam) => beam.dash)),
+  );
+
+  // Tab nav on this route — mirror of checkDocs's assertion 14: aria-current="page" here,
+  // absent on /docs, and still no role=tablist.
+  const tabs = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-docs-tab]")].map((a) => ({
+      tag: a.tagName,
+      href: a.getAttribute("data-docs-tab"),
+      current: a.getAttribute("aria-current"),
+    })),
+  );
+  const hasTablist = await page.evaluate(
+    () => document.querySelector('[role="tablist"]') !== null,
+  );
+  check(
+    tabs.length === 2 &&
+      tabs[0]?.current === null &&
+      tabs[1]?.current === "page" &&
+      tabs.every((tab) => tab.tag === "A") &&
+      !hasTablist,
+    "/docs/architecture renders two tab links with aria-current on the active one and no role=tablist",
+    JSON.stringify(tabs),
+  );
+
+  // Click → scroll, all seven. Reduced motion is emulated so the scroll is instant, exactly
+  // as checkDocs does — see that function's comment about setEmulatedMedia replacing rather
+  // than merging the override list.
+  await page.emulateMediaFeatures([
+    { name: "prefers-color-scheme", value: "light" },
+    { name: "prefers-reduced-motion", value: "reduce" },
+  ]);
+  await page.reload({ waitUntil: "load" });
+  await page.evaluate(() => document.fonts.ready);
+
+  const notScrolled = [];
+  for (const node of arch.nodes) {
+    const landed = await page.evaluate(
+      async ({ id, sectionId }) => {
+        window.scrollTo(0, 0);
+        const button = document.querySelector(`[data-arch-node="${id}"]`);
+        if (!button) return { clicked: false };
+        button.click();
+        // `behavior: "auto"` under reduced motion, so one frame is enough.
+        await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+        const heading = document.getElementById(sectionId);
+        return { clicked: true, top: heading?.getBoundingClientRect().top ?? null };
+      },
+      { id: node.id, sectionId: node.sectionId },
+    );
+    // Headings carry scroll-mt-24 (96px), so a scrolled-to heading sits just below it. Several
+    // nodes share a section id — that is expected, and each still has to land.
+    if (!landed.clicked || landed.top === null || landed.top < 0 || landed.top > 160) {
+      notScrolled.push(`${node.id} (heading top ${landed.top})`);
+    }
+  }
+  check(
+    notScrolled.length === 0,
+    "clicking each of the seven topology nodes scrolls to its section",
+    notScrolled.join(", "),
+  );
+
+  const reduced = await page.evaluate(probeDiagram, {
+    containerAttr: "data-arch-diagram",
+    nodeAttr: "data-arch-node",
+    sectionAttr: "data-arch-section",
+    edgesAttr: "data-arch-edges",
+  });
+  check(
+    reduced.beams.length === ARCH_BEAM_COUNT && reduced.beams.every((beam) => beam.gradients === 0),
+    "topology beams are static under prefers-reduced-motion: reduce",
+    JSON.stringify(reduced.beams.map((beam) => beam.gradients)),
+  );
+
+  // 375px, still under reduced motion so nothing animates while measuring. The stacked column
+  // is the layout most likely to leave a beam measured against the wide one.
+  await page.setViewport({ width: 375, height: 812 });
+  await page.reload({ waitUntil: "load" });
+  await page.evaluate(() => document.fonts.ready);
+  const narrow = await page.evaluate(probeDiagram, {
+    containerAttr: "data-arch-diagram",
+    nodeAttr: "data-arch-node",
+    sectionAttr: "data-arch-section",
+    edgesAttr: "data-arch-edges",
+  });
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  check(
+    narrow.nodes.length === ARCH_NODE_COUNT &&
+      narrow.beams.length === ARCH_BEAM_COUNT &&
+      overflow <= 1,
+    "the topology renders at 375px with no horizontal overflow",
+    `${narrow.nodes.length} nodes, ${narrow.beams.length} beams, overflow ${overflow}px`,
+  );
+
+  const narrowMisaligned = misalignedArchBeams(narrow);
+  check(
+    narrowMisaligned.length === 0,
+    "every topology beam still lands on its nodes' centres at 375px",
+    narrowMisaligned.join(", "),
+  );
+
+  await page.setViewport({ width: 1280, height: 900 });
+  // Restored before returning so the two trailing checks in main() — no console errors, every
+  // same-origin asset loads — see a normal page rather than a narrow, reduced-motion one.
   await page.emulateMediaFeatures([
     { name: "prefers-color-scheme", value: "light" },
     { name: "prefers-reduced-motion", value: "no-preference" },
@@ -567,6 +903,9 @@ async function main() {
     // `/docs` — the diagram, its anchors, and its beams. Runs on the same page object, so
     // the console and response listeners above cover it too.
     await checkDocs(page);
+
+    // `/docs/architecture` — the topology diagram PER-192 added, same page object again.
+    await checkArchitecture(page);
 
     check(consoleErrors.length === 0, "no console errors", consoleErrors.join(" | "));
     check(badResponses.length === 0, "every same-origin asset loads", badResponses.join(" | "));

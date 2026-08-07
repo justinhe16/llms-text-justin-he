@@ -1,39 +1,35 @@
-import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 
-import { DocsDiagram } from "@/components/docs/docs-diagram";
-
-export const metadata: Metadata = {
-  title: "Docs · llms-text",
-  description: "What llms.txt is, the seven stages of a run, and the limits that apply.",
-};
+import { DocsTabs } from "@/components/docs/docs-tabs";
 
 /**
- * The frame around `/docs`: one back link and two columns — the pipeline diagram, and the
- * reference text. Still no sidebar, no search, no version switcher, and still one MDX file.
+ * The frame shared by both `/docs` tabs: the back link and the tab nav. No `metadata` export
+ * here — each tab (`app/docs/(run)/layout.tsx`, `app/docs/architecture/layout.tsx`) owns its
+ * own title and description, and this file wraps them both, so root `app/layout.tsx:24-27`'s
+ * fallback title covers this frame if either tab's metadata is ever removed.
  *
- * ## The grid
+ * ## Two routes, not two client-side tabs
  *
- * Two columns from `lg` up; one column below it, diagram first. The diagram is the same
- * component either way — its beams measure from the DOM and its nodes still scroll the page,
- * so stacking it costs nothing and needs no second code path.
+ * `/docs` and `/docs/architecture` are ordinary Next routes rather than a client component
+ * switching on state, for three reasons that all trace back to the URL being the only thing
+ * that has to remember which tab a reader is on:
  *
- * `max-w-2xl` on the text column is a reading measure, not a layout guess: it puts a line of
- * this page's body text at roughly 70 characters. It survived the rebuild unchanged, which is
- * why the outer container grew instead.
+ * - `/docs#fetch` is a published, deep-linkable anchor into the run tab. A client-side switch
+ *   would need to restore both the active tab *and* the scroll position from a hash on every
+ *   load; a route needs neither, because the browser already does both for a URL.
+ * - There is no client state to restore on navigation, on refresh, or on the back button —
+ *   the active tab is just whichever route rendered.
+ * - Each tab owns its own left column (`DocsDiagram` vs. `ArchitectureDiagram`) inside its
+ *   own route-group layout, so swapping tabs is an ordinary navigation between two pages that
+ *   happen to share this frame, not a re-render of one page pretending to be two.
  *
- * ## Why the page scrolls and the column does not
- *
- * The left column is `lg:sticky` (see `DocsDiagram`) and the right column is plain flow. No
- * element here owns a scrollbar. That is deliberate: `scrollIntoView` then moves the
- * *document*, so the browser's back/forward scroll restoration keeps working, `scroll-mt-28`
- * on the headings applies, and a link to `/docs#fetch` lands where it should. Giving the
- * right column `overflow-y-auto` would break all three at once.
- *
- * Public. `/docs` is not in `frontend/middleware.ts`'s `PROTECTED_PREFIXES`, so this renders
- * for a signed-out visitor exactly as it does for a signed-in one — documentation nobody can
- * read before signing up is documentation that cannot do its job.
+ * Public. `frontend/middleware.ts`'s `PROTECTED_PREFIXES` is `["/crawls"]` — `/docs` was
+ * never in it, so both tabs render for a signed-out visitor exactly as they do for a
+ * signed-in one — documentation nobody can read before signing up is documentation that
+ * cannot do its job. `/docs/architecture` inherits that exemption for free, simply by never
+ * matching the one prefix the list does contain, so no middleware change was needed to add
+ * the second tab.
  */
 export default function DocsLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -46,10 +42,9 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
         Back
       </Link>
 
-      <div className="mt-10 grid gap-12 pb-10 lg:grid-cols-[15rem_minmax(0,1fr)] lg:items-start lg:gap-14">
-        <DocsDiagram />
-        <div className="min-w-0 max-w-2xl">{children}</div>
-      </div>
+      <DocsTabs />
+
+      {children}
     </main>
   );
 }
