@@ -175,8 +175,11 @@ class ValidatedTarget:
     `fetcher.py` must actually connect to."""
 
     host_header: str
-    """`host`, plus `":{port}"` when `port` is not `scheme`'s default — the exact value
-    `fetcher.py` sends as the `Host` header."""
+    """`<host, bracketed if IPv6>`, plus `":{port}"` when `port` is not `scheme`'s default —
+    the exact value `fetcher.py` sends as the `Host` header. RFC 7230 §5.4 is
+    `Host = uri-host [ ":" port ]`, and `uri-host` for an IPv6 address is an `IP-literal`,
+    brackets included — so the brackets are required in BOTH branches, not only the one
+    that appends a port."""
 
     connect_url: str
     """`scheme://<ip, bracketed if IPv6>[:port]/path?query` — what httpx is actually told
@@ -419,7 +422,16 @@ async def validate_url(
 
     chosen = addresses[0]
     default_port = _DEFAULT_PORTS[scheme]
-    host_header = host if port == default_port else f"{host}:{port}"
+
+    # `urlsplit().hostname` strips the brackets off an IPv6 literal, and `uri-host` in RFC
+    # 7230 §5.4's `Host = uri-host [ ":" port ]` is an `IP-literal` for an IPv6 address —
+    # brackets included — so they go back on for BOTH branches below, not just the one that
+    # appends a port. Keyed off `literal`'s address family rather than a colon in the string,
+    # so this cannot fire on a name; `literal` is `None` whenever `host` was resolved by DNS.
+    # `internals/url_ranking.py`'s `_authority()` is the same fix in the sibling module, kept
+    # separate on purpose (ARCHITECTURE.md §3.1).
+    header_host = f"[{host}]" if isinstance(literal, IPv6Address) else host
+    host_header = header_host if port == default_port else f"{header_host}:{port}"
 
     netloc = f"[{chosen}]" if isinstance(chosen, IPv6Address) else str(chosen)
     if port != default_port:

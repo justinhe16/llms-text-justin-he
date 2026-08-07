@@ -288,7 +288,49 @@ async def test_a_zone_id_on_a_public_ipv6_literal_survives_into_a_well_formed_co
 
     assert target.ip == f"{PUBLIC_V6}%25eth0"
     assert target.connect_url == f"http://[{PUBLIC_V6}%25eth0]/"
-    assert target.host_header == f"{PUBLIC_V6}%25eth0"
+    assert target.host_header == f"[{PUBLIC_V6}%25eth0]"
+
+
+async def test_an_ipv6_literal_is_bracketed_in_the_host_header_on_a_non_default_port() -> None:
+    """RFC 7230 §5.4 is `Host = uri-host [ ":" port ]`, and `uri-host` for an IPv6 address
+    is an `IP-literal` — brackets included. `urlsplit().hostname` strips them, so the header
+    has to put them back: without the brackets, `<address>` glued to `:443` is just one more
+    colon in a string of them, and no server can tell where the address ends.
+    """
+    target = await validate_url(f"http://[{PUBLIC_V6}]:443/docs")
+    assert target.host_header == f"[{PUBLIC_V6}]:443"
+    assert target.connect_url == f"http://[{PUBLIC_V6}]:443/docs"
+
+
+async def test_an_ipv6_literal_is_bracketed_in_the_host_header_on_the_default_port() -> None:
+    """The branch a fix that only touches the `f"{host}:{port}"` half would miss.
+
+    There is no port to disambiguate here, but `uri-host` is still `IP-literal`, so a bare
+    `Host: 2001:4860:4860::8888` is malformed on its own and not merely ambiguous.
+    """
+    target = await validate_url(f"https://[{PUBLIC_V6}]/docs")
+    assert target.host_header == f"[{PUBLIC_V6}]"
+    assert target.connect_url == f"https://[{PUBLIC_V6}]/docs"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://example.test/docs", "example.test"),
+        ("http://example.test:443/docs", "example.test:443"),
+        (f"https://{PUBLIC_V4}/docs", PUBLIC_V4),
+        (f"http://{PUBLIC_V4}:443/docs", f"{PUBLIC_V4}:443"),
+    ],
+)
+async def test_non_ipv6_hosts_are_never_bracketed_in_the_host_header(
+    url: str, expected: str
+) -> None:
+    """The other side of the case above: bracketing keys off the parsed address family, not
+    off a colon in the string, so neither a name nor an IPv4 literal picks up brackets from
+    the `:port` that follows it."""
+    resolver = _fake_resolver({"example.test": [PUBLIC_V4]})
+    target = await validate_url(url, resolver=resolver)
+    assert target.host_header == expected
 
 
 async def test_explicit_default_https_port_is_allowed_and_omitted_from_the_host_header() -> None:
