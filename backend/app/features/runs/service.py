@@ -1,4 +1,4 @@
-"""Business logic for the runs feature: three unscoped reads, and writes reached from two
+"""Business logic for the runs feature: five unscoped reads, and writes reached from two
 completely different directions.
 
 **This feature has a writer, and transactions.** `internals/runs_writer.py` exists, and
@@ -31,10 +31,12 @@ retrofit one into `list_runs` or `get_run`." That is exactly what happened, twic
   purpose: a run rescued by its own worker and a run rescued five minutes later by the reaper
   must land in the same state, or the two paths will drift.
 
-`list_runs`, `get_run`, and `get_website_stats` are unchanged by any of it, and open no
-transaction of their own.
+`list_runs`, `get_run`, `get_website_stats`, and — as of PER-181 — `get_llms_txt` and
+`get_llms_full_txt` are unchanged by any of it, and open no transaction of their own; the
+latter two share one private helper, `_get_artifact`, rather than being two independent
+copies of the same two `404`s.
 
-**Reads are still unscoped, the same rule `websites/service.py` follows.** None of the three
+**Reads are still unscoped, the same rule `websites/service.py` follows.** None of the five
 ever looks at who is asking — `CurrentUserId` is threaded through `app.api.routers.runs`
 purely to require a token (ARCHITECTURE.md §4.1).
 
@@ -174,6 +176,11 @@ from fastapi import HTTPException, status
 from app.core.auth.ownership import require_owner
 from app.core.pagination import Page
 from app.core.settings import Settings
+from app.features.runs.internals.artifact_filename import (
+    ArtifactKind,
+    artifact_filename,
+    artifact_name,
+)
 from app.features.runs.internals.run_cursor import RunCursor, encode_cursor
 from app.features.runs.internals.run_limits import (
     concurrency_limit_message,
@@ -201,6 +208,28 @@ from app.infrastructure.db.transaction import transaction
 logger = logging.getLogger(__name__)
 
 _NOT_FOUND_DETAIL = "No run with that id"
+
+
+def _missing_artifact_detail(kind: ArtifactKind) -> str:
+    """The `404` detail for a run that exists but has not produced this artifact.
+
+    **ONE message for `pending`, `processing`, and `failed`**, and the collapse is deliberate
+    rather than lazy. Three reasons, in order:
+
+    * The actionable fact is identical in all three — there is nothing to download — and a
+      client that wants the run's state already has `GET /runs/{id}`, which returns it to
+      every signed-in user anyway.
+    * Any status-derived wording would be a lie waiting to happen: the run can move from
+      `processing` to `completed` between the SELECT and the response.
+    * Producing it would mean selecting `status` and branching on it in the service for zero
+      client benefit, on a path whose entire job is to hand back one string.
+
+    Distinct from `_NOT_FOUND_DETAIL` above by construction, and distinct BETWEEN the two
+    artifacts, so a UI with two download buttons can say which one failed. Built from
+    `artifact_name`, so it cannot name a different artifact than the filename would.
+    """
+    return f"This run has no {artifact_name(kind)} artifact"
+
 
 # Deliberately character-identical to `websites/service.py`'s own "no such website" detail.
 # `trigger_run` can produce a `404` about the WEBSITE by two different routes — the
@@ -305,6 +334,29 @@ class ReaperSummary:
     # `True` when `examined == REAP_BATCH_LIMIT`: this pass's batch was full, so there MAY be
     # more stranded runs it never looked at.
     limit_reached: bool
+
+
+@dataclass(frozen=True)
+class RunArtifact:
+    """One generated artifact, and the filename a browser should save it under.
+
+    Lives here rather than in `schemas.py` for the reason `ReaperSummary` above does: it is
+    NOT a response body. `app.api.routers.runs` builds a `PlainTextResponse` out of these two
+    fields — the `content` becomes the body verbatim and the `filename` becomes a
+    `Content-Disposition` header — so nothing here is ever serialized as JSON and there is no
+    OpenAPI schema to derive from it. `schemas.py`'s module docstring reserves that file for
+    request/response DTOs; a pydantic model here would render as a component in
+    `openapi.json` describing a shape no response ever has.
+    """
+
+    content: str
+    """The artifact itself, exactly as `record_success` stored it. Never `None` — a run whose
+    column is `NULL` produces a `404` in `_get_artifact` instead of an instance of this."""
+
+    filename: str
+    """`llms-example-com.txt` / `llms-full-example-com.txt`, from `artifact_filename`. Already
+    sanitized to `[a-z0-9-]` plus one `.txt`, which is what lets the router interpolate it
+    into a quoted `Content-Disposition` with no escaping and no header-injection surface."""
 
 
 def _duration_ms(started_at: datetime, completed_at: datetime | None) -> int | None:
@@ -558,6 +610,48 @@ class RunService:
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND_DETAIL)
         return _to_detail(row)
+
+    async def get_llms_txt(self, run_id: UUID) -> RunArtifact:
+        """Return one run's `llms.txt` index, for any signed-in caller.
+
+        Takes no `user_id` and never asks who is calling (ARCHITECTURE.md §4.1) — same
+        contract as `get_run` above.
+
+        Raises:
+            HTTPException: `404` with `_NOT_FOUND_DETAIL` if there is no run with that id;
+                `404` with a DIFFERENT detail if the run exists but has produced no index —
+                see `_get_artifact`.
+        """
+        return await self._get_artifact(run_id, "index")
+
+    async def get_llms_full_txt(self, run_id: UUID) -> RunArtifact:
+        """Return one run's `llms-full.txt` expansion, for any signed-in caller. Identical
+        contract to `get_llms_txt` above, including both `404`s."""
+        return await self._get_artifact(run_id, "full")
+
+    async def _get_artifact(self, run_id: UUID, kind: ArtifactKind) -> RunArtifact:
+        """The one implementation behind both public methods above.
+
+        Two `404`s, deliberately distinguishable by `detail` alone (the status codes are
+        identical because both mean "there is nothing at this URL"):
+
+        * The run does not exist — `_NOT_FOUND_DETAIL`, character-identical to `get_run`'s,
+          so a client cannot learn from these routes whether an id it guessed is real.
+        * The run exists and its column is `NULL` — `_missing_artifact_detail(kind)`. That is
+          ONE message for `pending`, `processing`, and `failed`, on purpose: see that
+          function.
+        """
+        row = await self._reader.get_artifact(run_id, kind=kind)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND_DETAIL)
+
+        content: str | None = row["content"]
+        if content is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_missing_artifact_detail(kind)
+            )
+
+        return RunArtifact(content=content, filename=artifact_filename(row["origin"], kind))
 
     async def trigger_run(
         self, website_id: UUID, user_id: UUID, queue: ArqRedis

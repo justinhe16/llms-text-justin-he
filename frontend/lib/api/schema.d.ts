@@ -75,6 +75,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/runs/{id}/llms-full.txt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run Llms Full Txt
+         * @description Download one run's `llms-full.txt` expansion as `text/plain`. Identical contract to
+         *     `get_run_llms_txt` above, including both `404`s — see `RunService.get_llms_full_txt`.
+         */
+        get: operations["get_run_llms_full_txt_runs__id__llms_full_txt_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/runs/{id}/llms.txt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run Llms Txt
+         * @description Download one run's `llms.txt` index as `text/plain`. Any signed-in user, any run.
+         *
+         *     Not filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to
+         *     require authentication and is intentionally not passed to the service. `404` if `id`
+         *     names no run, or if that run has not produced this artifact — see
+         *     `RunService.get_llms_txt` for the two distinguishable `detail`s.
+         *
+         *     `-> Response`, not `-> str`: this handler's declared contract is that it returns an HTTP
+         *     response it built itself, not a value FastAPI should serialize — see `response_class`
+         *     above and this router's module docstring for why that is not a "routers are thin"
+         *     violation.
+         */
+        get: operations["get_run_llms_txt_runs__id__llms_txt_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/websites": {
         parameters: {
             query?: never;
@@ -163,7 +214,7 @@ export interface paths {
         put?: never;
         /**
          * Trigger Run
-         * @description Start a manual crawl of one website. Owner-only — unlike this module's two reads.
+         * @description Start a manual crawl of one website. Owner-only — unlike this module's reads.
          *
          *     `202 Accepted`, not `201 Created`: the body describes a `pending` run that has been
          *     queued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and
@@ -882,6 +933,90 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RunDetailResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_llms_full_txt_runs__id__llms_full_txt_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Either there is no run with that id, or that run has not produced this artifact — it is still pending or processing, or it failed. The two cases answer with different `detail` strings; the status is the same because from a client's side both mean there is nothing at this URL. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_llms_txt_runs__id__llms_txt_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Either there is no run with that id, or that run has not produced this artifact — it is still pending or processing, or it failed. The two cases answer with different `detail` strings; the status is the same because from a client's side both mean there is nothing at this URL. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
                 };
             };
             /** @description Validation Error */

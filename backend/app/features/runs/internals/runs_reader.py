@@ -18,11 +18,12 @@ question in batch rather than one website at a time.
 **READS IN THIS FILE ARE INTENTIONALLY NOT SCOPED TO THE CALLER — WITH ONE NAMED EXCEPTION.**
 Same rule as `websites_reader.py` (ARCHITECTURE.md §4.1): `list_by_website` returns a
 website's runs to ANY signed-in user, not merely its owner, and `get_by_id` returns any run,
-including its `llms_txt`, to any signed-in user. Do not add `WHERE user_id = $1` to either —
-there is no `user_id` column on `runs` in the first place, but the same principle applies to
-`website_id`-scoping-as-a-security-measure: the `website_id` filter below exists because
-"this website's runs" is the endpoint's documented contract, not because it is standing in
-for an ownership check.
+including its `llms_txt`, to any signed-in user. `get_artifact` (PER-181), below, is the same
+rule again — any signed-in user may download any run's `llms.txt` or `llms-full.txt`. Do not
+add `WHERE user_id = $1` to any of them — there is no `user_id` column on `runs` in the first
+place, but the same principle applies to `website_id`-scoping-as-a-security-measure: the
+`website_id` filter below exists because "this website's runs" is the endpoint's documented
+contract, not because it is standing in for an ownership check.
 
 The exception is the two new cap queries, `count_active_manual_for_user` and
 `count_and_oldest_since_for_user`, and it is worth spelling out why they are not a
@@ -134,6 +135,18 @@ index. `_WEBSITE_STATS` (`website_stats`, below) is a bucketed aggregate with no
 started_at)`, but its `SELECT` computes averages, `date_trunc` buckets, and a zero-filled
 `generate_series` join on purpose, because there is no index ordering downstream of an
 aggregate for a computed column to break.
+
+## `_ARTIFACT_QUERIES` — an allowlist, not a query built at call time (PER-181)
+
+`get_artifact` below serves `GET /runs/{id}/llms.txt` and `GET /runs/{id}/llms-full.txt`. Two
+fixed query shapes, keyed by `ArtifactKind` in `_ARTIFACT_QUERIES`, for the same reason the
+four keyset queries above are four constants — the column that varies is a COLUMN NAME, which
+cannot travel as a bind parameter, so it is validated against this allowlist instead. Both
+queries `JOIN websites` — the third query pair in this file to do so, after the two cap counts
+above — for the same reason those do: `websites.origin` is NOT NULL and reachable only through
+`runs.website_id`, and a run row cannot outlive its website (`ON DELETE CASCADE`,
+`db/schema.prisma`), so the join is guaranteed to produce a row. See the two query constants'
+own comments for the rest of the reasoning.
 """
 
 from collections.abc import Sequence
@@ -143,6 +156,7 @@ from uuid import UUID
 
 from asyncpg import Pool
 
+from app.features.runs.internals.artifact_filename import ArtifactKind
 from app.features.runs.internals.run_cursor import RunCursor
 from app.features.runs.internals.stats_window import StatsWindow
 from app.features.runs.schemas import RunStatusName
@@ -163,6 +177,45 @@ _GET_BY_ID: Final = f"""
     FROM runs
     WHERE id = $1
 """
+
+# The two artifact downloads, `GET /runs/{id}/llms.txt` and `GET /runs/{id}/llms-full.txt`.
+#
+# **Two fixed query shapes, not one assembled at call time**, for the reason the four keyset
+# queries above are four constants: the column that varies is a COLUMN NAME, which cannot
+# travel as a bind parameter, and `base_repository.py`'s module docstring is explicit that
+# such a value must be "validated against an explicit allowlist before it touches the query
+# string." `_ARTIFACT_QUERIES` below is that allowlist, keyed by a `Literal` — there is no
+# path from a request value to this SQL at all.
+#
+# `JOIN websites` — the third query in this file to cross that boundary, after the two cap
+# counts above, and for the same reason: `websites.origin` is NOT NULL and reachable only
+# through `runs.website_id`, and the join is guaranteed to produce a row because `runs`
+# references `websites` with `ON DELETE CASCADE` (db/schema.prisma). A run row cannot outlive
+# its website, so this is an INNER join and `origin` is never `NULL` here.
+#
+# The artifact column is aliased to `content` so that `RunService._get_artifact` reads one
+# key regardless of which artifact it asked for. Deliberately NOT `SELECT llms_txt,
+# llms_full_txt` in one query: `llms_full_txt` is bounded at 5 MB per run
+# (`crawl/internals/llms_txt.py`), and fetching both to hand back one would double every
+# download's bytes off the wire for no caller that wants them.
+_GET_LLMS_TXT_ARTIFACT: Final = """
+    SELECT runs.llms_txt AS content, websites.origin
+    FROM runs
+    JOIN websites ON websites.id = runs.website_id
+    WHERE runs.id = $1
+"""
+
+_GET_LLMS_FULL_TXT_ARTIFACT: Final = """
+    SELECT runs.llms_full_txt AS content, websites.origin
+    FROM runs
+    JOIN websites ON websites.id = runs.website_id
+    WHERE runs.id = $1
+"""
+
+_ARTIFACT_QUERIES: Final[dict[ArtifactKind, str]] = {
+    "index": _GET_LLMS_TXT_ARTIFACT,
+    "full": _GET_LLMS_FULL_TXT_ARTIFACT,
+}
 
 # First page, no status filter. `$2` is the caller's page size PLUS ONE — the extra row is
 # how `RunService.list_runs` detects a next page without a second, and stale-the-instant-
@@ -449,6 +502,24 @@ class RunsReader(Reader):
         (ARCHITECTURE.md §4.1).
         """
         return await self.fetch_one(_GET_BY_ID, run_id)
+
+    async def get_artifact(self, run_id: UUID, *, kind: ArtifactKind) -> dict[str, Any] | None:
+        """Return one run's generated artifact and its website's origin, or `None` if there
+        is no run with that id.
+
+        Unscoped, exactly like `get_by_id` above: any signed-in user may download any run's
+        artifacts (ARCHITECTURE.md §4.1). There is no `user_id` parameter here and there must
+        never be one.
+
+        Returns:
+            `{"content": str | None, "origin": str}`. `content` is `None` — a row, not the
+            absence of one — for a run that is `pending`, `processing`, or `failed`, and for
+            every row written before PER-179 added `llms_full_txt`. That distinction between
+            "no row" and "a row whose column is NULL" is the whole reason this returns the
+            row rather than the string: it is what lets `RunService` answer the two `404`s
+            with different `detail`s. `origin` is never `None` (see `_GET_LLMS_TXT_ARTIFACT`).
+        """
+        return await self.fetch_one(_ARTIFACT_QUERIES[kind], run_id)
 
     async def list_by_website(
         self,

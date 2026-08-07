@@ -1,5 +1,6 @@
-"""HTTP handlers for `/websites/{id}/runs`, `/runs/{id}`, and `/websites/{id}/stats`. Thin
-by contract (ARCHITECTURE.md §3.2).
+"""HTTP handlers for `/websites/{id}/runs`, `/runs/{id}`, `/runs/{id}/llms.txt`,
+`/runs/{id}/llms-full.txt`, and `/websites/{id}/stats`. Thin by contract (ARCHITECTURE.md
+§3.2).
 
 Every handler below parses its input, calls exactly one service method, and returns the
 result. There is no `if`, no `for`, no SQL, and no second service call anywhere in this
@@ -10,30 +11,51 @@ a typed `RunCursor` or a `422`, before any service method runs. It contains no b
 rule about runs — it is `decode_cursor` plus one `try`/`except` translating its one
 exception type into HTTP. `WindowQuery`, `get_website_stats`'s query parameter, needs no
 such parser: `StatsWindowName` is a `Literal`, so FastAPI itself turns an unrecognized
-`?window=` into a `422` declaratively.
+`?window=` into a `422` declaratively. `_artifact_response`, below the two artifact
+handlers, is a second router-level *presentation* helper of the same kind — it decides no
+business rule about runs either, only how a `RunArtifact` becomes an HTTP response.
 
 **Authentication vs. authorization, visible in the signatures — same pattern as
 `websites.py`.** Every handler takes `CurrentUserId`, so every endpoint is `401` without a
 valid token. `trigger_run` is the one handler that passes that id on to its service, because
 it is the one WRITE in this router and writes are ownership-checked — `RunService.trigger_run`
-hands it straight to `require_owner` (ARCHITECTURE.md §4.2). The three reads — `list_runs`,
-`get_run`, and `get_website_stats` — all still take `CurrentUserId` purely to require a token
-and deliberately never thread it any further, because reads in this codebase are unscoped by
-caller (ARCHITECTURE.md §4.1): any signed-in user may read any website's run history, any
-run's full detail including its `llms_txt`, and any website's run statistics. That asymmetry
-is the authorization contract in miniature, and it is what makes this feature's tests for "a
+hands it straight to `require_owner` (ARCHITECTURE.md §4.2). The five reads — `list_runs`,
+`get_run`, `get_run_llms_txt`, `get_run_llms_full_txt`, and `get_website_stats` — all still
+take `CurrentUserId` purely to require a token and deliberately never thread it any further,
+because reads in this codebase are unscoped by caller (ARCHITECTURE.md §4.1): any signed-in
+user may read any website's run history, any run's full detail including its `llms_txt`, any
+run's two generated artifacts (PER-181), and any website's run statistics. That asymmetry is
+the authorization contract in miniature, and it is what makes this feature's tests for "a
 non-owner can read this, but cannot trigger this" meaningful rather than vacuous.
 
 `GET /websites/{id}/stats` lives here rather than in a new `stats` feature module because
 the aggregate it runs reads exactly one table, `runs`, which this feature already owns —
 see `app.features.runs.service.RunService.get_website_stats` for the full reasoning.
+
+**`get_run_llms_txt` and `get_run_llms_full_txt` return a `Response`, not a Pydantic model,
+and that is intentional rather than a crack in "routers are thin."** Each handler is still
+exactly one call to one service method — `return _artifact_response(await
+service.get_llms_txt(id))` — with the response-shaping factored into the one helper both
+share, the same way `parse_cursor` factors out the one piece of input-shaping this router
+does. See `_artifact_response`'s own docstring for the `PlainTextResponse` and
+`Content-Disposition` details, and Decision C of PER-181's implementation notes for why
+`response_class=PlainTextResponse` is what makes `openapi.json` declare `text/plain` here
+instead of an empty `application/json` schema.
+
+**What these two routes do NOT do, on purpose: `Content-Disposition` reaches a browser only
+when nothing sits between it and FastAPI.** `frontend/app/api/[...path]/route.ts`'s BFF proxy
+(ARCHITECTURE.md §8.1) forwards only `content-type` from the upstream response today, so the
+header these two handlers set is currently dropped before it reaches the browser. That gap is
+deliberate, documented, and owned by the frontend download ticket that wires a UI up to these
+routes — it is not fixed here.
 """
 
-from typing import Annotated
+from typing import Annotated, Any, Final
 from uuid import UUID
 
 from arq.connections import ArqRedis
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import PlainTextResponse
 
 from app.api.deps import CurrentUserId, DbPool, SettingsDep, get_arq_pool
 from app.core.pagination import Page
@@ -48,7 +70,7 @@ from app.features.runs.schemas import (
     TriggerRunResponse,
     WebsiteStatsResponse,
 )
-from app.features.runs.service import RunService
+from app.features.runs.service import RunArtifact, RunService
 from app.features.websites.service import WebsiteService
 
 
@@ -229,6 +251,93 @@ async def get_run(
     return await service.get_run(id)
 
 
+# Documented by hand rather than with a `"model"` key, unlike `trigger_run`'s 409/429 below.
+# On a route whose `response_class` is not JSON, FastAPI files an additional response's model
+# under THAT route's media type (`route_response_media_type or "application/json"`,
+# fastapi/openapi/utils.py) — so `{"model": ...}` here would document these 404s as
+# `text/plain`, which is a lie: FastAPI's own `HTTPException` handler answers them as
+# `application/json`. Verified against the pinned FastAPI by dumping `app.openapi()`.
+_ARTIFACT_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    status.HTTP_404_NOT_FOUND: {
+        "description": (
+            "Either there is no run with that id, or that run has not produced this "
+            "artifact — it is still pending or processing, or it failed. The two cases "
+            "answer with different `detail` strings; the status is the same because from a "
+            "client's side both mean there is nothing at this URL."
+        ),
+        "content": {
+            "application/json": {
+                "schema": {"type": "object", "properties": {"detail": {"type": "string"}}}
+            }
+        },
+    }
+}
+
+
+def _artifact_response(artifact: RunArtifact) -> Response:
+    """Turn one `RunArtifact` into the downloadable body both handlers below return.
+
+    A router-level presentation helper, like `parse_cursor` above — no business rule about
+    runs is decided here, and it exists so the exact `Content-Disposition` spelling lives in
+    ONE place rather than being retyped in two handlers that must not drift.
+
+    `PlainTextResponse` supplies `content-type: text/plain; charset=utf-8` on its own:
+    Starlette appends `; charset=utf-8` to any `text/*` media type that does not already name
+    a charset. Spelling the charset out here would change nothing at runtime and would NOT
+    change what `openapi.json` says, which is read off the response CLASS, not the instance.
+
+    `filename` needs no quote-escaping and no RFC 5987 `filename*` companion:
+    `artifact_filename` has already reduced it to `[a-z0-9-]` plus one `.txt`, so it cannot
+    contain a quote, a semicolon, a CR, or an LF. That is the security argument for
+    sanitizing an attacker-influenceable value (a website's origin is whatever a user typed)
+    server-side rather than echoing it into a header.
+    """
+    return PlainTextResponse(
+        artifact.content,
+        headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+    )
+
+
+@router.get(
+    "/runs/{id}/llms.txt",
+    response_class=PlainTextResponse,
+    responses=_ARTIFACT_RESPONSES,
+)
+async def get_run_llms_txt(
+    id: UUID,
+    user_id: CurrentUserId,
+    service: RunServiceDep,
+) -> Response:
+    """Download one run's `llms.txt` index as `text/plain`. Any signed-in user, any run.
+
+    Not filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to
+    require authentication and is intentionally not passed to the service. `404` if `id`
+    names no run, or if that run has not produced this artifact — see
+    `RunService.get_llms_txt` for the two distinguishable `detail`s.
+
+    `-> Response`, not `-> str`: this handler's declared contract is that it returns an HTTP
+    response it built itself, not a value FastAPI should serialize — see `response_class`
+    above and this router's module docstring for why that is not a "routers are thin"
+    violation.
+    """
+    return _artifact_response(await service.get_llms_txt(id))
+
+
+@router.get(
+    "/runs/{id}/llms-full.txt",
+    response_class=PlainTextResponse,
+    responses=_ARTIFACT_RESPONSES,
+)
+async def get_run_llms_full_txt(
+    id: UUID,
+    user_id: CurrentUserId,
+    service: RunServiceDep,
+) -> Response:
+    """Download one run's `llms-full.txt` expansion as `text/plain`. Identical contract to
+    `get_run_llms_txt` above, including both `404`s — see `RunService.get_llms_full_txt`."""
+    return _artifact_response(await service.get_llms_full_txt(id))
+
+
 @router.get("/websites/{id}/stats", response_model=WebsiteStatsResponse)
 async def get_website_stats(
     id: UUID,
@@ -277,7 +386,7 @@ async def trigger_run(
     service: RunServiceDep,
     queue: QueuePoolDep,
 ) -> TriggerRunResponse:
-    """Start a manual crawl of one website. Owner-only — unlike this module's two reads.
+    """Start a manual crawl of one website. Owner-only — unlike this module's reads.
 
     `202 Accepted`, not `201 Created`: the body describes a `pending` run that has been
     queued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and

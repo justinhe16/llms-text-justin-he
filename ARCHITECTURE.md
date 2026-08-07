@@ -535,7 +535,10 @@ per arq job by `app.worker.jobs.crawl_task` from resources `open_worker_resource
 (`app/worker/settings.py`) already put on that job's `ctx`. There is no second caller and no
 dependency-injection path for a singleton to serve, so this package does not build one; the
 worker's own `ctx` dict already does the "build once per process" job a singleton here would
-duplicate.
+duplicate. That remains true after PER-181's `GET /runs/{id}/llms.txt` and `/llms-full.txt`:
+both serve the `runs.llms_txt` / `runs.llms_full_txt` columns through the runs feature's own
+reader, and neither touches this package. The Storage bucket holds the raw crawl payload, not
+the generated artifacts.
 
 **The bucket is private, and its layout is website-scoped.** Every crawl run's raw payload is
 uploaded to `crawl-payloads/{website_id}/{run_id}.jsonl.gz` — gzip-compressed JSONL, one
@@ -1165,6 +1168,15 @@ client's inferred type says the call returns nothing. `202` had to be added when
 `POST /websites/{id}/runs` landed, for exactly that reason. Any future 2xx needs the same
 one-line entry.
 
+The same silent failure has a second dimension, and PER-181 hit it: the client also resolves
+an operation's body by MEDIA TYPE, and it originally matched only `"application/json"`. The
+two `text/plain` artifact downloads (§10.3) therefore resolved to `void` for the same reason
+a `205` would resolve to `never` — assignable to anything, so nothing complained.
+`SuccessBodyOf` in `fetcher.ts` now matches `application/json`, then `text/plain`, then falls
+through to `void` for a `204`; a third media type needs a third branch, and
+`lib/api/schema.type-test.ts` is where that stays checked. The runtime half never had the
+bug — `parseResponseBody` has always returned raw text for a non-JSON content-type.
+
 **The drift check has two halves, enforced separately.** `scripts/export-openapi.sh --check`
 (run in `ci-backend.yml`'s `lint` job, and by `make lint`) re-exports the live schema from
 `app.openapi()` and diffs it against the committed `openapi.json` — this is what catches a
@@ -1356,6 +1368,8 @@ DELETE /websites/{id}
 GET    /websites/{id}/runs
 POST   /websites/{id}/runs
 GET    /runs/{id}
+GET    /runs/{id}/llms.txt
+GET    /runs/{id}/llms-full.txt
 GET    /websites/{id}/stats
 GET    /websites/{id}/schedule
 PUT    /websites/{id}/schedule
@@ -1363,9 +1377,19 @@ PUT    /websites/{id}/schedule
 
 - Path parameters are `{id}`, not `{website_id}`, when the noun is already in the path.
 - No verbs in paths. `POST /websites/{id}/runs` starts a run; there is no `/start-crawl`.
-- `schedule` is the one exception to "plural nouns": it is a singleton sub-resource, at most
-  one per website and enforced as such by `schedules`' `UNIQUE (website_id)` index, so there
-  is never a collection of them to name in the plural.
+- `schedule` is one of two exceptions to "plural nouns": it is a singleton sub-resource, at
+  most one per website and enforced as such by `schedules`' `UNIQUE (website_id)` index, so
+  there is never a collection of them to name in the plural.
+- `llms.txt` and `llms-full.txt` are the other exception, and a different kind of one: the
+  last segment is a **filename**, not a resource name. That is deliberate.
+  `Content-Disposition` is what actually names the download, but it is stripped by proxies
+  and ignored by some clients, and when it is, the URL's last segment is what the file gets
+  called — so `/runs/{id}/llms.txt` saves as `llms.txt` and `curl -O` produces something
+  usable, where a more RESTful `/runs/{id}/artifacts/index` would save as `index`. The
+  extension also documents the content type in the path, which no other route in this list
+  needs to. Like `schedule`, this is a carve-out with a stated reason and not licence to
+  name the next route freely: a route whose last segment is a filename must be serving that
+  file and nothing else.
 - No `/v1` prefix. When versioning is genuinely needed, it gets a ticket and a migration
   plan — it is not added preemptively.
 
@@ -1392,11 +1416,15 @@ Deliberately not decided here, and not to be decided by accident in an implement
   feature's flag is off or its API call fails. A generator that only works when an external
   service answers is not a fallback, which is why `internals/llms_txt.py` may not grow a
   network call and may not become conditional on one having happened.
-- **Serving either artifact over HTTP.** `GET /runs/{id}` returns `llms_txt` today;
-  `llms_full_txt` is written but read by no endpoint. `_DETAIL_COLUMNS`
-  (`runs/internals/runs_reader.py`) names its columns explicitly, which is why adding the
-  column did not silently widen the API. Serving both at stable, cacheable URLs is its own
-  ticket.
+- **Cacheable and shareable artifact URLs.** PER-181 shipped `GET /runs/{id}/llms.txt` and
+  `GET /runs/{id}/llms-full.txt` (§10.3), served straight from the `runs.llms_txt` /
+  `runs.llms_full_txt` columns. What they deliberately do NOT have is any caching story — no
+  `ETag`, no `Cache-Control`, no `Last-Modified`, and no conditional request handling — and
+  no unauthenticated form: both still require a valid JWT like every other read, so neither
+  can be pasted into a crawler's config or a `<link>` tag. Signed URLs, a public
+  `/{origin}/llms.txt` alias, and serving the artifact from Storage rather than from Postgres
+  are all still undesigned, and the last of those would need §3.7's "nothing under
+  `app/api/` ever calls Storage" revisited rather than quietly broken.
 - **Recursive, multi-level crawling.** Both halves of the frontier are now built: PER-176
   discovers a site's URLs from `sitemap.xml`, `sitemap_index.xml`, or `robots.txt`'s
   `Sitemap:` directive, and PER-178 falls back to the `<a href>` links on the seed page for
