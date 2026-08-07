@@ -313,6 +313,20 @@ async def test_an_ipv6_literal_is_bracketed_in_the_host_header_on_the_default_po
     assert target.connect_url == f"https://[{PUBLIC_V6}]/docs"
 
 
+async def test_a_zoned_ipv6_literal_on_a_non_default_port_brackets_before_the_colon() -> None:
+    """The two IPv6 complications stacked: a `%`-bearing zone id AND an explicit port.
+
+    Worth pinning separately because neither half above covers it — the zone-id test carries
+    no port and the port test carries no zone — and this is where getting the order wrong
+    stays invisible. The closing bracket must land between the zone and the colon, so the
+    port sits outside the `IP-literal` instead of being swallowed into it.
+    """
+    target = await validate_url(f"http://[{PUBLIC_V6}%25eth0]:443/docs")
+
+    assert target.host_header == f"[{PUBLIC_V6}%25eth0]:443"
+    assert target.connect_url == f"http://[{PUBLIC_V6}%25eth0]:443/docs"
+
+
 @pytest.mark.parametrize(
     ("url", "expected"),
     [

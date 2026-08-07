@@ -426,10 +426,17 @@ async def validate_url(
     # `urlsplit().hostname` strips the brackets off an IPv6 literal, and `uri-host` in RFC
     # 7230 §5.4's `Host = uri-host [ ":" port ]` is an `IP-literal` for an IPv6 address —
     # brackets included — so they go back on for BOTH branches below, not just the one that
-    # appends a port. Keyed off `literal`'s address family rather than a colon in the string,
-    # so this cannot fire on a name; `literal` is `None` whenever `host` was resolved by DNS.
-    # `internals/url_ranking.py`'s `_authority()` is the same fix in the sibling module, kept
-    # separate on purpose (ARCHITECTURE.md §3.1).
+    # appends a port.
+    #
+    # The predicate is the parsed `literal`, and specifically NOT `chosen`: this header
+    # carries the NAME while `connect_url` below carries the ADDRESS, so a hostname with
+    # only an AAAA record is exactly where the two part company — it must stay unbracketed
+    # here while `connect_url` brackets what it dials. `literal` is `None` on every DNS
+    # path, so that falls out for free. (A `":" in host` test would be equivalent for names
+    # — `urlsplit` has already taken the port off and userinfo is rejected above — so it is
+    # the AAAA case, not name safety, that decides this.) `internals/url_ranking.py`'s
+    # `_authority()` is the same concern in the sibling module, kept separate on purpose
+    # (ARCHITECTURE.md §3.1).
     header_host = f"[{host}]" if isinstance(literal, IPv6Address) else host
     host_header = header_host if port == default_port else f"{header_host}:{port}"
 
