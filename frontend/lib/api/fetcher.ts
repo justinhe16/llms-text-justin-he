@@ -296,14 +296,34 @@ type SuccessResponseOf<Op> = Op extends { responses: infer R }
     : never
   : never;
 
+// How a success response's TypeScript type is read off the generated schema, across the two
+// media types this API actually answers with — plus the third case, no body at all.
+//
 // A `204`'s response has no `content` key at all (there is no body to describe), which is
 // exactly the case this resolves to `void` rather than `never` — `never` would make
 // `deleteWebsite`'s return type uncallable, where `void` correctly says "nothing to read."
-type JsonBodyOf<Response> = Response extends { content: { "application/json": infer Body } }
+//
+// The `text/plain` branch is the media-type twin of the `202` story in `SuccessStatus`
+// above, and it failed in the same worst possible direction. `GET /runs/{id}/llms.txt` and
+// `GET /runs/{id}/llms-full.txt` (PER-181) declare `text/plain` 200s, which
+// openapi-typescript emits as `content: { "text/plain": string }`. Matching only
+// `"application/json"` made those two operations fall through to `void` — a helper declaring
+// `Promise<string>` would have compiled while this client's own inferred type said the call
+// returns nothing. This is a TYPE-LEVEL fix only: `parseResponseBody` above already returns
+// the raw text for any non-JSON content-type, so the runtime was correct the whole time.
+// `SuccessStatus` needed no new entry — both routes are plain `200`s.
+//
+// JSON is checked first because it is the common case, not because the two could both match:
+// an operation declares one media type, so exactly one branch can ever hit.
+type SuccessBodyOf<Response> = Response extends {
+  content: { "application/json": infer Body };
+}
   ? Body
-  : void;
+  : Response extends { content: { "text/plain": infer Text } }
+    ? Text
+    : void;
 
-type ResponseFor<P extends keyof paths, M extends HttpMethod> = JsonBodyOf<
+type ResponseFor<P extends keyof paths, M extends HttpMethod> = SuccessBodyOf<
   SuccessResponseOf<OperationFor<P, M>>
 >;
 

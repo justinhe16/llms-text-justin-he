@@ -653,6 +653,7 @@ async def seed_run(
     completed_at: datetime | None = None,
     stats: dict[str, Any] | str | None = None,
     llms_txt: str | None = None,
+    llms_full_txt: str | None = None,
     storage_path: str | None = None,
     error: str | None = None,
     attempts: int = 0,
@@ -666,9 +667,10 @@ async def seed_run(
     malformed stats.
 
     `"trigger"` is quoted because it is a SQL keyword, matching the generated migration.
-    `llms_txt`, `storage_path`, and `error` default to `None`, matching a run that has not
-    (yet, or ever) recorded them; `tests/test_runs_api.py` passes them explicitly to
-    exercise `RunDetailResponse`.
+    `llms_txt`, `llms_full_txt`, `storage_path`, and `error` default to `None`, matching a run
+    that has not (yet, or ever) recorded them; `tests/test_runs_api.py` passes them explicitly
+    to exercise `RunDetailResponse`, and `tests/test_run_artifacts_api.py` (PER-181) passes
+    both artifact columns independently to exercise the two artifact-download endpoints.
 
     `attempts` and `claimed_at` (PER-166) default to what a freshly-inserted, never-claimed
     run holds — `0` and `NULL` — which is exactly what `RunsWriter.insert_manual` produces,
@@ -683,8 +685,8 @@ async def seed_run(
         """
         INSERT INTO runs
             (website_id, "trigger", status, started_at, completed_at, stats,
-             llms_txt, storage_path, error, attempts, claimed_at)
-        VALUES ($1, $2::run_trigger, $3::run_status, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+             llms_txt, llms_full_txt, storage_path, error, attempts, claimed_at)
+        VALUES ($1, $2::run_trigger, $3::run_status, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
         RETURNING id
         """,
         website_id,
@@ -694,6 +696,7 @@ async def seed_run(
         completed_at,
         encoded,
         llms_txt,
+        llms_full_txt,
         storage_path,
         error,
         attempts,

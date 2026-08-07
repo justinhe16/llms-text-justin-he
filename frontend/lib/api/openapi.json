@@ -1059,6 +1059,134 @@
         ]
       }
     },
+    "/runs/{id}/llms-full.txt": {
+      "get": {
+        "description": "Download one run's `llms-full.txt` expansion as `text/plain`. Identical contract to\n`get_run_llms_txt` above, including both `404`s — see `RunService.get_llms_full_txt`.",
+        "operationId": "get_run_llms_full_txt_runs__id__llms_full_txt_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Either there is no run with that id, or that run has not produced this artifact — it is still pending or processing, or it failed. The two cases answer with different `detail` strings; the status is the same because from a client's side both mean there is nothing at this URL."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Run Llms Full Txt",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/runs/{id}/llms.txt": {
+      "get": {
+        "description": "Download one run's `llms.txt` index as `text/plain`. Any signed-in user, any run.\n\nNot filtered by the caller, on purpose (ARCHITECTURE.md §4.1) — `user_id` is present to\nrequire authentication and is intentionally not passed to the service. `404` if `id`\nnames no run, or if that run has not produced this artifact — see\n`RunService.get_llms_txt` for the two distinguishable `detail`s.\n\n`-> Response`, not `-> str`: this handler's declared contract is that it returns an HTTP\nresponse it built itself, not a value FastAPI should serialize — see `response_class`\nabove and this router's module docstring for why that is not a \"routers are thin\"\nviolation.",
+        "operationId": "get_run_llms_txt_runs__id__llms_txt_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Either there is no run with that id, or that run has not produced this artifact — it is still pending or processing, or it failed. The two cases answer with different `detail` strings; the status is the same because from a client's side both mean there is nothing at this URL."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Run Llms Txt",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
     "/websites": {
       "get": {
         "description": "List **every** website, from every user, most recently active first.\n\nNot filtered by the caller, on purpose: this application is not multi-tenant and\nbrowsing everyone's sites is the product (ARCHITECTURE.md §4.1). `user_id` is present to\nrequire authentication and is intentionally not passed to the service.",
@@ -1369,7 +1497,7 @@
         ]
       },
       "post": {
-        "description": "Start a manual crawl of one website. Owner-only — unlike this module's two reads.\n\n`202 Accepted`, not `201 Created`: the body describes a `pending` run that has been\nqueued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and\n`get_run`, `user_id` IS passed to the service here, because this is the one write in\nthis router and writes are ownership-checked (ARCHITECTURE.md §4.2).\n\nFour things can stop this short of a `202`: `404` if `id` names no website; `403` if the\ncaller does not own it; `409` if that website already has a run in flight; `429` if the\ncaller is over their concurrent- or daily-run cap. A `503` is also possible, if the run\nwas created but could not be queued — see `RunService.trigger_run` for exactly which\ncheck produces which, and `require_queue_pool` above for the one `503` this router\nitself can raise before the service even runs.",
+        "description": "Start a manual crawl of one website. Owner-only — unlike this module's reads.\n\n`202 Accepted`, not `201 Created`: the body describes a `pending` run that has been\nqueued, not one that has finished (see `TriggerRunResponse`). Unlike `list_runs` and\n`get_run`, `user_id` IS passed to the service here, because this is the one write in\nthis router and writes are ownership-checked (ARCHITECTURE.md §4.2).\n\nFour things can stop this short of a `202`: `404` if `id` names no website; `403` if the\ncaller does not own it; `409` if that website already has a run in flight; `429` if the\ncaller is over their concurrent- or daily-run cap. A `503` is also possible, if the run\nwas created but could not be queued — see `RunService.trigger_run` for exactly which\ncheck produces which, and `require_queue_pool` above for the one `503` this router\nitself can raise before the service even runs.",
         "operationId": "trigger_run_websites__id__runs_post",
         "parameters": [
           {
