@@ -229,6 +229,28 @@ async def crawl_site(
             reached" half of that directly, with a callback that would happily return more
             links if it were ever called a second time.
 
+            **Two obligations on whatever is passed here, neither of them enforced by this
+            module.** First, it MUST NOT RAISE. It is called inside this function's own
+            `asyncio.timeout` block but outside every `except` clause that could absorb it,
+            so an exception escaping it would leave `crawl_site` entirely and reach
+            `CrawlService.execute_run`'s `except Exception`, which turns anything it catches
+            into a FAILED run — a site whose markup could not be read would fail rather than
+            producing the single-page run it deserves. `service.py`'s `_select_seed_links`
+            discharges this with a `try/except` of its own, exactly as
+            `discover_sitemap_urls` does for the sitemap path; it is not defended a second
+            time here, because a bare `except` around this call would also swallow real bugs
+            in a caller's own code and report them as "this site had no links".
+
+            Second, it is SYNCHRONOUS, and that is load-bearing in two directions. A function
+            that cannot `await` cannot make an HTTP request, which is what makes "the fallback
+            costs no extra fetch" a property of the type rather than a rule to remember. The
+            flip side is that it cannot be interrupted: it runs to completion on the event
+            loop, so `limits.max_wall_clock_s` cannot cut a pathological parse short, and the
+            time it takes is time no other job in this worker process gets. That is the same
+            property `internals/fetcher.py` already has for the `extract_content` call it
+            makes per page, and it is bounded the same way — by `crawl_max_bytes` on the body
+            being parsed, and by `links.MAX_LINKS` on what comes out.
+
             Skipped entirely when `extra_urls` is non-empty, so a run cannot end up with a
             frontier assembled from two sources: a sitemap is a site operator's own statement
             about which pages matter, and links scraped off one page do not get a vote

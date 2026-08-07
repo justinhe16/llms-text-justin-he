@@ -322,3 +322,19 @@ def test_the_host_comparison_is_case_insensitive_but_the_path_is_left_alone() ->
     assert extract_links(html, base_url="https://docs.acme.test/") == [
         "https://DOCS.ACME.TEST/Docs/Guide"
     ]
+
+
+def test_a_newline_or_tab_inside_an_href_is_removed_rather_than_kept() -> None:
+    """A template that wraps a long href across two lines writes the newline INTO the
+    attribute value, where `.strip()` cannot reach it. `urlsplit` removes ASCII tab, CR and
+    LF anywhere in a URL — the same rule a browser applies — and `_resolve` round-trips every
+    candidate through it, so this is already handled. Pinned because it is not obvious from
+    reading `_resolve`, and a well-meaning refactor that stopped round-tripping through
+    `urlsplit`/`urlunsplit` would put a literal newline into a URL the crawler then tries to
+    fetch."""
+    html = '<a href="/docs/gu\nide">wrapped</a><a href="/ok\tay">tabbed</a>'
+
+    assert extract_links(html, base_url="https://docs.acme.test/") == [
+        "https://docs.acme.test/docs/guide",
+        "https://docs.acme.test/okay",
+    ]

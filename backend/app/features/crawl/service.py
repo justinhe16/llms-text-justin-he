@@ -598,6 +598,18 @@ class CrawlService:
         fetched from the frontier it returns are never passed back to it, which is the entire
         depth-1 rule.
 
+        **It does re-parse the seed's HTML, and that is the one real cost here.** trafilatura
+        already parsed this same body once, inside `fetch_page`, to produce
+        `CrawledPage.markdown` — but what that produces is extracted PROSE, with the navigation
+        carrying most of a documentation site's links deliberately stripped out, so there is no
+        parsed artifact on `CrawledPage` this could read instead. The cost is one extra lxml
+        parse, of one page, on the exception path only (a site with a sitemap never reaches
+        this method), bounded by the same `crawl_max_bytes` that bounds the body itself.
+        Threading a parsed tree out of `extract_content` to avoid it would widen that module's
+        return type for one caller on one page — a worse trade than the parse. It is
+        `duration_ms`, not `bytes_fetched` or a request count, that would show this if it ever
+        matters.
+
         **Every candidate carries `source="links"`, `lastmod=None`, `priority=None`** — a
         page's own markup declares neither of the two signals a sitemap does. That is not a
         degraded input to `select_urls`: that module ranks a candidate with no metadata on

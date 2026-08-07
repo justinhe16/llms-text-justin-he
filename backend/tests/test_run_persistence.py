@@ -891,3 +891,39 @@ async def test_a_failed_seed_reports_no_discovery_source_even_with_the_fallback_
     assert stats["discovery_source"] == "none"
     assert stats["urls_discovered"] == 0
     assert stats["pages_crawled"] == 0
+
+
+async def test_links_found_but_all_ranked_away_still_report_the_links_source(
+    websites_db: Pool,
+) -> None:
+    """The direct mirror of `test_a_sitemap_whose_urls_ranking_drops_does_not_fall_back_to_
+    links`, for the fallback path — and the reason `discovery_source` is decided on what
+    EXTRACTION found rather than on what ranking kept.
+
+    Every link on this seed page is structurally not worth fetching, so `select_urls` empties
+    the frontier and the run is a single-page one. `discovery_source` is still `"links"`,
+    exactly as a sitemap whose every URL is dropped still reports `"sitemap"`: the key names
+    where the frontier came from, and `urls_discovered`/`urls_selected` are what say how much
+    of it survived. Reporting `"none"` here would make a run that found six links
+    indistinguishable from one that found a blank page.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "all-ranked-away")
+    storage = FakeStorage()
+
+    seed_html = _links_page("/tag/releases", "/blog/2019/hello", "/feed.xml")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        if request.url.path == "/all-ranked-away":
+            return httpx.Response(200, html=seed_html)
+        raise AssertionError(f"select_urls should have dropped {request.url.path}")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["discovery_source"] == "links"
+    assert stats["urls_discovered"] == 3
+    assert stats["urls_selected"] == 0
+    assert stats["pages_crawled"] == 1
