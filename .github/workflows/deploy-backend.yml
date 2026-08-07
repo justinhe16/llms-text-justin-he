@@ -3,7 +3,8 @@ name: Deploy Backend
 # The only path to production. Merging to `main` migrates the database, deploys the image
 # to Fly, and then verifies from outside that the app came back healthy — in that order,
 # each job gated on the one before it, so application code never reaches production ahead
-# of the schema it needs. README.md "Deploy" is the operator-facing version.
+# of the schema it needs. ARCHITECTURE.md §7 is the authoritative deploy policy;
+# README.md "Deploy policy" is the operator-facing pointer to it.
 #
 # Path filtering here IS a `paths:` trigger, unlike ci-backend.yml and ci-frontend.yml,
 # and that difference is deliberate. Those two filter inside a `changes` job because
