@@ -9,6 +9,7 @@ end-to-end behaviour.
 """
 
 import inspect
+import time
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,105 @@ def test_disallow_slash_allows_nothing() -> None:
 
     assert rules.is_allowed("https://docs.test/") is False
     assert rules.is_allowed("https://docs.test/anything") is False
+
+
+# --- Glob edge cases --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("pattern", "url", "expected"),
+    [
+        # Leading "*" — an empty first segment, matched trivially at position 0.
+        ("*.pdf", "https://docs.test/guide.pdf", False),
+        ("*.pdf", "https://docs.test/guide.txt", True),
+        # Trailing "*" — an empty last segment; unanchored, so it degrades to a plain prefix
+        # match identical to the star-free pattern.
+        ("/docs*", "https://docs.test/docs/page", False),
+        ("/docs*", "https://docs.test/doc", True),
+        # Consecutive "**" — the empty middle segment does no work, so "**" behaves exactly
+        # like a single "*".
+        ("/a**b", "https://docs.test/axyzb", False),
+        ("/a**b", "https://docs.test/ab", False),
+        # The pattern "*" alone — matches every target, no matter its shape.
+        ("*", "https://docs.test/anything/at/all", False),
+        # The pattern "/" alone — no wildcard at all, an ordinary prefix match against every
+        # path (the same case `test_disallow_slash_allows_nothing` pins end to end).
+        ("/", "https://docs.test/", False),
+        ("/", "https://docs.test/anything", False),
+        # "$" appearing anywhere other than the final character is a literal, per the de facto
+        # standard — this pattern is NOT end-anchored.
+        ("/a$b", "https://docs.test/a$b", False),
+        ("/a$b", "https://docs.test/a", True),
+    ],
+)
+def test_glob_edge_cases(pattern: str, url: str, expected: bool) -> None:
+    text = f"User-agent: *\nDisallow: {pattern}\n"
+
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+
+    assert rules.is_allowed(url) is expected
+
+
+# --- ReDoS resistance ---------------------------------------------------------------------------
+
+
+def test_a_hostile_many_wildcard_pattern_returns_promptly() -> None:
+    """The exact reproduction from the code-review finding this test exists to pin down: a
+    regex-based translation of this pattern (`".*".join(re.escape(seg) for seg in
+    pattern.split("*"))`, what `_compile` built before this ticket) is catastrophically
+    backtracking against a target that satisfies every wildcard's prefix but never reaches the
+    trailing literal — `is_allowed` runs synchronously, inline, on the worker's single event
+    loop (module docstring's "wildcards" section), so a hang here is not merely slow, it
+    freezes every OTHER crawl sharing that worker process. The bound below is generous — the
+    greedy glob matcher this ticket replaced it with returns in microseconds — but real: it is
+    what makes this test fail loudly if an exponential matcher ever comes back.
+    """
+    pattern = "/" + "a*" * 25 + "Z"
+    text = f"User-agent: *\nDisallow: {pattern}\n"
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+    url = "http://example.com/" + "a" * 60  # matches every "a*" prefix, never reaches "Z"
+
+    start = time.monotonic()
+    result = rules.is_allowed(url)
+    elapsed = time.monotonic() - start
+
+    assert result is True  # the trailing "Z" is never found -> not disallowed
+    assert elapsed < 0.5, f"is_allowed took {elapsed:.3f}s — the matcher is backtracking again"
+
+
+def test_a_hostile_dollar_anchored_pattern_that_cannot_match_returns_promptly() -> None:
+    """Same adversarial shape, `$`-anchored — `_matches`'s anchored branch is a different code
+    path (module docstring) from its unanchored one and needs its own coverage: a target that
+    satisfies every `a*` prefix but can never satisfy the anchor, because it does not end in
+    `Z` at all."""
+    pattern = "/" + "a*" * 25 + "Z$"
+    text = f"User-agent: *\nDisallow: {pattern}\n"
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+    url = "http://example.com/" + "a" * 60  # ends in "a", never "Z"
+
+    start = time.monotonic()
+    result = rules.is_allowed(url)
+    elapsed = time.monotonic() - start
+
+    assert result is True
+    assert elapsed < 0.5, f"is_allowed took {elapsed:.3f}s — the matcher is backtracking again"
+
+
+def test_many_consecutive_wildcards_against_a_long_target_return_promptly() -> None:
+    """`****...*` collapses to a single `*` (the "glob edge cases" section above), and this
+    pins that the collapse is genuinely O(n) rather than, say, a `_matches` call that still
+    walks fifty empty segments against a long target quadratically."""
+    pattern = "/" + "*" * 50
+    text = f"User-agent: *\nDisallow: {pattern}\n"
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+    url = "http://example.com/" + "a" * 5000
+
+    start = time.monotonic()
+    result = rules.is_allowed(url)
+    elapsed = time.monotonic() - start
+
+    assert result is False  # "/" followed by any run of "*" matches everything under the root
+    assert elapsed < 0.5, f"is_allowed took {elapsed:.3f}s"
 
 
 # --- Percent-encoding --------------------------------------------------------------------------

@@ -86,15 +86,38 @@ routinely sits between two `User-agent` lines in a real file (`tests/fixtures/ro
 .txt` has one), and treating it as a rule would incorrectly split what the file intends as one
 group into two.
 
-**Wildcards: `*` (any run of characters) and `$` (anchors the match to the end).** Each
-`Allow`/`Disallow` pattern becomes a regex by escaping every literal run between `*`s and
-joining them with `.*`, then anchoring the whole thing at the start always and at the end only
-when the pattern itself ends in `$` — `re.match`'s own prefix semantics already give the
-"matches this path or anything under it" behaviour a bare pattern like `/docs` wants.
-Compilation is memoized with a module-level `@lru_cache` — a pure function of the pattern
-string, so caching it introduces no state this module's "no I/O, no clock" contract would be
-broken by; it exists because the same handful of patterns from one `robots.txt` are tested
-against every candidate URL in a run's frontier.
+**Wildcards: `*` (any run of characters) and `$` (anchors the match to the end) — matched by a
+greedy, non-backtracking glob, never by a regex.** An earlier revision of this module compiled
+each pattern into a regex — `.*`.join of the literal runs between `*`s, escaped, anchored at
+the start always and at the end only when the pattern itself ends in `$`. That is the
+textbook translation, and it is also the textbook way to build a catastrophically backtracking
+regex: a pattern with many `*`s tested against a target that satisfies every wildcard's prefix
+but never reaches the final literal makes the engine try every split point of every `.*`
+against every other before it can report failure, which is exponential in the number of
+wildcards. `is_allowed` runs synchronously, inline, on the CRAWL phase's single event loop —
+called from `crawler.py`'s seed check and `url_ranking.py`'s per-candidate frontier check —
+with no timeout and no thread/process offload, and a hang there cannot be interrupted by
+`crawl_site`'s own `asyncio.timeout` or arq's `job_timeout`, both of which only take effect at
+the next `await`. With `max_jobs = 2` and no tenant isolation in this codebase (§4 of
+`ARCHITECTURE.md`), one user's hostile `robots.txt` would freeze every other user's crawl
+sharing that worker process. So this module uses the algorithm Google's own open-sourced
+`robots.txt` parser uses instead: `_compile` splits a pattern's body on `*` into a tuple of
+literal segments (a `$` at the end sets `anchored` and is stripped first; a `$` anywhere else
+is just a literal character, since it has no other meaning in this grammar) and `_matches`
+walks them in order — the first segment must match at position 0 (prefix semantics), every
+following segment is located with a single `str.find` from wherever the previous one ended,
+and, when `anchored`, the final segment must land exactly at the end of the target without
+overlapping the previous match. An unanchored pattern succeeds the moment every segment has
+been located in order; the rest of the target is free, which is what gives a bare pattern like
+`/docs` its "matches this path or anything under it" behaviour. Every step is a fast C-level
+`str.startswith`/`str.find`/`str.endswith` call, the work done is linear in
+`len(pattern) + len(target)` by construction, and there is no split point to backtrack over —
+no input can make this take longer than a linear scan. Compilation is memoized with a
+module-level `@lru_cache`, now caching the parsed `(segments, anchored)` pair rather than a
+compiled regex — still a pure function of the pattern string, so caching it introduces no
+state this module's "no I/O, no clock" contract would be broken by; it exists because the same
+handful of patterns from one `robots.txt` are tested against every candidate URL in a run's
+frontier.
 
 **Longest match wins, `Allow` wins an exact tie, and "longest" means the length of the RULE
 PATTERN — `*` and `$` included — not of what it matched.** That is how the de facto standard
@@ -122,11 +145,18 @@ never sent to a server and is dropped before comparison, the same rule `internal
 .py`'s own normalization step applies.
 
 **Defensive ceilings, the same role `internals/links.py`'s `MAX_LINKS` plays for a hostile
-page:** `MAX_LINES` bounds how much of a `robots.txt` body this module will even scan (a
-hostile or merely enormous file cannot make this module do unbounded work), and `MAX_RULES`
-bounds how many `Allow`/`Disallow` entries the winning group(s) contribute regardless of how
-many the file declares, kept in file order — a thousand real, distinct path rules is already
-far beyond any file this crawler will meet in practice.
+page — and what they do NOT cover.** `MAX_LINES` bounds how much of a `robots.txt` body this
+module will even scan (a hostile or merely enormous file cannot make this module do unbounded
+*parsing* work), and `MAX_RULES` bounds how many `Allow`/`Disallow` entries the winning
+group(s) contribute regardless of how many the file declares, kept in file order — a thousand
+real, distinct path rules is already far beyond any file this crawler will meet in practice.
+Neither one bounds the cost of matching a SINGLE pattern against a SINGLE URL — a file with
+one line and no lines to spare could still carry a pattern expensive to match if the matcher
+itself allowed it. That is why the matcher is linear-time BY CONSTRUCTION rather than merely
+bounded from outside: see the "wildcards" section above for the algorithm and why a
+regex-based one was replaced rather than capped. `is_allowed` has no timeout of its own and
+runs inline on the worker's single event loop, so "some inputs are slow" was never an option
+this module could patch around — every input has to be fast.
 """
 
 import logging
@@ -200,18 +230,73 @@ def _normalize_encoding(value: str) -> str:
     return "".join(pieces)
 
 
+@dataclass(frozen=True, slots=True)
+class _CompiledPattern:
+    """One `Allow`/`Disallow` pattern, pre-split for `_matches` — private to this module. See
+    the module docstring's "wildcards" section for the algorithm this supports."""
+
+    segments: tuple[str, ...]
+    """The pattern's body (the `$`, if any, already stripped), split on `*`. Always at least
+    one element — a pattern with no `*` at all is a single segment, matched as a plain prefix
+    (or, if `anchored`, an exact string)."""
+
+    anchored: bool
+    """Whether the original pattern ended in `$` — the final segment in `segments` must then
+    land exactly at the end of the target, rather than merely being found somewhere in it."""
+
+
 @lru_cache(maxsize=1024)
-def _compile(pattern: str) -> re.Pattern[str]:
-    """Compile one `Allow`/`Disallow` pattern into a regex — `*` becomes `.*`, and a trailing
-    `$` anchors the match to the end rather than allowing it as an ordinary prefix match.
+def _compile(pattern: str) -> _CompiledPattern:
+    """Split one `Allow`/`Disallow` pattern into `_matches`'s segment form — a trailing `$`
+    anchors the match to the end rather than allowing it as an ordinary prefix match; a `$`
+    anywhere else is a literal character, per the module docstring's "wildcards" section.
 
     Memoized: a pure function of `pattern` alone, so caching it adds no state this otherwise
-    I/O-free module would not already have — see the module docstring's "wildcards" section.
+    I/O-free module would not already have — it exists because the same handful of patterns
+    from one `robots.txt` are tested against every candidate URL in a run's frontier.
     """
     anchored = pattern.endswith("$")
     body = pattern[:-1] if anchored else pattern
-    regex = ".*".join(re.escape(segment) for segment in body.split("*"))
-    return re.compile("^" + regex + ("$" if anchored else ""))
+    return _CompiledPattern(segments=tuple(body.split("*")), anchored=anchored)
+
+
+def _matches(compiled: _CompiledPattern, target: str) -> bool:
+    """Does `target` match `compiled`? The greedy, non-backtracking glob algorithm the module
+    docstring's "wildcards" section describes — no regex, and no case that takes longer than a
+    linear scan of `target`.
+
+    The first segment is matched with `str.startswith` at position 0 (prefix semantics); every
+    later segment is located with a single `str.find` from wherever the previous one ended. An
+    empty segment — from a leading, trailing, or doubled `*` — matches at the current position
+    with no work to do, which is exactly right: `**` means the same thing as `*`. When
+    `compiled.anchored`, the LAST segment is a special case instead of an ordinary `find`: it
+    must end exactly at `len(target)`, and the position it would start at must not fall before
+    the previous match, so the match cannot overlap itself.
+    """
+    segments = compiled.segments
+    first = segments[0]
+    if not target.startswith(first):
+        return False
+    if len(segments) == 1:
+        # No `*` in the pattern at all — the first segment is also the only one.
+        return not compiled.anchored or len(target) == len(first)
+
+    pos = len(first)
+    last = len(segments) - 1
+    for index in range(1, len(segments)):
+        segment = segments[index]
+        if index == last and compiled.anchored:
+            start = len(target) - len(segment)
+            if start < pos or target[start:] != segment:
+                return False
+            pos = len(target)
+        elif segment:
+            found = target.find(segment, pos)
+            if found == -1:
+                return False
+            pos = found + len(segment)
+        # else: an empty middle/last-unanchored segment needs no work — see docstring.
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,13 +351,15 @@ class RobotsRules:
         target = _normalize_encoding(target)
 
         disallow_lengths = [
-            len(pattern) for pattern in self.disallow if _compile(pattern).match(target)
+            len(pattern) for pattern in self.disallow if _matches(_compile(pattern), target)
         ]
         if not disallow_lengths:
             return True
         best_disallow = max(disallow_lengths)
 
-        allow_lengths = [len(pattern) for pattern in self.allow if _compile(pattern).match(target)]
+        allow_lengths = [
+            len(pattern) for pattern in self.allow if _matches(_compile(pattern), target)
+        ]
         best_allow = max(allow_lengths) if allow_lengths else -1
         return best_allow >= best_disallow
 
