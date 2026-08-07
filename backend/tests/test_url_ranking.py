@@ -218,6 +218,40 @@ def test_duplicate_normalized_urls_keep_only_the_first_occurrence(first: str, se
     _assert_reconciles(result)
 
 
+def test_duplicate_metadata_is_merged_order_independently() -> None:
+    """A duplicate's `priority`/`lastmod` are folded into the surviving candidate rather
+    than discarded, so a URL's score never depends on which of its discoveries came first.
+
+    This is the shape PER-176 will actually produce: link extraction rediscovers a page the
+    sitemap already listed, carrying neither field (`source="links"` populates neither), and
+    a sitemap entry may carry `priority` while another carries `lastmod`. Keeping only the
+    first occurrence's metadata would make the result depend on input order — silently, and
+    in the one place this module promises the opposite.
+    """
+    later = _dt(20)
+    split_across_two = [
+        _url(f"{SEED}/docs/intro", priority=0.9),
+        _url(f"{SEED}/docs/intro", lastmod=later, source="links"),
+        _url(f"{SEED}/guide/deploy", priority=0.5, lastmod=later),
+    ]
+    both_on_one = [
+        _url(f"{SEED}/docs/intro", priority=0.9, lastmod=later),
+        _url(f"{SEED}/guide/deploy", priority=0.5, lastmod=later),
+    ]
+
+    forward = select_urls(split_across_two, seed_url=SEED, limit=2)
+    reversed_ = select_urls(list(reversed(split_across_two)), seed_url=SEED, limit=2)
+    merged = select_urls(both_on_one, seed_url=SEED, limit=2)
+
+    assert forward.selected == reversed_.selected
+    # The merge is not merely stable, it is *correct*: the surviving candidate ranks exactly
+    # as if one discovery had carried both fields all along.
+    assert forward.selected == merged.selected
+    assert forward.dropped["duplicate"] == 1
+    _assert_reconciles(forward)
+    _assert_reconciles(reversed_)
+
+
 def test_path_case_is_never_normalized_so_it_does_not_cause_a_false_duplicate() -> None:
     """Paths are case-sensitive on the servers that host them; only the host is
     case-folded (module docstring, step 1). `/DOCS/intro` and `/docs/intro` are two
@@ -275,6 +309,29 @@ def test_off_origin_comparison_collapses_the_schemes_default_port() -> None:
 
     assert result.selected == [f"{SEED}:443/docs/intro"]
     assert result.dropped == {}
+
+
+@pytest.mark.parametrize(
+    "seed,path",
+    [
+        pytest.param("https://[2001:db8::1]:8080", "/docs/intro", id="ipv6-with-port"),
+        pytest.param("https://[2001:db8::1]", "/docs/intro", id="ipv6-no-port"),
+        pytest.param("https://[::1]:3000", "/es/docs/intro", id="ipv6-locale-stripped"),
+    ],
+)
+def test_ipv6_hosts_round_trip_through_normalization_without_corruption(
+    seed: str, path: str
+) -> None:
+    """`urlsplit().hostname` strips the brackets from an IPv6 literal, so rebuilding an
+    authority as `f"{host}:{port}"` yields `2001:db8::1:8080` — a string that reparses with
+    hostname `2001` and raises on `.port`. `_authority` puts the brackets back. The locale
+    case is here because `_leading_locale_free_url` rebuilds the authority a second time,
+    on a different code path, and an IPv6 host has to survive that one too."""
+    result = select_urls([_url(f"{seed}{path}")], seed_url=seed, limit=10)
+
+    assert result.selected == [f"{seed}{path}"]
+    assert result.dropped == {}
+    _assert_reconciles(result)
 
 
 @pytest.mark.parametrize(
@@ -468,11 +525,13 @@ def test_over_limit_counts_every_survivor_beyond_the_cap() -> None:
 
 def _synthetic_candidates() -> list[DiscoveredUrl]:
     """A candidate set spanning every rule at least once, with no two candidates sharing a
-    normalized URL — see `tests/fixtures/candidates_docs_site.json`'s generator for why
-    duplicate-with-differing-metadata candidates are deliberately excluded from a shuffle
-    test: which literal duplicate "wins" is order-dependent by the rule's own definition
-    (module docstring), so a shuffle test needs a candidate set that never puts that
-    order-dependence to the test.
+    normalized URL.
+
+    Duplicates are kept out of this particular set only to keep the two tests below
+    reasoning about one thing each — *not* because a duplicate would make the selection
+    order-dependent. It would not: a duplicate's metadata is merged into the survivor
+    commutatively (module docstring), which
+    `test_duplicate_metadata_is_merged_order_independently` covers directly.
     """
     return [
         _url(f"{SEED}/docs/getting-started", priority=0.9, lastmod=_dt(2)),

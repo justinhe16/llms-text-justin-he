@@ -34,8 +34,12 @@ next to its one consumer instead of in the shared schemas module.
 2. **Pre-filter drop rules.** Cheap, stateless checks (origin, path shape, query shape) run
    before scoring so that scoring never has to reason about URLs that were never going to be
    selected — a `/tag/`, `/2019/03/`, or off-origin URL gains nothing by being scored high.
-   Cross-candidate state is limited to the one thing pre-filtering genuinely needs: a set of
-   normalized URLs already seen, for `"duplicate"`.
+   Cross-candidate state is limited to what pre-filtering genuinely needs: a set of
+   normalized URLs already seen, for `"duplicate"`, and — when a duplicate's normalized URL
+   already survived pre-filtering — an order-independent merge of its `priority` (the max of
+   the non-`None` values seen) and `lastmod` (the latest of the non-`None` values seen) into
+   the surviving candidate, so a URL's score never depends on which of its several
+   discoveries `select_urls` happened to visit first.
 3. **Score.** Only survivors are scored, deterministically and without a clock — see the
    weight constants below for the reasoning behind each term's magnitude.
 4. **Sort** by `(-score, url)`. The URL tie-break is what makes the whole pipeline
@@ -63,6 +67,18 @@ codebase, and this rule is deliberately the same equality it already uses for
 `UNIQUE (user_id, origin)`. It is not imported (ARCHITECTURE.md §3.1 forbids importing
 another feature's `internals/`); only the small piece needed — collapsing a default port —
 is reimplemented here.
+
+**Why a duplicate's metadata is merged rather than discarded.** PER-176's link extraction
+will routinely rediscover a URL a sitemap already listed — the same page, now carrying no
+`lastmod`/`priority` at all (`source="links"` never populates either field). Simply keeping
+whichever `DiscoveredUrl` `select_urls` happened to visit first would make a page's score
+depend on `candidates`' input order — silently, and in the one place this module promises
+the opposite (`select_urls`'s own docstring, and the determinism tests in
+`tests/test_url_ranking.py`). `_merge_priority` and `_merge_lastmod` are commutative and
+associative — the larger of two priorities, and the later of two `lastmod` values, do not
+care which argument arrived first — so folding every duplicate of a survivor into one merged
+entry, encountered in any order, always produces the same merged candidate and therefore the
+same score.
 
 **The reconciliation invariant.** For any call, `discovered_count == len(selected) +
 sum(dropped.values())`. Every candidate is either selected or dropped under exactly one
@@ -165,7 +181,11 @@ none of those are in this set, so none of them are ever mistaken for a locale pr
 is a genuine edge case (it is both the ISO 639-1 code for Indonesian and a plausible generic
 path segment elsewhere); it stays in this set because the false negative — failing to fold a
 real `/id/docs/...` Indonesian docs tree — is the more common shape on a documentation site,
-and the pattern below still requires an exact, whole-segment match, not a substring."""
+and the pattern below still requires an exact, whole-segment match, not a substring. `"no"`
+(Norwegian) is the same tradeoff for the same reason — a documentation site is far more
+likely to have a `/no/` Norwegian docs tree than a path segment that abbreviates "no" on its
+own (`no-code` and `no-op` are never a bare `no` segment, since the pattern below requires
+the whole segment to match, not a prefix)."""
 
 _LOCALE_SEGMENT_PATTERN: Final = re.compile(r"^([a-z]{2,3})(-[a-z]{2,4})?$", re.IGNORECASE)
 """A locale segment: a 2-3 letter language code, optionally followed by a hyphenated region
@@ -335,6 +355,24 @@ def _normalize_query(raw_query: str) -> str:
     return urlencode(kept)
 
 
+def _authority(host: str, port: int | None) -> str:
+    """Rebuild a URL's authority component from an already-parsed host and optional port.
+
+    `urlsplit().hostname` strips the brackets from an IPv6 literal (`[2001:db8::1]` becomes
+    `2001:db8::1`), but the authority component of a URL requires them back — without this,
+    `f"{host}:{port}"` on an IPv6 host produces a string with three-or-more colons that does
+    not round-trip through `urlsplit` at all (it reparses with the wrong hostname and raises
+    on `.port`). `websites/internals/url_normalize.py` already carries this exact fix, next
+    to an identical comment; it is reimplemented here — this one small piece of it, not
+    imported — for the same reason `_DEFAULT_PORTS`'s docstring gives. The only caller-visible
+    difference from that module: brackets are added whenever `host` contains a colon, even
+    with no `port` at all, since an unbracketed IPv6 literal on its own is exactly as
+    unparseable as one with a port glued on.
+    """
+    bracketed = f"[{host}]" if ":" in host else host
+    return bracketed if port is None else f"{bracketed}:{port}"
+
+
 def _parse_candidate(url: str) -> _NormalizedCandidate | None:
     """Normalize `url` per the module docstring's step 1, or return `None`.
 
@@ -356,7 +394,7 @@ def _parse_candidate(url: str) -> _NormalizedCandidate | None:
     except ValueError:
         return None
 
-    authority = host if port is None else f"{host}:{port}"
+    authority = _authority(host, port)
     path = _normalize_path(parts.path)
     query = _normalize_query(parts.query)
     normalized_url = f"{parts.scheme}://{authority}{path}"
@@ -442,7 +480,7 @@ def _leading_locale_free_url(candidate: _NormalizedCandidate) -> str | None:
 
     remaining = segments[1:]
     stripped_path = "/" + "/".join(remaining) if remaining else "/"
-    authority = candidate.host if candidate.port is None else f"{candidate.host}:{candidate.port}"
+    authority = _authority(candidate.host, candidate.port)
     url = f"{candidate.scheme}://{authority}{stripped_path}"
     if candidate.query:
         url = f"{url}?{candidate.query}"
@@ -463,6 +501,37 @@ def _to_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _merge_priority(existing: float | None, incoming: float | None) -> float | None:
+    """The larger of two declared `priority` values for the same normalized URL — `None`
+    only when both are. `None` is handled explicitly rather than folded into `max()` because
+    a genuinely declared `0.0` must beat a genuinely absent value, and `max(0.0, None)`
+    itself raises. Commutative and associative, which is what makes folding three or more
+    duplicates of the same URL, in any order, produce the same result — see the module
+    docstring's "Why a duplicate's metadata is merged" section and `select_urls`'s
+    duplicate-handling branch, the only caller.
+    """
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    return max(existing, incoming)
+
+
+def _merge_lastmod(existing: datetime | None, incoming: datetime | None) -> datetime | None:
+    """The later of two declared `lastmod` values for the same normalized URL — `None` only
+    when both are. Compared through `_to_utc` so a naive/aware mix can never raise, the same
+    landmine `_to_utc` itself documents — but the value RETURNED is whichever original
+    `datetime` won, not a UTC-normalized copy, because `_score` already calls `_to_utc` again
+    wherever it reads a `lastmod`; this function does not need to be the only place that
+    normalizes one. Commutative and associative for the same reason `_merge_priority` is.
+    """
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    return existing if _to_utc(existing) >= _to_utc(incoming) else incoming
 
 
 def _recency_term(
@@ -533,11 +602,12 @@ def select_urls(
 ) -> SelectionResult:
     """Rank `candidates` and select at most `limit` of them to crawl.
 
-    Pure and deterministic: no `async`, no network or filesystem access, no clock read, and
-    no dependency on `candidates`' order beyond `"duplicate"`'s own well-defined "first
-    occurrence wins" rule (see its entry in the module docstring's pre-filter table). Calling
-    this twice with the same arguments, or once with `candidates` shuffled, produces the same
-    `selected` list — `tests/test_url_ranking.py` asserts both directly.
+    Pure and deterministic: no `async`, no network or filesystem access, and no clock read.
+    Calling this twice with the same arguments, or once with `candidates` shuffled into any
+    order, produces the same `selected` list — including when the same URL is discovered
+    more than once with different `priority`/`lastmod` values, which is exactly what
+    `"duplicate"`'s order-independent metadata merge (module docstring) guarantees.
+    `tests/test_url_ranking.py` asserts both directly.
 
     Args:
         candidates: Every URL a discovery step found, in whatever order it found them.
@@ -545,7 +615,13 @@ def select_urls(
             compared against it for the `"seed"` and `"off_origin"` rules. Not itself
             included in `selected` even if a candidate happens to be a byte-for-byte repeat
             of it, because the seed is fetched separately (`crawl_site`'s own first fetch)
-            and already counts against the run's page cap.
+            and already counts against the run's page cap. If `seed_url` itself cannot be
+            parsed — a defensive case, since `crawl_site` has already fetched it
+            successfully by the time this runs, not an expected one — every candidate fails
+            the `"off_origin"` comparison against an origin that cannot be determined, and
+            `selected` comes back empty. Failing CLOSED here is deliberate: failing open
+            (treating an unparseable seed as "no origin restriction") would silently defeat
+            the one rule `"off_origin"` exists for.
         limit: The maximum number of URLs to select. `limit <= 0` returns an empty
             `selected` without raising — every surviving candidate is counted under
             `"over_limit"` instead.
@@ -565,7 +641,10 @@ def select_urls(
     seed_origin = _origin(seed_candidate) if seed_candidate is not None else None
 
     seen: set[str] = set()
-    survivors: list[tuple[_NormalizedCandidate, float | None, datetime | None]] = []
+    # Keyed by normalized URL rather than a plain list, so a later duplicate of an already-
+    # surviving candidate can be folded into it (see the module docstring's "Why a
+    # duplicate's metadata is merged" section) instead of merely being counted and discarded.
+    survivors: dict[str, tuple[_NormalizedCandidate, float | None, datetime | None]] = {}
 
     for candidate in candidates:
         normalized = _parse_candidate(candidate.url)
@@ -574,6 +653,21 @@ def select_urls(
             continue
         if normalized.url in seen:
             _drop("duplicate")
+            # `existing` is `None` when the first occurrence of this URL was itself dropped
+            # by a rule below (e.g. "dated_archive") rather than surviving — there is no
+            # entry to merge into, and this duplicate's metadata is discarded exactly as
+            # before. When `existing` IS present, folding this candidate's `priority`/
+            # `lastmod` into it — via `_merge_priority`/`_merge_lastmod`, both commutative
+            # and associative — is what keeps the survivor's score independent of which
+            # duplicate `select_urls` happened to visit first.
+            existing = survivors.get(normalized.url)
+            if existing is not None:
+                existing_normalized, existing_priority, existing_lastmod = existing
+                survivors[normalized.url] = (
+                    existing_normalized,
+                    _merge_priority(existing_priority, candidate.priority),
+                    _merge_lastmod(existing_lastmod, candidate.lastmod),
+                )
             continue
         seen.add(normalized.url)
 
@@ -599,9 +693,11 @@ def select_urls(
             _drop("changelog")
             continue
 
-        survivors.append((normalized, candidate.priority, candidate.lastmod))
+        survivors[normalized.url] = (normalized, candidate.priority, candidate.lastmod)
 
-    lastmods_utc = [_to_utc(lastmod) for _c, _p, lastmod in survivors if lastmod is not None]
+    lastmods_utc = [
+        _to_utc(lastmod) for _n, _p, lastmod in survivors.values() if lastmod is not None
+    ]
     earliest_lastmod = min(lastmods_utc) if lastmods_utc else None
     latest_lastmod = max(lastmods_utc) if lastmods_utc else None
 
@@ -616,7 +712,7 @@ def select_urls(
                 latest_lastmod=latest_lastmod,
             ),
         )
-        for normalized, priority, lastmod in survivors
+        for normalized, priority, lastmod in survivors.values()
     ]
     scored.sort(key=lambda pair: (-pair[1], pair[0].url))
 
