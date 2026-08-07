@@ -2,7 +2,6 @@
 
 import { useCallback, useMemo, useState } from "react";
 
-import { useUser } from "@/lib/auth/use-user";
 import { useStatusChangeHighlight } from "@/lib/crawls/use-status-change-highlight";
 import { DEFAULT_SORT, nextSortState, sortWebsites, type SortKey } from "@/lib/crawls/sort";
 import { useWebsites } from "@/lib/query/use-websites";
@@ -29,7 +28,6 @@ export function CrawlsView() {
   const { data, error, isPending, isFetching, refetch } = useWebsites({
     include: "latest_run",
   });
-  const { user } = useUser();
   const [sort, setSort] = useState(DEFAULT_SORT);
 
   const highlighted = useStatusChangeHighlight(data);
@@ -82,7 +80,6 @@ export function CrawlsView() {
       <div className="hidden overflow-hidden rounded-xl border border-border bg-card md:block">
         <CrawlsTable
           websites={sorted}
-          currentUserId={user?.id ?? null}
           sort={sort}
           onSort={handleSort}
           highlighted={highlighted}

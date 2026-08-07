@@ -24,7 +24,6 @@ import { PlainHeader, SortHeader } from "./sort-header";
 
 interface CrawlsTableProps {
   websites: WebsiteListItem[];
-  currentUserId: string | null;
   sort: SortState;
   onSort: (key: SortKey) => void;
   /** Ids of rows whose status just changed — see lib/crawls/use-status-change-highlight.ts. */
@@ -45,7 +44,6 @@ interface CrawlsTableProps {
  */
 export function CrawlsTable({
   websites,
-  currentUserId,
   sort,
   onSort,
   highlighted,
@@ -128,7 +126,7 @@ export function CrawlsTable({
               </TableCell>
 
               <TableCell className="px-3">
-                <CrawlOwner userId={website.user_id} currentUserId={currentUserId} />
+                <CrawlOwner userId={website.user_id} />
               </TableCell>
             </TableRow>
           );

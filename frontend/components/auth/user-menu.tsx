@@ -12,13 +12,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { signOut } from "@/lib/auth/actions";
+import { initials } from "@/lib/auth/initials";
 import { useUser } from "@/lib/auth/use-user";
 import { createClient } from "@/lib/supabase/client";
-
-function initials(displayName: string): string {
-  const trimmed = displayName.trim();
-  return trimmed ? trimmed.slice(0, 1).toUpperCase() : "?";
-}
 
 async function handleSignOut() {
   // Clear the browser client's own session first: this emits SIGNED_OUT

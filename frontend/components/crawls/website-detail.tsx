@@ -136,7 +136,7 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
                     <span aria-hidden="true" className="text-muted-foreground/40">
                       ·
                     </span>
-                    <CrawlOwner userId={website.user_id} currentUserId={user?.id ?? null} />
+                    <CrawlOwner userId={website.user_id} focusable />
                   </div>
                 </>
               )}
