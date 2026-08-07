@@ -1114,10 +1114,12 @@ threat model would.
 | `components/magicui/` | Magic UI components |
 | `components/crawls/` | App-specific composites built from the above |
 | `components/landing/` | The landing page's own composites — the URL field and the account chip |
+| `components/docs/` | `/docs`'s own composites — the pipeline diagram, and the one mark Lucide does not ship |
 | `components/auth/` | Sign-in / sign-out affordances and the client-side identity hook |
 
 Feature composites go in a directory named after the screen they belong to —
-`components/crawls/` for the crawls table and detail page, `components/landing/` for `/`.
+`components/crawls/` for the crawls table and detail page, `components/landing/` for `/`,
+`components/docs/` for `/docs`.
 Do not put app-specific logic into `components/ui/`; those files should stay close to what
 the generator produced so they can be regenerated. `components/magicui/` follows the same
 rule, with one deliberate carve-out: retuning a Magic UI component for this light palette,
@@ -1153,6 +1155,25 @@ invalidations stay defined once. What it *did* add to those two hooks is a
 `toastOnError` option, defaulting to the existing behaviour — because the landing page
 renders each failure under the field that caused it, and its two `409`s are navigations
 rather than errors to report at all.
+
+`lib/docs/` is the third instance, and the clearest illustration of where the line falls.
+`/docs` renders a pipeline diagram beside its prose; the diagram is seven buttons and six
+beams, and `components/docs/docs-diagram.tsx` is that markup and nothing else. The three
+things it needs that are not markup live here: `sections.ts`, the canonical list of stages
+that the diagram, the anchors and the smoke test all read so that no id is written down
+twice; `use-active-section.ts`, one `IntersectionObserver` deciding which stage the reader
+is looking at; and `scroll-to-section.ts`, which scrolls the document and decides — from
+`prefers-reduced-motion` — whether that scroll animates. Each is readable without knowing
+what the page looks like, which is the test.
+
+**Ids that cross a file boundary need a gate, because the compiler will not give you one.**
+`lib/docs/sections.ts` names heading ids; `rehype-slug` (wired in `next.config.ts`) derives
+those ids from the *text* of the headings in `app/docs/page.mdx`. Nothing type-checks the
+join, so renaming a heading turns a diagram node into a button that scrolls nowhere while
+`tsc`, eslint and `next build` all stay green. `frontend/scripts/smoke.mjs` loads the
+rendered page and fails when an id resolves to no `h2` — the same argument §8.5's smoke test
+makes about rendered output, applied to a string rather than a colour. A cross-file
+convention with no gate is a convention that is already broken somewhere.
 
 ### 8.5 Light theme only
 
