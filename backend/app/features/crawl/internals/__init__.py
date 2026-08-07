@@ -12,6 +12,9 @@ private, table-free I/O:
   `ByteBudget` that caps how many response bytes one run may accept in total.
 * `crawler.py` — `crawl_site`, the bounded loop that turns one `fetch_page` call into a run:
   the seed fetch, the frontier, and the six caps from `Settings`.
+* `sitemap.py` — `discover_sitemap_urls`, which fills that frontier before the loop runs:
+  `/sitemap.xml`, then `/sitemap_index.xml`, then whatever `robots.txt` declares, every fetch
+  going through `fetcher.py` (and therefore `ssrf.py`) exactly like the crawl loop's own.
 * `llms_txt.py` — `generate_llms_txt`, the stub seam (ARCHITECTURE.md §3.4, CLAUDE.md #9).
 
 Beside those sit this feature's **pure** modules, which do no I/O at all and are listed
@@ -20,9 +23,8 @@ separately for exactly that reason: `payload.py` (the bytes a run's pages are st
 page's HTML parsed into a title, a description, and a markdown body), and `url_ranking.py`
 (`select_urls`, a list of discovered URLs ranked and cut down to the ones worth spending a
 run's page budget on). `extract.py` is called by `fetcher.py`, once per fetched page that
-looks like HTML (PER-177). `url_ranking.py` is called by nothing today: wiring selection into
-the crawl loop — so that `crawl_site`'s `extra_urls` stops being an empty tuple — is PER-176
-(ARCHITECTURE.md §3.4).
+looks like HTML (PER-177). `url_ranking.py` is called by `service.py`, over whatever
+`sitemap.py` discovers, to build `crawl_site`'s `extra_urls` (PER-176).
 
 Like any other feature's `internals/`, this package is private: only
 `app.features.crawl.service` and this feature's own modules import from it. No other

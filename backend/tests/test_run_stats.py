@@ -20,10 +20,11 @@ def test_run_stats_version_is_2() -> None:
     assert RUN_STATS_VERSION == 2
 
 
-def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_two_keys() -> None:
+def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_five_keys() -> None:
     """`crawl_stats` — including `pages_empty_content`, `CrawlResult.stats`'s newest key — is
-    spread into the result verbatim; `links_emitted` and `version` are the only two keys
-    `build_run_stats` itself contributes."""
+    spread into the result verbatim; `links_emitted`, `discovery_source`, `urls_discovered`,
+    `urls_selected`, and `version` are the only five keys `build_run_stats` itself
+    contributes."""
     crawl_stats = {
         "pages_crawled": 3,
         "pages_failed": 1,
@@ -33,31 +34,68 @@ def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_two_keys(
         "pages_empty_content": 2,
     }
 
-    stats = build_run_stats(crawl_stats, links_emitted=3)
+    stats = build_run_stats(
+        crawl_stats,
+        links_emitted=3,
+        discovery_source="sitemap",
+        urls_discovered=5,
+        urls_selected=3,
+    )
 
     assert stats == {
         **crawl_stats,
         "links_emitted": 3,
+        "discovery_source": "sitemap",
+        "urls_discovered": 5,
+        "urls_selected": 3,
         "version": RUN_STATS_VERSION,
     }
 
 
 def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
     """Every key `crawl_stats` arrived with survives into the result with its original value,
-    alongside the two this module contributes.
+    alongside the five this module contributes.
 
     Deliberately NOT a collision test. `build_run_stats` spreads `{**crawl_stats, ...}`, so a
-    `crawl_stats` that already carried `links_emitted` or `version` would have that value
+    `crawl_stats` that already carried one of the five contributed keys would have that value
     OVERWRITTEN, not preserved — asserting otherwise here would be asserting the opposite of
     what the code does. The real guarantee, as `build_run_stats`' own docstring states, is
-    that neither name is one `CrawlResult.stats` has ever produced, which is a property of
-    `internals/crawler.py` rather than of this function; `tests/test_crawler_caps.py` is where
-    that side of it is pinned down."""
+    that none of the five is a key `CrawlResult.stats` has ever produced, which is a property
+    of `internals/crawler.py` rather than of this function; `tests/test_crawler_caps.py` is
+    where that side of it is pinned down."""
     crawl_stats = {"pages_crawled": 1, "pages_empty_content": 0}
 
-    stats = build_run_stats(crawl_stats, links_emitted=1)
+    stats = build_run_stats(
+        crawl_stats,
+        links_emitted=1,
+        discovery_source="none",
+        urls_discovered=0,
+        urls_selected=0,
+    )
 
     assert stats["pages_crawled"] == 1
     assert stats["pages_empty_content"] == 0
     assert stats["links_emitted"] == 1
+    assert stats["discovery_source"] == "none"
+    assert stats["urls_discovered"] == 0
+    assert stats["urls_selected"] == 0
     assert stats["version"] == RUN_STATS_VERSION
+
+
+def test_build_run_stats_carries_the_discovery_counters() -> None:
+    """The three PER-176 keys land with exactly the values passed in — a narrower,
+    single-purpose companion to the "adds five keys" test above, named for the acceptance
+    criterion it pins rather than for the mechanics of the dict spread."""
+    crawl_stats = {"pages_crawled": 4, "pages_empty_content": 0}
+
+    stats = build_run_stats(
+        crawl_stats,
+        links_emitted=4,
+        discovery_source="robots",
+        urls_discovered=7,
+        urls_selected=3,
+    )
+
+    assert stats["discovery_source"] == "robots"
+    assert stats["urls_discovered"] == 7
+    assert stats["urls_selected"] == 3

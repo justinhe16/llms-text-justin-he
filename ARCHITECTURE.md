@@ -331,16 +331,27 @@ JavaScript-shell case that flag exists to measure: a shell is real HTML with a r
 `<title>`, `extract_content` deliberately keeps it, and discarding it here would be exactly
 the branch this paragraph forbids.
 
-**A second exception, still unwired: `internals/url_ranking.py`.** Unlike `extract.py` above,
-nothing calls this one yet. `select_urls(candidates, *, seed_url, limit) -> SelectionResult`
-turns the URLs a discovery step found into the subset worth spending a run's page budget on.
-It normalizes every candidate, drops the ones structurally not worth fetching under named,
-individually-counted rules (dated archives, `/tag/` and `/author/` taxonomies, pagination,
-feeds, changelogs, off-origin links, and localized duplicates of a page already chosen),
-scores the rest on path shape plus the sitemap's own `<priority>` and `<lastmod>`, and takes
-the top `limit`. Pure and clock-free like `extract.py`, `payload.py`, and `run_stats.py`, and
-**called by nothing today**: `crawl_site`'s `extra_urls` is still an empty tuple, and wiring
-discovery and selection into it is PER-176.
+**Sitemap discovery and URL ranking, wired together as of PER-176.**
+`internals/sitemap.py`'s `discover_sitemap_urls(client, origin, *, budget, settings,
+resolver=None) -> DiscoveryResult` fills the crawl frontier before `crawl_site`'s own loop
+runs: it walks the sitemap protocol's own discovery order for one website's origin —
+`/sitemap.xml`, then `/sitemap_index.xml`, then whatever `robots.txt` itself declares —
+recurses one level into a `<sitemapindex>`, and returns the same-origin `<url><loc>` entries
+it found as `DiscoveredUrl`s, under three bounds: a document-fetch counter
+(`crawl_sitemap_max_documents`, counting every attempt regardless of outcome), an
+accumulated-URL cap (`crawl_sitemap_max_urls`), and a byte-budget SHARE (a fixed fraction of
+the run's own `crawl_max_bytes`, so a huge sitemap cannot starve the page crawl that follows
+it — see that module's own docstring for the numbers). `internals/url_ranking.py`'s
+`select_urls(candidates, *, seed_url, limit) -> SelectionResult` then turns whatever discovery
+found into the subset worth spending a run's page budget on. It normalizes every candidate,
+drops the ones structurally not worth fetching under named, individually-counted rules (dated
+archives, `/tag/` and `/author/` taxonomies, pagination, feeds, changelogs, off-origin links,
+and localized duplicates of a page already chosen), scores the rest on path shape plus the
+sitemap's own `<priority>` and `<lastmod>`, and takes the top `limit`. Both modules are pure
+and clock-free like `extract.py`, `payload.py`, and `run_stats.py` — `sitemap.py` is the one
+exception that does I/O in this pairing, since finding URLs to rank means fetching a sitemap.
+`CrawlService.execute_run` (`service.py`) calls the two in sequence, discovery then selection,
+and passes `SelectionResult.selected` as `crawl_site`'s `extra_urls`.
 
 The distinction that matters is *where* that ranking sits. It runs entirely **before** any
 page is fetched, so it ranks on URL shape and sitemap metadata only — "fetch it and see
@@ -355,18 +366,27 @@ the order a sitemap or a set of racing fetches happened to yield them in. That i
 upstream half of the guarantee `internals/llms_txt.py`'s own docstring makes for the artifact.
 Its per-rule `SelectionResult.dropped` counters reconcile exactly — `discovered_count ==
 len(selected) + sum(dropped.values())`, every candidate either selected or dropped under
-exactly one rule — and recording them in `runs.stats` belongs to PER-176, not here.
+exactly one rule — and `runs.stats["discovery_source"]`, `["urls_discovered"]`, and
+`["urls_selected"]` record where the frontier came from and how it was cut down
+(`internals/run_stats.py`'s `build_run_stats`, still at `RUN_STATS_VERSION` 2 — PER-176 added
+three keys to an existing version rather than bumping it).
 
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
 table-free I/O to do may keep it in `internals/` anyway, as this one keeps `ssrf.py`,
-`fetcher.py`, and `crawler.py`. Every fetch, seed or redirect, passes `internals/ssrf.py`'s
-SSRF guard before a socket opens, and the crawl loop (`internals/crawler.py`) runs under six
-hard caps read from `Settings` — page count, wall-clock budget, total response bytes,
-per-request timeout, concurrency, and a politeness delay between request starts. Hitting one
-of those caps ends the crawl with whatever pages it already collected and is a **success**,
-not a failure; only the seed itself failing to fetch is treated as one, because a run with no
-pages at all has nothing to build an artifact from.
+`fetcher.py`, `crawler.py`, and `sitemap.py`. Every fetch, seed or redirect or a discovery
+document, passes `internals/ssrf.py`'s SSRF guard before a socket opens, and the crawl loop
+(`internals/crawler.py`) runs under six hard caps read from `Settings` — page count,
+wall-clock budget, total response bytes, per-request timeout, concurrency, and a politeness
+delay between request starts. Hitting one of those caps ends the crawl with whatever pages it
+already collected and is a **success**, not a failure; only the seed itself failing to fetch
+is treated as one, because a run with no pages at all has nothing to build an artifact from.
+Sitemap discovery is bounded the same way and fails the same way it succeeds: it spends from
+the SAME `ByteBudget` the page crawl does, under a fixed share of it, so `stats["cap_hit"] ==
+"bytes"` and `stats["bytes_fetched"]` stay honest about the one run-wide counter both phases
+share; and nothing discovery can do — a missing sitemap, malformed XML, an SSRF refusal, an
+exhausted cap — ever fails the run itself, the same "hitting a cap is a success" rule as the
+crawl loop's own six caps, one level earlier.
 
 ### 3.5 The database infrastructure layer
 
@@ -1244,15 +1264,17 @@ PUT    /websites/{id}/schedule
 Deliberately not decided here, and not to be decided by accident in an implementation PR:
 
 - **The crawler pipeline design.** That milestone has not been designed. Until it is,
-  everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Two pieces have landed,
-  both pure (§3.4): `internals/extract.py`, which turns one page's HTML into a title, a
-  description and a markdown body, and `internals/url_ranking.py`, which decides which
-  discovered URLs are worth fetching at all. The first is now **wired** — `internals/
-  fetcher.py` runs every HTML response through it, so a `CrawledPage` arrives at the seam
-  already parsed; the second is still called by nothing. Neither changes what remains
-  undecided, because both sit *upstream* of the seam: how *fetched* pages are ranked, what a
-  generated artifact selects and summarizes, and whether a model is involved at all are all
-  still open.
+  everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Three pieces have landed,
+  all pure or (for discovery) narrowly I/O-bound (§3.4): `internals/extract.py`, which turns
+  one page's HTML into a title, a description and a markdown body; `internals/sitemap.py`,
+  which discovers a website's candidate URLs from its sitemap; and `internals/url_ranking.py`,
+  which decides which of those discovered URLs are worth fetching at all. All three are now
+  **wired**: `internals/fetcher.py` runs every HTML response through `extract.py`, so a
+  `CrawledPage` arrives at the seam already parsed, and `service.py` runs `sitemap.py`'s
+  discovery through `url_ranking.py`'s selection to build `crawl_site`'s frontier before a
+  run's page fetches begin. Wiring changes nothing about what remains undecided, because all
+  three still sit *upstream* of the seam: how *fetched* pages are ranked, what a generated
+  artifact selects and summarizes, and whether a model is involved at all are all still open.
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**

@@ -39,7 +39,7 @@ from fastapi import HTTPException
 
 from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, CrawlResult, crawl_site
-from app.features.crawl.internals.fetcher import ByteBudgetExceededError, FetchError
+from app.features.crawl.internals.fetcher import ByteBudget, ByteBudgetExceededError, FetchError
 from app.features.crawl.internals.llms_txt import generate_llms_txt
 from app.features.crawl.internals.payload import (
     PAYLOAD_CONTENT_TYPE,
@@ -47,7 +47,9 @@ from app.features.crawl.internals.payload import (
     serialize_payload,
 )
 from app.features.crawl.internals.run_stats import build_run_stats
+from app.features.crawl.internals.sitemap import DiscoverySource, discover_sitemap_urls
 from app.features.crawl.internals.ssrf import SsrfBlockedError
+from app.features.crawl.internals.url_ranking import select_urls
 from app.features.crawl.schemas import CrawlOutcome
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
@@ -333,6 +335,13 @@ class CrawlService:
         result: CrawlResult | None = None
         links_emitted = 0
         outcome: CrawlOutcome | None = None
+        # Same hoisting reasoning as the three locals above: a seed failure never reaches the
+        # `discover_sitemap_urls`/`select_urls` call below, so `build_run_stats` in that path
+        # needs values to report rather than a `NameError`. "None" / 0 / 0 is exactly what a
+        # run that discovered nothing (or never got to discover) looks like.
+        discovery_source: DiscoverySource = "none"
+        urls_discovered = 0
+        urls_selected = 0
         # Set by the failure paths below when the attempt should be retried, and raised
         # AFTER the `try` rather than from inside it. Raising `TransientCrawlError` from within the
         # `try` would be caught by this method's own `except Exception` and turned into a
@@ -359,9 +368,31 @@ class CrawlService:
                 },
             )
 
-            # The network call, deliberately outside any transaction — see the module
-            # docstring's second paragraph.
-            result = await crawl_site(self._client, website.url, limits=limits)
+            # Two network calls, both outside every transaction (ARCHITECTURE.md §5.1).
+            # Discovery never fails a run: `discover_sitemap_urls` returns an empty result
+            # for a 404, malformed XML, an SSRF refusal, or an exhausted byte share, and logs
+            # the reason at WARNING — see that module's own docstring. `budget` is built
+            # BEFORE discovery runs and handed to both calls below, so the two share one
+            # run-wide byte cap rather than each getting its own (`crawl_site`'s `budget`
+            # parameter docstring has the other half of this).
+            budget = ByteBudget(limits.max_bytes)
+            discovery = await discover_sitemap_urls(
+                self._client, website.origin, budget=budget, settings=self._settings
+            )
+            selection = select_urls(
+                discovery.urls, seed_url=website.url, limit=limits.max_pages - 1
+            )
+            discovery_source = discovery.source
+            urls_discovered = len(discovery.urls)
+            urls_selected = len(selection.selected)
+
+            result = await crawl_site(
+                self._client,
+                website.url,
+                limits=limits,
+                extra_urls=selection.selected,
+                budget=budget,
+            )
 
             if result.seed_error is not None:
                 # WARNING, not ERROR, and a message of its own: a site that is down is an
@@ -378,7 +409,13 @@ class CrawlService:
                     result.seed_error,
                     attempts=attempts,
                     max_attempts=max_attempts,
-                    stats=build_run_stats(result.stats, links_emitted=links_emitted),
+                    stats=build_run_stats(
+                        result.stats,
+                        links_emitted=links_emitted,
+                        discovery_source=discovery_source,
+                        urls_discovered=urls_discovered,
+                        urls_selected=urls_selected,
+                    ),
                 )
             else:
                 llms_txt = generate_llms_txt(result.pages)
@@ -403,7 +440,13 @@ class CrawlService:
                     extra={"bytes": len(payload), "storage_path": storage_path},
                 )
 
-                stats = build_run_stats(result.stats, links_emitted=links_emitted)
+                stats = build_run_stats(
+                    result.stats,
+                    links_emitted=links_emitted,
+                    discovery_source=discovery_source,
+                    urls_discovered=urls_discovered,
+                    urls_selected=urls_selected,
+                )
                 await self._runs.record_success(
                     run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
                 )
@@ -433,7 +476,13 @@ class CrawlService:
             # line carries is the only record of the failure that will ever exist.
             logger.error("crawl: failed unexpectedly", exc_info=True)
             partial_stats = (
-                build_run_stats(result.stats, links_emitted=links_emitted)
+                build_run_stats(
+                    result.stats,
+                    links_emitted=links_emitted,
+                    discovery_source=discovery_source,
+                    urls_discovered=urls_discovered,
+                    urls_selected=urls_selected,
+                )
                 if result is not None
                 else None
             )

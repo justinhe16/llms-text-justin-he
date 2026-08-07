@@ -12,8 +12,8 @@ a discovery step will have already collected.
 
 **Not wired into `crawler.py` by this ticket.** Exactly like `internals/llms_txt.py` was
 built as a standalone, fully-tested seam before anything called it for real, this module is
-built and proven here; the ticket that makes `extra_urls` come from `select_urls` instead of
-an empty tuple is a later one.
+built and proven here; the ticket that makes `extra_urls` come from `select_urls` over
+`internals/sitemap.py`'s discovered URLs, instead of an empty tuple, is PER-176.
 
 **Why `DiscoveredUrl` lives here and not in `schemas.py`.** `schemas.py`'s own docstring
 gives the reason for `CrawledPage`: a shape that never crosses the HTTP boundary and exists

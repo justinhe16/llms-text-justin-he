@@ -13,7 +13,10 @@ from pathlib import Path
 
 import httpx
 
+from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, crawl_site
+from app.features.crawl.internals.fetcher import ByteBudget
+from app.features.crawl.internals.sitemap import discover_sitemap_urls
 from app.features.crawl.internals.ssrf import Resolver
 
 
@@ -317,3 +320,102 @@ async def test_a_seed_that_hangs_past_the_wall_clock_budget_is_a_seed_failure() 
     assert result.pages == []
     assert result.cap_hit == "wall_clock"
     assert isinstance(result.seed_error, TimeoutError)
+
+
+def _settings(*, crawl_max_bytes: int) -> Settings:
+    """Build a `Settings` from explicit values only — the same "ignore the ambient
+    environment" contract `tests/test_settings.py`'s own `_settings` helper documents — so
+    nothing this file asserts on can be perturbed by a developer's own `backend/.env`. Takes
+    only the one field this file's tests ever need to override; every other field keeps
+    `Settings`'s own default."""
+    return Settings(
+        _env_file=None,
+        database_url="postgresql://localhost:5432/llms_text",
+        redis_url="redis://localhost:6379/0",
+        supabase_url="https://example.supabase.co",
+        supabase_secret_key="placeholder",
+        crawl_max_bytes=crawl_max_bytes,
+    )
+
+
+async def test_a_caller_supplied_budget_is_used_instead_of_limits_max_bytes() -> None:
+    """`crawl_site`'s `budget` parameter, not `limits.max_bytes`, is what actually binds when
+    both are given — and the caller's PRIOR spend on that object is included in
+    `stats["bytes_fetched"]`, which is what proves the injected object is the one this
+    function spends from, rather than a fresh `ByteBudget(limits.max_bytes)` built inside
+    it. `limits.max_bytes` here is deliberately generous enough that it would never itself
+    bind at the byte count this test reaches — only the caller's smaller, pre-spent `budget`
+    can explain the result.
+    """
+    body = b"x" * 200
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    budget = ByteBudget(1000)
+    budget.take(500)
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "http://seed.test/",
+            limits=_limits(max_bytes=50_000_000),
+            budget=budget,
+            resolver=_fake_resolver(),
+        )
+
+    assert result.stats["bytes_fetched"] == 700
+    assert budget.used == 700
+
+
+async def test_a_huge_sitemap_does_not_starve_the_page_crawl() -> None:
+    """The ticket's own "a 40 MB sitemap must not leave the page crawl with nothing"
+    scenario, driven for real across both modules: `discover_sitemap_urls`
+    (`internals/sitemap.py`) spends most of a small, shared `ByteBudget` on an oversized
+    `/sitemap.xml` — 80% of `crawl_max_bytes` — and the SAME budget object is then handed to
+    `crawl_site` for the seed fetch, exactly as `service.py` wires the two together.
+
+    Without `internals/sitemap.py`'s `_DiscoveryBudget` giving discovery its own, tighter
+    share of the run's budget, discovery would spend directly from the full shared budget,
+    the oversized sitemap would consume nearly all of it, and the seed fetch below would
+    raise `ByteBudgetExceededError` — turning a site with a huge sitemap and a perfectly
+    reachable seed into a FAILED run (`crawler.py` catches that into `seed_error`, and
+    `CrawlService` turns a `seed_error` into a failed run). Deleting `_DiscoveryBudget` (or
+    having discovery spend directly from `budget` with no share of its own) turns this test
+    red: the seed fetch below would come back with `seed_error` set instead of `None`.
+    """
+    settings = _settings(crawl_max_bytes=1_000_000)
+    huge_sitemap = b"a" * int(settings.crawl_max_bytes * 0.8)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sitemap.xml":
+            return httpx.Response(200, content=huge_sitemap)
+        return httpx.Response(200, text="ok")
+
+    budget = ByteBudget(settings.crawl_max_bytes)
+
+    async with _client(handler) as client:
+        discovery = await discover_sitemap_urls(
+            client,
+            "http://seed.test",
+            budget=budget,
+            settings=settings,
+            resolver=_fake_resolver(),
+        )
+        result = await crawl_site(
+            client,
+            "http://seed.test/",
+            limits=_limits(max_bytes=settings.crawl_max_bytes),
+            budget=budget,
+            resolver=_fake_resolver(),
+        )
+
+    # Discovery genuinely spent most of the shared budget on the oversized document — the
+    # premise of this test, not merely its setup — and still harvested nothing (the fixture
+    # is `"a" * N`, not valid XML, so even if it had fit it would not have parsed).
+    assert discovery.urls == []
+    assert budget.used > 0
+
+    assert result.seed_error is None
+    assert len(result.pages) == 1
+    assert result.pages[0].url == "http://seed.test/"

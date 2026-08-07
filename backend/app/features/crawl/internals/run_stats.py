@@ -45,9 +45,16 @@ written under, because a row from before this milestone and one from after other
 silently different set of keys behind the same schema-less jsonb column."""
 
 
-def build_run_stats(crawl_stats: Mapping[str, Any], *, links_emitted: int) -> dict[str, Any]:
-    """Combine `crawl_stats` (from `CrawlResult.stats`) with `links_emitted` and `version`
-    into the exact `dict` `runs.stats` stores.
+def build_run_stats(
+    crawl_stats: Mapping[str, Any],
+    *,
+    links_emitted: int,
+    discovery_source: str,
+    urls_discovered: int,
+    urls_selected: int,
+) -> dict[str, Any]:
+    """Combine `crawl_stats` (from `CrawlResult.stats`) with the persistence-shaped keys this
+    module owns into the exact `dict` `runs.stats` stores.
 
     Args:
         crawl_stats: `CrawlResult.stats` — `pages_crawled`, `pages_failed`, `bytes_fetched`,
@@ -69,14 +76,34 @@ def build_run_stats(crawl_stats: Mapping[str, Any], *, links_emitted: int) -> di
             rule," rather than leaving it to guess from the row's age. Do not add link
             extraction here or anywhere upstream of it to make this number "more accurate"
             (CLAUDE.md #9) — it is exactly as accurate as the artifact it describes.
+        discovery_source: Which of `internals/sitemap.py`'s four discovery entry points
+            actually produced this run's frontier — `"sitemap"`, `"sitemap_index"`,
+            `"robots"`, or `"none"`. Typed as a plain `str`, not that module's
+            `DiscoverySource` literal: this is a pure, I/O-free module, and importing a type
+            from `internals/sitemap.py` would make it depend on an I/O module for the first
+            time. The vocabulary those four strings are drawn from is owned by
+            `internals/sitemap.py`, not here.
+        urls_discovered: How many same-origin candidates `internals/sitemap.py`'s discovery
+            step handed to `url_ranking.select_urls` — not every `<loc>` in whatever document
+            it read, which may have listed more before off-origin entries were dropped.
+        urls_selected: How many of those candidates `select_urls` actually chose, i.e.
+            `len(SelectionResult.selected)` — the size of the frontier `crawl_site` was
+            actually given via `extra_urls`.
 
     Returns:
-        `{**crawl_stats, "links_emitted": links_emitted, "version": RUN_STATS_VERSION}`.
-        `crawl_stats`'s own keys come first and are never overwritten by the two added here,
-        because neither `"links_emitted"` nor `"version"` is a key `CrawlResult.stats` has
-        ever produced.
+        `crawl_stats` spread first, followed by `links_emitted`, `discovery_source`,
+        `urls_discovered`, `urls_selected`, and `version`. `crawl_stats`'s own keys are never
+        overwritten by any of these, because none of these five names is a key
+        `CrawlResult.stats` has ever produced.
     """
-    stats = {**crawl_stats, "links_emitted": links_emitted, "version": RUN_STATS_VERSION}
+    stats = {
+        **crawl_stats,
+        "links_emitted": links_emitted,
+        "discovery_source": discovery_source,
+        "urls_discovered": urls_discovered,
+        "urls_selected": urls_selected,
+        "version": RUN_STATS_VERSION,
+    }
     # "Generation complete, with stats" — passed as `extra=stats` rather than folded into the
     # message text, so a `jq` filter can select on any of `pages_crawled`, `bytes_fetched`,
     # `cap_hit`, etc. directly instead of parsing them back out of a rendered string.
