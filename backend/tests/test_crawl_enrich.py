@@ -8,6 +8,7 @@ somehow reached a real `httpx` transport — `AsyncAnthropic` itself sits on the
 transport class that fixture patches, so an accidental real client is not a silent risk.
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,7 @@ from conftest import (
 )
 
 from app.core.settings import Settings
+from app.features.crawl.internals import enrich
 from app.features.crawl.internals.enrich import (
     _SUMMARY_SCHEMA,
     MAX_TOKENS,
@@ -254,6 +256,76 @@ async def test_a_malformed_or_truncated_response_is_counted_as_a_failure_not_rai
 
     assert result.summaries == {}, case
     assert result.failures == 1, case
+
+
+# -----------------------------------------------------------------------------------------
+# The whole-phase wall-clock cap. `enrich_pages` wraps its entire `asyncio.gather` in
+# `asyncio.timeout(ENRICH_WALL_CLOCK_S)`, and the property that matters when it fires is that
+# the pages which already finished are STILL THERE — which is the whole reason `summaries` is
+# accumulated into shared `nonlocal` state rather than collected from `gather`'s return value.
+# A refactor that innocently switched to `results = await gather(...)` would lose every
+# summary on timeout and pass every other test in this file, so this pins the mechanism
+# directly rather than trusting the comment that explains it.
+# -----------------------------------------------------------------------------------------
+
+
+class _SlowForMarkedPages(FakeAnthropic):
+    """A `FakeAnthropic` whose response is delayed for any page whose markdown contains
+    `marker`, so a test can drive some pages past the wall-clock cap while others finish
+    inside it. The delay is a real `await`, not a blocking sleep: blocking the event loop
+    would stop `asyncio.timeout` from ever firing and the test would hang instead of failing.
+    """
+
+    def __init__(self, *, marker: str, delay: float) -> None:
+        super().__init__()
+        self._marker = marker
+        self._delay = delay
+
+    async def _create(self, **kwargs: Any) -> FakeAnthropicResponse:
+        if self._marker in kwargs["messages"][0]["content"]:
+            await asyncio.sleep(self._delay)
+        return await super()._create(**kwargs)
+
+
+async def test_the_wall_clock_cap_keeps_the_pages_that_already_finished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enrich, "ENRICH_WALL_CLOCK_S", 0.05)
+    fast = [
+        _page(f"https://example.test/fast-{i}", markdown=f"quick content {i}") for i in range(3)
+    ]
+    slow = _page("https://example.test/slow", markdown="SLOW content that never comes back")
+    fake = _SlowForMarkedPages(marker="SLOW", delay=30.0)
+
+    result = await enrich_pages(fake, [*fast, slow], settings=_settings())
+
+    # The cap fired and cancelled the slow page — but did not discard the three that had
+    # already written themselves into `summaries`.
+    assert {page.url for page in fast} <= result.summaries.keys()
+    assert slow.url not in result.summaries
+    # A cancelled in-flight request is NOT a per-page API failure: nothing raised inside
+    # `_enrich_one`, so `failures` stays at zero and the run's stats say the pass was cut
+    # short rather than that the model rejected anything.
+    assert result.failures == 0
+
+
+async def test_the_wall_clock_cap_never_raises_out_of_enrich_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The degradation guarantee at the phase level: a pass that runs out of time returns an
+    `EnrichmentResult` like any other, so `CrawlService` falls back page by page and the run
+    still completes. If `TimeoutError` escaped here, a slow model would fail a crawl that had
+    already successfully fetched every page."""
+    monkeypatch.setattr(enrich, "ENRICH_WALL_CLOCK_S", 0.05)
+    page = _page("https://example.test/slow", markdown="SLOW content that never comes back")
+    fake = _SlowForMarkedPages(marker="SLOW", delay=30.0)
+
+    result = await enrich_pages(fake, [page], settings=_settings())
+
+    assert result.summaries == {}
+    assert result.failures == 0
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
 
 
 # -----------------------------------------------------------------------------------------
