@@ -888,3 +888,114 @@ class FakeStorage:
             raise self.fail
         self.calls.append((object_path, data, content_type))
         return f"{self._bucket}/{object_path}"
+
+
+# -----------------------------------------------------------------------------------------
+# FakeAnthropic, shared by tests/test_crawl_enrich.py (a pure unit suite that exercises
+# `internals/enrich.py` directly, with no database and no real socket) and
+# tests/test_run_persistence.py (which drives `CrawlService.execute_run`, and therefore
+# `enrich_pages`, end to end against a real Postgres) — the same "promoted once a second
+# suite needs it" precedent `FakeStorage` above documents. `internals/enrich.py` calls
+# exactly one method on whatever client it is given, `await client.messages.create(**kwargs)`,
+# so a structural stand-in exposing only that is a complete substitute for
+# `anthropic.AsyncAnthropic`, with nothing that could accidentally open a real connection —
+# `tests/conftest.py`'s autouse `_forbid_real_network` fixture would catch it if one did,
+# since `AsyncAnthropic` sits on the same `httpx.AsyncHTTPTransport` that fixture patches.
+# -----------------------------------------------------------------------------------------
+
+
+@dataclass
+class FakeAnthropicTextBlock:
+    """Stands in for one of `anthropic.types.Message.content`'s blocks —
+    `internals/enrich.py`'s `_parse_summary` reads `.type` and `.text` off it by attribute,
+    never by subscript, so this has to be an object rather than a dict."""
+
+    type: str
+    text: str
+
+
+@dataclass
+class FakeAnthropicUsage:
+    """Stands in for `anthropic.types.Message.usage` — `internals/enrich.py` reads
+    `.input_tokens`/`.output_tokens` off it by attribute."""
+
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
+class FakeAnthropicResponse:
+    """Stands in for `anthropic.types.Message` — the return value of one `messages.create`
+    call, exactly as much of it as `internals/enrich.py`'s `_parse_summary` ever reads."""
+
+    content: list[FakeAnthropicTextBlock]
+    usage: FakeAnthropicUsage
+
+
+def fake_summary_response(
+    title: str, description: str, *, input_tokens: int = 500, output_tokens: int = 40
+) -> FakeAnthropicResponse:
+    """A well-formed success response: one text block carrying the exact JSON
+    `_parse_summary` expects to `json.loads`, wrapping `title` and `description`."""
+    payload = json.dumps({"title": title, "description": description})
+    return FakeAnthropicResponse(
+        content=[FakeAnthropicTextBlock(type="text", text=payload)],
+        usage=FakeAnthropicUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+    )
+
+
+class _FakeAnthropicMessages:
+    """The `.messages` namespace `AsyncAnthropic` exposes `.create` under — split out of
+    `FakeAnthropic` itself so `client.messages.create(...)` reads exactly like a call through
+    the real SDK, which nests the method the same way."""
+
+    def __init__(self, outer: "FakeAnthropic") -> None:
+        self._outer = outer
+
+    async def create(self, **kwargs: Any) -> FakeAnthropicResponse:
+        return await self._outer._create(**kwargs)
+
+
+class FakeAnthropic:
+    """A minimal stand-in for `anthropic.AsyncAnthropic`, exposing only
+    `.messages.create(**kwargs)` — the one call `internals/enrich.py`'s `enrich_pages` makes.
+
+    `respond` decides what one call returns, or raises, as a callable over the exact kwargs
+    `create()` received — a test varies behavior per page by giving each page distinguishable
+    markdown and pattern-matching on `kwargs["messages"][0]["content"]`, since the page's URL
+    itself never reaches `messages.create` (only its truncated text does). Defaults to always
+    answering with the same fixed, well-formed summary, which is enough for a test that only
+    needs a client to be present and does not care what any individual page's summary says.
+
+    `calls` records every kwargs dict `create()` was actually called with, in order — for
+    assertions on the pinned model, prompt, temperature, and `output_config` shape, and on
+    truncation (`len(calls[i]["messages"][0]["content"])`).
+
+    `peak_concurrency` is a real measurement, not an assumption: `create()` increments a
+    depth counter, awaits `asyncio.sleep(0)` — a genuine suspension point, the same reason
+    `_JwksServer.handle` above does the same — and decrements on the way out, so a burst of
+    concurrent calls actually overlaps on the event loop instead of running to completion one
+    coroutine at a time, which is what makes a concurrency-cap assertion built on this class
+    mean anything.
+    """
+
+    def __init__(
+        self, *, respond: Callable[[dict[str, Any]], FakeAnthropicResponse] | None = None
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._respond = respond or (
+            lambda _kwargs: fake_summary_response("Title", "A description of the page.")
+        )
+        self._depth = 0
+        self.peak_concurrency = 0
+        self.messages = _FakeAnthropicMessages(self)
+
+    async def _create(self, **kwargs: Any) -> FakeAnthropicResponse:
+        self.calls.append(kwargs)
+        self._depth += 1
+        self.peak_concurrency = max(self.peak_concurrency, self._depth)
+        try:
+            await asyncio.sleep(0)
+            return self._respond(kwargs)
+        finally:
+            self._depth -= 1

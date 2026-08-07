@@ -20,6 +20,7 @@ from arq import cron
 
 from app.core.logging import configure_logging
 from app.core.settings import settings
+from app.features.crawl.anthropic_client import build_anthropic_client
 from app.features.crawl.http_client import build_crawl_client
 from app.infrastructure.db.pool import close_pool, open_pool
 from app.infrastructure.queue.pool import redis_settings_from_url
@@ -111,6 +112,16 @@ async def open_worker_resources(ctx: dict[Any, Any]) -> None:
     the thing `close_worker_resources` below closes, and the thing built from it
     (`build_supabase_storage`) is a separate value with nothing of its own to close.
 
+    **`ctx["anthropic_client"]` is CONDITIONAL — this is acceptance criterion 1 (PER-180).**
+    Built only `if settings.crawl_enrich_with_llm`, unlike every other key above, which is
+    always set. With the flag off, this key is simply absent from `ctx`: no `AsyncAnthropic`
+    is constructed, no `ANTHROPIC_API_KEY` is read, and `app.worker.jobs.crawl_task` reads it
+    back with `ctx.get("anthropic_client")` rather than `ctx["anthropic_client"]` for exactly
+    this reason. Building it unconditionally — the way `http_client` and `storage_client` are
+    built — would be harmless in itself (`build_anthropic_client`, like `build_crawl_client`,
+    opens no socket), but it would also make "was enrichment supposed to run" a question with
+    no clean answer from `ctx` alone once the client existed either way.
+
     Errors are logged at CRITICAL and re-raised. arq's `Worker.run()` only swallows
     `CancelledError`, so re-raising exits the process with a traceback; the log line above
     it exists because a worker that dies here dies with no HTTP listener to fail a health
@@ -134,20 +145,39 @@ async def open_worker_resources(ctx: dict[Any, Any]) -> None:
     ctx["http_client"] = build_crawl_client(settings)
     ctx["storage_client"] = build_storage_client(settings)
     ctx["storage"] = build_supabase_storage(ctx["storage_client"], settings)
+    # THE GUARD IS ACCEPTANCE CRITERION 1: nothing under this `if` runs at all with the flag
+    # off, so a deployment (or this test suite) that never sets `CRAWL_ENRICH_WITH_LLM`
+    # never constructs an `AsyncAnthropic`, never reads `ANTHROPIC_API_KEY`, and boots
+    # exactly as it did before this feature existed. See `ctx["anthropic_client"]`'s own
+    # paragraph above for why this key is conditional where every other one here is not.
+    if settings.crawl_enrich_with_llm:
+        ctx["anthropic_client"] = build_anthropic_client(settings)
     logger.info("ARQ worker ready (poll_delay=%ss, max_jobs=%s)", POLL_DELAY_SECONDS, MAX_JOBS)
 
 
 async def close_worker_resources(ctx: dict[Any, Any]) -> None:
-    """Close the shared `httpx.AsyncClient`s and the Postgres pool.
+    """Close the shared `httpx.AsyncClient`s, the shared `AsyncAnthropic` client, and the
+    Postgres pool.
 
     Called by `Worker.close()` after the in-flight jobs have finished or been cancelled,
     and before arq closes its own Redis connection. Safe if `on_startup` never got as far
     as opening any of these resources: every `ctx.get(...)` below is `None` and skipped when
     that is so, and `close_pool()` is a no-op when there is nothing to close — all of that
-    matters because `Worker.run()`'s `finally` calls this even on a failed startup.
+    matters because `Worker.run()`'s `finally` calls this even on a failed startup. It is
+    also how a flag-off worker reaches this function safely: `ctx.get("anthropic_client")` is
+    `None` because `open_worker_resources` never set the key at all, not because startup
+    failed partway through — the same `ctx.get(...)` shape, doing double duty.
 
     Closes `storage_client`, not `storage` — `SupabaseStorage` never owns the client it is
     handed (see its own module docstring), so it has nothing to close itself.
+
+    **`AsyncAnthropic.close()` — a coroutine — not `.aclose()`, unlike every `httpx.AsyncClient`
+    above.** The Anthropic SDK's async client spells this method differently from httpx's, and
+    copying the `await client.aclose()` idiom used for `http_client`/`storage_client` two lines
+    up onto an `AsyncAnthropic` is an `AttributeError` at shutdown — `aclose` does not exist on
+    this class. `tests/test_worker_settings.py` pins this with a spy that exposes `close` and
+    deliberately NOT `aclose`, so a copy-paste of the wrong name fails the test rather than
+    failing silently on the next real deploy.
     """
     logger.info("ARQ worker shutting down")
     http_client = ctx.get("http_client")
@@ -156,6 +186,9 @@ async def close_worker_resources(ctx: dict[Any, Any]) -> None:
     storage_client = ctx.get("storage_client")
     if storage_client is not None:
         await storage_client.aclose()
+    anthropic_client = ctx.get("anthropic_client")
+    if anthropic_client is not None:
+        await anthropic_client.close()
     await close_pool()
 
 

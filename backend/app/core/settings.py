@@ -122,6 +122,62 @@ class Settings(BaseSettings):
     # unbounded list in memory even if that arithmetic ever changes.
     crawl_sitemap_max_urls: int = Field(default=50_000, ge=1)
 
+    # Model-assisted per-page summarization (app.features.crawl.internals.enrich), the layer
+    # ARCHITECTURE.md §11 describes as sitting ABOVE `internals/llms_txt.py` rather than
+    # inside it. Everything below is read by the worker only — the API never touches these.
+    #
+    # `crawl_enrich_with_llm` defaults OFF, and OFF is load-bearing here, not merely
+    # cautious. With the flag off, nothing in this feature constructs an `AsyncAnthropic`
+    # client at all (`app/worker/settings.py`'s `open_worker_resources` checks this same
+    # flag before calling `build_anthropic_client`), so a run's artifact is byte-identical
+    # to what the deterministic path already produced, and this suite — and CI — never needs
+    # a live `ANTHROPIC_API_KEY` to go green. Flip it on and a website's crawl starts paying
+    # for a model call per page; that is a cost decision an operator makes deliberately, not
+    # a default this codebase should make for them.
+    #
+    # Summarization is ALL-OR-NOTHING for a run, by design, and there is deliberately no
+    # third "gap-filling" mode that mixes model-written and extracted metadata based on which
+    # calls happened to succeed. An index whose entries came from two different authors, with
+    # no way for a reader to tell which is which, is worse than either alone: a reader of
+    # `llms.txt` cannot tell "the model wrote this" from "trafilatura wrote this" by looking
+    # at it, so a run that silently blends the two teaches nobody anything about which pages
+    # to trust more. `internals/enrich.py`'s `enrich_pages` reports every page it could not
+    # summarize, and `CrawlService.execute_run` falls back to the FULL deterministic artifact
+    # rather than a partially-enriched one — see that method for exactly where the line is
+    # drawn.
+    crawl_enrich_with_llm: bool = False
+
+    # The Anthropic API key. Read only when `crawl_enrich_with_llm` is `True` — see
+    # `validate_required_secrets` below, which is why this is safe to default to `""` rather
+    # than being declared required unconditionally the way `supabase_secret_key` is. Never
+    # logged, interpolated into a message, or `repr`'d anywhere this feature touches it
+    # (ARCHITECTURE.md §9.4) — `anthropic_client.py`'s own docstring restates this at the one
+    # call site that actually reads it.
+    anthropic_api_key: str = ""
+
+    # How many `messages.create` calls `internals/enrich.py`'s `enrich_pages` may have in
+    # flight at once, per run — mirrors `crawl_concurrency`'s shape for the page fetch loop,
+    # but as its own field: the crawl's own concurrency is bounded by what this process's
+    # `httpx.AsyncClient` connection pool and the target site's politeness can tolerate,
+    # while this one is bounded by what the Anthropic account's own rate limit allows, and
+    # the two have no reason to share a number. Defaulted to 10 to match Firecrawl's own
+    # batch size for the equivalent step — a number this ticket did not need to reinvent —
+    # rather than to any measurement of this codebase's own account limits.
+    crawl_enrich_concurrency: int = Field(default=10, ge=1)
+
+    # How many characters of a page's extracted `markdown` are sent to the model, cut AFTER
+    # stripping leading/trailing whitespace so a page that is mostly boilerplate at the edges
+    # does not spend its whole budget on nothing (`internals/enrich.py`'s `enrich_pages`).
+    # This is where this feature's entire cost lives, and the arithmetic is worth stating
+    # rather than assuming: `claude-haiku-4-5` is priced at roughly $1 per million input
+    # tokens, and 4,000 characters of English prose is on the order of 1,000 tokens — so a
+    # 100-page run spends on the order of 100,000 input tokens, a few cents, before the (far
+    # smaller) `MAX_TOKENS`-bounded output cost is added on top. Raising this raises that
+    # number roughly linearly; it does not change what gets summarized, since a page's title
+    # and the gist of its description are almost always decided well within the first few
+    # thousand characters of real prose.
+    crawl_enrich_max_chars: int = Field(default=4000, ge=1)
+
     # Abuse protection for `POST /websites/{id}/runs` (`app.features.runs.service.
     # RunService.trigger_run`). Both caps are per-USER, not per-website — a user with ten
     # websites gets ten websites' worth of manual triggers, not ten independent budgets —
@@ -190,6 +246,15 @@ class Settings(BaseSettings):
             ("SUPABASE_URL", self.supabase_url),
             ("SUPABASE_SECRET_KEY", self.supabase_secret_key),
         )
+        # A deliberately obvious `if`, not a ternary folded into the tuple above. Every other
+        # variable in `required` is unconditional, but demanding `ANTHROPIC_API_KEY` with
+        # `crawl_enrich_with_llm` off would refuse to boot a perfectly correct deployment —
+        # including this process's own tests and CI, where the flag is always off and the
+        # key is never set. Appended LAST, which keeps `required`'s existing property of
+        # matching `backend/.env.example`'s order: this is a later, optional section of that
+        # file, added after every unconditional variable above it.
+        if self.crawl_enrich_with_llm:
+            required = (*required, ("ANTHROPIC_API_KEY", self.anthropic_api_key))
         missing = [name for name, value in required if not value.strip()]
         if missing:
             raise RuntimeError(

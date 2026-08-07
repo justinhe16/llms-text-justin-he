@@ -70,3 +70,19 @@ htmldate==1.10.0     # trafilatura's date extraction, imported at its import tim
                      # upstream, floor only. extract.py discards the date and passes
                      # `extensive=False` to stop it hunting for one, but the import still has
                      # to resolve, so the version still has to be fixed.
+
+# LLM enrichment
+anthropic==0.120.2   # RUNTIME for the WORKER process only — the SECOND entry in this file with
+                     # that shape, alongside trafilatura above, and for the same reason: the API
+                     # never calls a model, only the crawl task does
+                     # (app/features/crawl/internals/enrich.py, flag-gated on
+                     # `settings.crawl_enrich_with_llm`). It lives in this file rather than
+                     # requirements-dev.txt because CI's build-check step installs this file
+                     # ALONE to prove the image actually builds — an SDK that only existed in
+                     # the dev file would import-error there, and only there, the same trap
+                     # httpx's own comment above describes. The OFFICIAL Anthropic SDK is a
+                     # RULE here, not a preference this pin happens to satisfy: CLAUDE.md and
+                     # this ticket both forbid a hand-rolled `httpx`/`requests` client against
+                     # api.anthropic.com or an OpenAI-compatible shim in its place — the pinned
+                     # SDK is the only client this codebase is allowed to speak Anthropic's API
+                     # through, so there is nothing to weigh against a second implementation.

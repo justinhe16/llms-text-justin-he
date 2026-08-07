@@ -20,12 +20,22 @@ import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
+import anthropic
 import httpx
 import pytest
 from asyncpg import Connection, Pool
-from conftest import TEST_USER_A_ID, FakeStorage, seed_run, seed_website
+from conftest import (
+    TEST_USER_A_ID,
+    FakeAnthropic,
+    FakeAnthropicResponse,
+    FakeStorage,
+    fake_summary_response,
+    seed_run,
+    seed_website,
+)
 
 from app.core.settings import settings
 from app.features.crawl.internals.crawler import CrawlResult
@@ -76,6 +86,7 @@ async def _execute(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     max_attempts: int = 1,
+    anthropic_client: object | None = None,
 ) -> object:
     """Run one crawl attempt, with the retry budget already spent by default.
 
@@ -90,9 +101,17 @@ async def _execute(
     The retry path itself is covered in tests/test_crawl_retry.py, and
     `test_no_failure_mode_ever_leaves_a_run_processing` below parametrizes this argument so
     the "no run is ever left processing" invariant is checked on both sides of the budget.
+
+    `anthropic_client` defaults to `None`, matching `build_crawl_service`'s own default —
+    every test above the PER-180 section leaves it unset and exercises the module-level
+    `settings` object's real, flag-off default, exactly as before this parameter existed. The
+    enrichment tests below pass a `conftest.FakeAnthropic` and monkeypatch
+    `settings.crawl_enrich_with_llm` to `True` themselves.
     """
     async with _mock_client(handler) as http_client:
-        service = build_crawl_service(pool, http_client, storage, settings)
+        service = build_crawl_service(
+            pool, http_client, storage, settings, anthropic_client=anthropic_client
+        )
         return await service.execute_run(run_id, max_attempts=max_attempts)
 
 
@@ -118,7 +137,7 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 4
+    assert stats["version"] == 5
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
     assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
@@ -388,11 +407,19 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 4
+    assert stats["version"] == 5
     # A failure row carries the same KEYS as a success row, at their hoisted defaults — the
-    # shape `runs.stats` stores must not depend on how far a run got before it failed.
+    # shape `runs.stats` stores must not depend on how far a run got before it failed. The
+    # four PER-180 counters are part of that same guarantee now: this suite's `_execute`
+    # helper builds a `CrawlService` with `crawl_enrich_with_llm` off and no `anthropic_client`
+    # (the default `Settings`, unmodified), so the enrichment guard never fires and every one
+    # of them stays at its hoisted 0 exactly like `links_emitted` and `full_txt_truncated` do.
     assert stats["links_emitted"] == 0
     assert stats["full_txt_truncated"] == 0
+    assert stats["pages_enriched"] == 0
+    assert stats["enrich_failures"] == 0
+    assert stats["enrich_input_tokens"] == 0
+    assert stats["enrich_output_tokens"] == 0
 
 
 @pytest.mark.parametrize(
@@ -682,7 +709,12 @@ async def test_a_site_with_no_sitemap_falls_back_to_the_links_on_its_seed_page(
     assert stats["urls_discovered"] == 3, "off-origin, mailto: and fragment-only never count"
     assert stats["urls_selected"] == 3
     assert stats["pages_crawled"] == 4
-    assert stats["version"] == 4, "a new VALUE for an existing key is not a new shape"
+    assert stats["version"] == 5, (
+        "a new VALUE for an existing key is still not a new shape — PER-178 added "
+        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 5 '
+        "because PER-180 added four enrich KEYS after that, which is a shape change; the "
+        "number moved for a reason that has nothing to do with the value asserted above."
+    )
 
 
 async def test_a_site_with_a_sitemap_never_consults_the_links_on_its_seed_page(
@@ -927,3 +959,364 @@ async def test_links_found_but_all_ranked_away_still_report_the_links_source(
     assert stats["urls_discovered"] == 3
     assert stats["urls_selected"] == 0
     assert stats["pages_crawled"] == 1
+
+
+# -----------------------------------------------------------------------------------------
+# PER-180: flag-gated, model-assisted per-page summarization
+# (`app.features.crawl.internals.enrich`), end to end against a real Postgres row. Every
+# test below monkeypatches `settings.crawl_enrich_with_llm` to `True` and hands `_execute`
+# a `conftest.FakeAnthropic` — the module-level `settings` object is real, so every test
+# above this section that never touches it keeps exercising the actual, flag-off default.
+#
+# `crawl_site` is monkeypatched to hand `execute_run` pre-built `CrawledPage`s, the same
+# pattern `test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats` and
+# `test_links_emitted_counts_the_indexed_pages_and_the_full_text_is_persisted` above already
+# use — it is the only deterministic way to give a page markdown substantial enough to be
+# sent to the model, since the real extraction pipeline over a MockTransport's plain-text
+# bodies would mark every page `is_empty` and enrichment would never make a request at all.
+# `discover_sitemap_urls` is deliberately left unmocked, exactly as those two tests leave it:
+# its own probes hit `handler`'s `AssertionError`, which `internals/sitemap.py` catches and
+# logs at WARNING as an ordinary fetch failure, never propagating.
+# -----------------------------------------------------------------------------------------
+
+
+def _enrich_page(
+    suffix: str,
+    *,
+    title: str = "Extracted Title",
+    description: str = "Extracted description.",
+    markdown: str = "Real page content, long enough to be sent to the model for summarization.",
+) -> CrawledPage:
+    """A `CrawledPage` shaped for the enrichment tests below: real, substantial `markdown` so
+    `enrich_pages` never skips it, and an extracted `title`/`description` distinct enough
+    from any model-written one that a test can tell which metadata reached the artifact."""
+    return CrawledPage(
+        url=f"http://{_SEED_IP}/{suffix}",
+        status=200,
+        title=title,
+        content="raw response body",
+        fetched_at=datetime.now(UTC),
+        content_bytes=1,
+        description=description,
+        markdown=markdown,
+        is_empty=False,
+    )
+
+
+def _crawl_stats(*, pages_crawled: int) -> dict[str, Any]:
+    return {
+        "pages_crawled": pages_crawled,
+        "pages_failed": 0,
+        "bytes_fetched": pages_crawled,
+        "duration_ms": 1,
+        "cap_hit": None,
+        "pages_empty_content": 0,
+    }
+
+
+def _mock_crawl_site(monkeypatch: pytest.MonkeyPatch, result: CrawlResult) -> None:
+    async def fake_crawl_site(*args: object, **kwargs: object) -> CrawlResult:
+        return result
+
+    monkeypatch.setattr("app.features.crawl.service.crawl_site", fake_crawl_site)
+
+
+def _unreachable_handler(request: httpx.Request) -> httpx.Response:
+    raise AssertionError("crawl_site is mocked; no HTTP request should be made")
+
+
+def _always_fails(_kwargs: dict[str, Any]) -> FakeAnthropicResponse:
+    raise anthropic.APIConnectionError(
+        message="the model is unreachable",
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+
+
+async def test_model_titles_reach_llms_txt_and_the_extracted_title_does_not(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-model-title")
+
+    page = _enrich_page(
+        "enrich-model-title", title="Extracted Title Nobody Should See In The Artifact"
+    )
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+    fake_anthropic = FakeAnthropic(
+        respond=lambda _kwargs: fake_summary_response(
+            "Model Written Title", "Model written description of the page."
+        )
+    )
+
+    outcome = await _execute(
+        websites_db, FakeStorage(), run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT llms_txt, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert "Model Written Title" in row["llms_txt"]
+    assert "Extracted Title Nobody Should See In The Artifact" not in row["llms_txt"]
+
+    stats = json.loads(row["stats"])
+    assert stats["version"] == 5
+    assert stats["pages_enriched"] == 1
+    assert stats["enrich_failures"] == 0
+
+
+async def test_a_total_enrichment_failure_still_completes_with_the_deterministic_artifact(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criteria 3 and 4: every page's request fails, and the run still ends `completed` with
+    an artifact byte-identical to the flag-off run's — never `failed`, and never a
+    partially-model-written index."""
+    page = _enrich_page("enrich-total-failure")
+    crawl_result = CrawlResult(
+        pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+    )
+    _mock_crawl_site(monkeypatch, crawl_result)
+
+    _website_id_off, run_id_off = await _seed_pending(websites_db, "enrich-total-failure-off")
+    outcome_off = await _execute(websites_db, FakeStorage(), run_id_off, _unreachable_handler)
+    assert outcome_off is not None
+    row_off = await websites_db.fetchrow(
+        "SELECT status, llms_txt, llms_full_txt FROM runs WHERE id = $1", run_id_off
+    )
+    assert row_off is not None
+    assert row_off["status"] == "completed"
+
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id_on, run_id_on = await _seed_pending(websites_db, "enrich-total-failure-on")
+    fake_anthropic = FakeAnthropic(respond=_always_fails)
+    outcome_on = await _execute(
+        websites_db, FakeStorage(), run_id_on, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome_on is not None
+
+    row_on = await websites_db.fetchrow(
+        "SELECT status, llms_txt, llms_full_txt, stats FROM runs WHERE id = $1", run_id_on
+    )
+    assert row_on is not None
+    assert row_on["status"] == "completed"
+    assert row_on["llms_txt"] == row_off["llms_txt"]
+    assert row_on["llms_full_txt"] == row_off["llms_full_txt"]
+
+    stats_on = json.loads(row_on["stats"])
+    assert stats_on["pages_enriched"] == 0
+    assert stats_on["enrich_failures"] == 1
+
+
+async def test_a_per_page_enrichment_failure_mixes_model_and_extracted_titles(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-mixed")
+
+    ok_page = _enrich_page(
+        "enrich-mixed/ok",
+        title="Extracted OK Title",
+        markdown="Real content for the page that will be summarized successfully.",
+    )
+    failing_page = _enrich_page(
+        "enrich-mixed/fails",
+        title="Extracted Fallback Title",
+        markdown="Real content for the page whose summarization request will fail.",
+    )
+    crawl_result = CrawlResult(
+        pages=[ok_page, failing_page],
+        stats=_crawl_stats(pages_crawled=2),
+        cap_hit=None,
+        seed_error=None,
+    )
+    _mock_crawl_site(monkeypatch, crawl_result)
+
+    def respond(kwargs: dict[str, Any]) -> FakeAnthropicResponse:
+        if kwargs["messages"][0]["content"] == failing_page.markdown:
+            raise anthropic.APIConnectionError(
+                message="down",
+                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+            )
+        return fake_summary_response("Model OK Title", "Model written description of the page.")
+
+    fake_anthropic = FakeAnthropic(respond=respond)
+
+    outcome = await _execute(
+        websites_db, FakeStorage(), run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT llms_txt, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert "Model OK Title" in row["llms_txt"]
+    assert "Extracted Fallback Title" in row["llms_txt"]
+    assert "Extracted OK Title" not in row["llms_txt"]
+
+    stats = json.loads(row["stats"])
+    assert stats["pages_enriched"] == 1
+    assert stats["enrich_failures"] == 1
+
+
+async def test_the_archived_payload_keeps_the_extracted_metadata_not_the_models(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 7, pinned end to end: `serialize_payload` is called on `result.pages` — the
+    ORIGINAL, extracted pages — never on `artifact_pages`, so the gzip-compressed JSONL this
+    run uploads to Storage keeps trafilatura's own title and description even though the
+    artifact `runs.llms_txt` stores carries the model's."""
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-payload")
+
+    page = _enrich_page(
+        "enrich-payload",
+        title="Extracted Title For The Archive",
+        description="Extracted description for the archive.",
+    )
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+    fake_anthropic = FakeAnthropic(
+        respond=lambda _kwargs: fake_summary_response(
+            "Model Written Title", "Model written description."
+        )
+    )
+    storage = FakeStorage()
+
+    outcome = await _execute(
+        websites_db, storage, run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    assert len(storage.calls) == 1
+    _object_path, data, _content_type = storage.calls[0]
+    lines = gzip.decompress(data).decode("utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["title"] == "Extracted Title For The Archive"
+    assert record["description"] == "Extracted description for the archive."
+    assert record["title"] != "Model Written Title"
+
+    row = await websites_db.fetchrow("SELECT llms_txt FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert "Model Written Title" in row["llms_txt"]
+
+
+async def test_all_four_enrichment_counters_are_recorded(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-counters")
+
+    page_a = _enrich_page("enrich-counters/a", markdown="Real content A, long enough to summarize.")
+    page_b = _enrich_page("enrich-counters/b", markdown="Real content B, long enough to summarize.")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page_a, page_b],
+            stats=_crawl_stats(pages_crawled=2),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+
+    def respond(kwargs: dict[str, Any]) -> FakeAnthropicResponse:
+        return fake_summary_response(
+            "Model Title", "Model description.", input_tokens=123, output_tokens=45
+        )
+
+    fake_anthropic = FakeAnthropic(respond=respond)
+
+    outcome = await _execute(
+        websites_db, FakeStorage(), run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    stats = json.loads(row["stats"])
+    assert stats["pages_enriched"] == 2
+    assert stats["enrich_failures"] == 0
+    assert stats["enrich_input_tokens"] == 246
+    assert stats["enrich_output_tokens"] == 90
+
+
+async def test_the_anthropic_call_never_happens_inside_a_database_transaction(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 7, ASSERTED rather than assumed — the enrichment call's own
+    sibling of `test_the_upload_never_happens_inside_a_database_transaction` above, sharing
+    its transaction-depth-counter machinery over the SAME `events` list, so both network
+    calls this run makes are checked against one continuous timeline rather than two
+    independent ones that could pass separately while still overlapping a transaction
+    between them."""
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-no-tx")
+
+    page = _enrich_page("enrich-no-tx")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+
+    events: list[tuple[str, str]] = []
+
+    @asynccontextmanager
+    async def tracking_transaction(pool: Pool) -> AsyncIterator[Connection]:
+        events.append(("tx", "enter"))
+        try:
+            async with real_transaction(pool) as conn:
+                yield conn
+        finally:
+            events.append(("tx", "exit"))
+
+    monkeypatch.setattr("app.features.runs.service.transaction", tracking_transaction)
+
+    class _TrackingStorage(FakeStorage):
+        async def upload(self, object_path: str, data: bytes, *, content_type: str) -> str:
+            events.append(("upload", "start"))
+            try:
+                return await super().upload(object_path, data, content_type=content_type)
+            finally:
+                events.append(("upload", "end"))
+
+    class _TrackingAnthropic(FakeAnthropic):
+        async def _create(self, **kwargs: Any) -> FakeAnthropicResponse:
+            events.append(("enrich", "start"))
+            try:
+                return await super()._create(**kwargs)
+            finally:
+                events.append(("enrich", "end"))
+
+    storage = _TrackingStorage()
+    fake_anthropic = _TrackingAnthropic()
+
+    outcome = await _execute(
+        websites_db, storage, run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    depth = 0
+    saw_enrich = False
+    saw_upload = False
+    for kind, phase in events:
+        if kind == "tx":
+            depth += 1 if phase == "enter" else -1
+            assert depth >= 0, "a transaction exited more times than it entered"
+        else:
+            if kind == "enrich":
+                saw_enrich = True
+            elif kind == "upload":
+                saw_upload = True
+            assert depth == 0, f"{kind} {phase!r} happened while a transaction was open"
+    assert saw_enrich, "the Anthropic call never happened at all"
+    assert saw_upload, "the Storage upload never happened at all"
+    assert depth == 0, "a transaction was left open"

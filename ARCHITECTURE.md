@@ -287,8 +287,13 @@ stood here said the pipeline "has not been designed yet" and that the function b
 a deterministic stand-in. That is no longer true, and the boundary it drew moved rather than
 disappeared. What is now decided, and decided *here*: which fetched pages the artifact lists,
 how they are grouped and ordered, what each is called, and what the expansion contains. What
-is still out of scope, and out of scope for a reason rather than for want of a ticket:
-**anything that calls a model.** See §11.
+is still out of scope, and out of scope for a reason rather than for want of a ticket: calling
+a model **inside this seam**. That is no longer the same as "calling a model at all" — PER-180
+added exactly that, one layer up, in `internals/enrich.py` (see the new paragraph below and
+§11) — but `generate_llms_txt` and `generate_llms_full_txt` themselves still take a
+`list[CrawledPage]` and return `str` with no network call anywhere inside either one, and that
+half of the sentence remains true precisely because the model-calling layer was built beside
+this module rather than into it.
 
 `CrawledPage`, not `Page`: `app.core.pagination.Page` already names the generic pagination
 envelope returned by `GET /websites/{id}/runs`, and a second, unrelated `Page` in the same
@@ -424,8 +429,10 @@ The distinction that matters is *where* that ranking sits. It runs entirely **be
 page is fetched, so it ranks on URL shape and sitemap metadata only — "fetch it and see
 whether it was worth fetching" is explicitly not a pass this module may grow, because that
 would put content judgement upstream of the seam instead of behind it. How *fetched* pages
-are ranked, summarized, or chosen for the artifact is still undesigned and still lives behind
-`generate_llms_txt`.
+are **summarized** is no longer undesigned — PER-180's `internals/enrich.py`, described below,
+is exactly that layer. How *fetched* pages are **ranked or chosen** for the artifact — which
+of them make the index at all, beyond the `is_empty` skip §3.4 already documents — remains
+undesigned and still lives behind `generate_llms_txt`.
 
 **The depth-1 link fallback, for the minority of sites with no sitemap (PER-178).** Every
 documentation generator this crawler targets ships a sitemap, so the paragraphs above are the
@@ -478,12 +485,36 @@ tickets deploy separately, so version 3 was already writing rows before discover
 folding the new keys into 3 would have left two different shapes stamped with the same version
 — exactly the ambiguity the field exists to prevent. See `RUN_STATS_VERSION`'s own docstring.
 
+**Model-assisted per-page summarization, flag-gated as of PER-180.**
+`internals/enrich.py`'s `enrich_pages(client, pages, *, settings) -> EnrichmentResult` asks
+`claude-haiku-4-5` for a 3-4 word title and a 9-10 word description for every page whose
+extracted markdown is non-empty after truncation, with bounded concurrency
+(`crawl_enrich_concurrency`) and a whole-phase timeout (`ENRICH_WALL_CLOCK_S`) distinct from
+the per-request one on the client itself. `apply_summaries(pages, summaries) -> list[
+CrawledPage]` then returns a NEW list — pages are frozen — with a summarized page's `title`
+and `description` replaced and everything else untouched. `CrawlService.execute_run` calls
+both, in that order, as the first thing inside its success branch, strictly before
+`generate_llms_txt`/`generate_llms_full_txt` are called on the result — this is the "layer
+*above* the seam" §11 requires, and it is enforced by where the call sits, not by a comment:
+`internals/llms_txt.py` itself is unmodified by this ticket and still takes a
+`list[CrawledPage]` with no idea whether a model wrote any of it. Failure at any level —
+a single page's request, the whole phase's timeout, or an unexpected exception in this module
+itself — degrades to that page's (or every page's) extraction-derived title and description
+rather than failing the run; `Settings.crawl_enrich_with_llm` defaults off, and off means
+`CrawlService` never constructs the request in the first place. `internals/enrich.py` is the
+SECOND `internals/` module in this feature that does I/O, after `sitemap.py` above — the same
+exception to "pure and clock-free" for the same reason, because summarizing a page means
+calling an API — and `anthropic_client.py` sits at the top of the feature, beside
+`http_client.py` and not inside `internals/`, for the same reason that module's own docstring
+gives: `app/worker/settings.py` has to import it to build the shared client, and `internals/`
+is private to this feature (§3.1).
+
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
 table-free I/O to do may keep it in `internals/` anyway, as this one keeps `ssrf.py`,
-`fetcher.py`, `crawler.py`, and `sitemap.py`. Every fetch, seed or redirect or a discovery
-document, passes `internals/ssrf.py`'s SSRF guard before a socket opens, and the crawl loop
-(`internals/crawler.py`) runs under six hard caps read from `Settings` — page count,
+`fetcher.py`, `crawler.py`, `sitemap.py`, and `enrich.py`. Every fetch, seed or redirect or a
+discovery document, passes `internals/ssrf.py`'s SSRF guard before a socket opens, and the
+crawl loop (`internals/crawler.py`) runs under six hard caps read from `Settings` — page count,
 wall-clock budget, total response bytes, per-request timeout, concurrency, and a politeness
 delay between request starts. Hitting one of those caps ends the crawl with whatever pages it
 already collected and is a **success**, not a failure; only the seed itself failing to fetch
@@ -1406,16 +1437,30 @@ PUT    /websites/{id}/schedule
 
 Deliberately not decided here, and not to be decided by accident in an implementation PR:
 
-- **Model-assisted summarization.** Artifact generation itself is no longer open: PER-179
-  filled the seam, and `internals/llms_txt.py` now builds both real artifacts from the pages
-  a run fetched (§3.4). What remains undesigned is the pass that would *improve* them with a
-  model — a written per-page summary in place of the page's own meta description, a written
-  site overview in place of the counted blockquote. Two constraints on whoever designs it,
-  both load-bearing rather than stylistic: it is a layer **above** `generate_llms_txt`, never
-  inside it, and the deterministic path must survive as the fallback it degrades to when the
-  feature's flag is off or its API call fails. A generator that only works when an external
-  service answers is not a fallback, which is why `internals/llms_txt.py` may not grow a
-  network call and may not become conditional on one having happened.
+- **Model-assisted summarization — the per-page half landed with PER-180, and is now an
+  implementation.** The paragraph that stood here said the pass that would *improve* the
+  artifacts with a model was undesigned in full: "a written per-page summary in place of the
+  page's own meta description, a written site overview in place of the counted blockquote."
+  That is no longer true for the first half of that sentence. `internals/enrich.py`'s
+  `enrich_pages` writes a `claude-haiku-4-5` title and description for every page with
+  extractable content, flag-gated on `Settings.crawl_enrich_with_llm` (default **off**), and
+  `CrawlService.execute_run` calls it as the first thing in its success branch — before
+  `generate_llms_txt`/`generate_llms_full_txt` ever run — so the boundary this paragraph used
+  to only ask for is now where the call physically sits (§3.4). What survives, unchanged and
+  still undesigned: the written SITE OVERVIEW half of the old sentence — a model-authored
+  blockquote in place of `_index_summary`'s factual, countable one — is untouched by PER-180;
+  `internals/llms_txt.py`'s blockquote is exactly what it was before this ticket. And the two
+  constraints this paragraph used to merely ask of "whoever designs it" are no longer
+  aspirational — they are enforced by code, not by convention. **A layer above
+  `generate_llms_txt`, never inside it:** `internals/llms_txt.py` is byte-identical to what
+  PER-179 left it; the model-calling code lives in a sibling module that `internals/llms_txt.py`
+  never imports. **The deterministic path survives as the fallback it degrades to:** the flag
+  defaults off, a single page's failed request falls back to that page's own extracted title
+  and description, a whole-phase timeout or an unexpected exception falls back to every page's
+  extracted metadata, and none of those paths is distinguishable from a run where enrichment
+  never existed — see `internals/enrich.py`'s own module docstring for the full argument, and
+  `RUN_STATS_VERSION` 5's `enrich_failures` counter for how a reader tells "off" apart from
+  "on and lost."
 - **Cacheable and shareable artifact URLs.** PER-181 shipped `GET /runs/{id}/llms.txt` and
   `GET /runs/{id}/llms-full.txt` (§10.3), served straight from the `runs.llms_txt` /
   `runs.llms_full_txt` columns. What they deliberately do NOT have is any caching story — no
