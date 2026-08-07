@@ -9,6 +9,13 @@ import { llmsFullTxtFilename } from "./run-display";
 import { saveTextFile } from "./save-text-file";
 
 /**
+ * Which artifact one click asks for: the run to fetch, and the origin its saved file is named
+ * after. Carried together as one value so the two can never be sourced from different renders
+ * — see the comment on `mutationFn` below.
+ */
+type DownloadTarget = { runId: string; origin: string };
+
+/**
  * Fetches `GET /runs/{id}/llms-full.txt` on demand and saves it — the behaviour behind the
  * Output tab's "Download full" button (`components/crawls/download-full-button.tsx`).
  *
@@ -45,9 +52,18 @@ import { saveTextFile } from "./save-text-file";
  */
 export function useDownloadFullArtifact(runId: string, origin: string) {
   const mutation = useMutation({
-    mutationFn: () => getLlmsFullTxt(runId),
-    onSuccess: (text) => {
-      const filename = llmsFullTxtFilename(origin);
+    // Which run, and which origin to name the file after, travel as the mutation's
+    // *variables* rather than being read out of the enclosing render's closure — the shape
+    // `useTriggerRun` (lib/query/use-trigger-run.ts) already uses for its own `websiteId`.
+    // React Query patches a still-pending mutation's options on every re-render, so a
+    // closure-captured `runId` is in principle a different value by the time the request is
+    // dispatched. The stronger reason is the pairing: `onSuccess` names the file from the
+    // SAME `origin` that travelled with the request that produced the bytes, so the artifact
+    // and its filename cannot describe two different websites even in principle. A closure
+    // would leave that resting on an argument about timing instead of on the code's shape.
+    mutationFn: (target: DownloadTarget) => getLlmsFullTxt(target.runId),
+    onSuccess: (text, target) => {
+      const filename = llmsFullTxtFilename(target.origin);
       saveTextFile(text, filename);
       toast.success(`Downloaded ${filename}`);
     },
@@ -55,7 +71,7 @@ export function useDownloadFullArtifact(runId: string, origin: string) {
   });
 
   return {
-    download: () => mutation.mutate(),
+    download: () => mutation.mutate({ runId, origin }),
     isDownloading: mutation.isPending,
   };
 }
