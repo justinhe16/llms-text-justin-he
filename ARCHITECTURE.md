@@ -405,25 +405,69 @@ homepage's title is what names the whole artifact.
 
 **Sitemap discovery and URL ranking, wired together as of PER-176.**
 `internals/sitemap.py`'s `discover_sitemap_urls(client, origin, *, budget, settings,
-resolver=None) -> DiscoveryResult` fills the crawl frontier before `crawl_site`'s own loop
-runs: it walks the sitemap protocol's own discovery order for one website's origin —
+resolver=None, gate=None) -> DiscoveryResult` fills the crawl frontier before `crawl_site`'s
+own loop runs: it walks the sitemap protocol's own discovery order for one website's origin —
 `/sitemap.xml`, then `/sitemap_index.xml`, then whatever `robots.txt` itself declares —
 recurses one level into a `<sitemapindex>`, and returns the same-origin `<url><loc>` entries
-it found as `DiscoveredUrl`s, under three bounds: a document-fetch counter
-(`crawl_sitemap_max_documents`, counting every attempt regardless of outcome), an
-accumulated-URL cap (`crawl_sitemap_max_urls`), and a byte-budget SHARE (a fixed fraction of
-the run's own `crawl_max_bytes`, so a huge sitemap cannot starve the page crawl that follows
-it — see that module's own docstring for the numbers). `internals/url_ranking.py`'s
-`select_urls(candidates, *, seed_url, limit) -> SelectionResult` then turns whatever discovery
-found into the subset worth spending a run's page budget on. It normalizes every candidate,
-drops the ones structurally not worth fetching under named, individually-counted rules (dated
-archives, `/tag/` and `/author/` taxonomies, pagination, feeds, changelogs, off-origin links,
-and localized duplicates of a page already chosen), scores the rest on path shape plus the
-sitemap's own `<priority>` and `<lastmod>`, and takes the top `limit`. Both modules are pure
-and clock-free like `extract.py`, `payload.py`, and `run_stats.py` — `sitemap.py` is the one
-exception that does I/O in this pairing, since finding URLs to rank means fetching a sitemap.
-`CrawlService.execute_run` (`service.py`) calls the two in sequence, discovery then selection,
-and passes `SelectionResult.selected` as `crawl_site`'s `extra_urls`.
+it found as `DiscoveredUrl`s, plus this run's parsed `robots.txt` rules on
+`DiscoveryResult.robots` (PER-191, its own paragraph below), under three bounds: a
+document-fetch counter (`crawl_sitemap_max_documents`, counting every attempt regardless of
+outcome), an accumulated-URL cap (`crawl_sitemap_max_urls`), and a byte-budget SHARE (a fixed
+fraction of the run's own `crawl_max_bytes`, so a huge sitemap cannot starve the page crawl
+that follows it — see that module's own docstring for the numbers). `internals/url_ranking.py`'s
+`select_urls(candidates, *, seed_url, limit, robots=None) -> SelectionResult` then turns
+whatever discovery found into the subset worth spending a run's page budget on. It normalizes
+every candidate, drops the ones structurally not worth fetching under named,
+individually-counted rules (dated archives, `/tag/` and `/author/` taxonomies, pagination,
+feeds, changelogs, off-origin links, a `robots.txt`-disallowed URL, and localized duplicates
+of a page already chosen — twelve rules as of PER-191, up from eleven), scores the rest on
+path shape plus the sitemap's own `<priority>` and `<lastmod>`, and takes the top `limit`.
+Both modules are pure and clock-free like `extract.py`, `payload.py`, `run_stats.py`, and
+`robots.py` (PER-191, below) — `sitemap.py` is the one exception that does I/O in this
+grouping, since finding URLs to rank means fetching a sitemap (and, as of PER-191, a
+`robots.txt`). `CrawlService.execute_run` (`service.py`) calls the two in sequence, discovery
+then selection, and passes `SelectionResult.selected` as `crawl_site`'s `extra_urls`.
+
+**`robots.txt` is obeyed, as of PER-191.** Until this ticket, `internals/sitemap.py` read
+exactly one directive out of a site's `robots.txt` — `Sitemap:` — and only when both
+well-known probes (`/sitemap.xml`, `/sitemap_index.xml`) had already come back empty.
+`Disallow`, `Allow`, and `Crawl-delay` were read by nothing, and the fetch itself was
+conditional. Both of those are now false. `discover_sitemap_urls` fetches `robots.txt`
+exactly ONCE per run, unconditionally, before either well-known probe, and hands the SAME
+response to two consumers: `_robots_sitemap_urls` (unchanged, still `Sitemap:` lines only) and
+the new third pure module in this feature's pipeline, `internals/robots.py`'s `parse_robots`,
+which turns the body into a `RobotsRules` — the winning `User-agent` group's `Allow`,
+`Disallow`, and `Crawl-delay`, with `*` and `$` wildcards and percent-encoding normalized on
+both the rule and the match side. A group naming this crawler's own product token
+(`llms-text-bot`, derived from `http_client.CRAWL_USER_AGENT`) wins outright over a `*` group,
+and the two are never merged. The parsed rules travel out on `DiscoveryResult.robots` and are
+consulted in exactly two places: `select_urls`'s `"robots_disallowed"` rule (positioned right
+after `"off_origin"`, ahead of the five guessed structural rules, because an operator-authored
+rule outranks a guessed one) drops a disallowed FRONTIER url before it is ever scored, and
+`internals/crawler.py`'s `crawl_site` gains an `is_allowed` predicate consulted for the SEED
+alone — a disallowed seed becomes a `RobotsDisallowedError`, mapped to the fixed message "This
+site's robots.txt disallows crawling this URL." and treated as PERMANENT (not retried;
+`robots.txt` will still say no in sixty seconds), rather than silently crawled anyway or
+silently producing an empty artifact. `Crawl-delay` combines with the operator's own
+`crawl_politeness_delay_ms` through `robots.py`'s `effective_crawl_delay_ms(configured_ms,
+crawl_delay_s) -> int`, which takes the larger of the two and clamps the site's own
+contribution to a 10-second ceiling (`MAX_ROBOTS_CRAWL_DELAY_MS`) — a module constant, for the
+same reason `SITEMAP_BYTE_SHARE` is one. That combined delay applies to the CRAWL phase only:
+`service.py` builds one shared `PolitenessGate` (`internals/fetcher.py`, moved there from
+`crawler.py` and made public in this same ticket) at the configured floor, hands it to
+`discover_sitemap_urls` first, and only WIDENS it — never replaces it — to the
+`Crawl-delay`-aware value after discovery has returned and before `crawl_site`'s own loop
+begins. Discovery's own remaining fetches never wait on a site's requested delay; only the
+page crawl that follows does. Every fetch this feature makes now passes through that one
+gate — discovery's included, which corrects an earlier revision of `sitemap.py`'s own
+docstring that claimed the crawl loop's gate "already owns rate-limiting on the requests this
+module does not make." A `robots.txt` this module cannot fetch or cannot parse — a 404, a
+timeout, a 500, an HTML error page, or nonsense bytes — fails OPEN: `parse_robots` never
+raises, and `ALLOW_ALL` is what both consumers see, the same rule a missing sitemap already
+follows. `RUN_STATS_VERSION` moved to **6** for it: `urls_robots_disallowed` (how many
+candidates the disallow rule dropped) and `crawl_delay_ms` (the delay this run's crawl phase
+actually used) are the two new keys, both real, recorded values on every row from this
+version onward, never absent ones.
 
 The distinction that matters is *where* that ranking sits. It runs entirely **before** any
 page is fetched, so it ranks on URL shape and sitemap metadata only — "fetch it and see
@@ -516,15 +560,20 @@ table-free I/O to do may keep it in `internals/` anyway, as this one keeps `ssrf
 discovery document, passes `internals/ssrf.py`'s SSRF guard before a socket opens, and the
 crawl loop (`internals/crawler.py`) runs under six hard caps read from `Settings` — page count,
 wall-clock budget, total response bytes, per-request timeout, concurrency, and a politeness
-delay between request starts. Hitting one of those caps ends the crawl with whatever pages it
-already collected and is a **success**, not a failure; only the seed itself failing to fetch
-is treated as one, because a run with no pages at all has nothing to build an artifact from.
+delay between request starts. **That politeness delay is now `max(configured, clamped
+Crawl-delay)`, as of PER-191** — `internals/robots.py`'s `effective_crawl_delay_ms` — and
+every fetch this feature makes, discovery's included, passes through the run's one shared
+`PolitenessGate` (`internals/fetcher.py`) rather than each phase enforcing its own. Hitting one
+of those caps ends the crawl with whatever pages it already collected and is a **success**,
+not a failure; only the seed itself failing to fetch is treated as one — which now includes a
+seed `robots.txt` disallows, `RobotsDisallowedError`, exactly as deliberately as a genuine
+fetch failure is, because a run with no pages at all has nothing to build an artifact from.
 Sitemap discovery is bounded the same way and fails the same way it succeeds: it spends from
 the SAME `ByteBudget` the page crawl does, under a fixed share of it, so `stats["cap_hit"] ==
 "bytes"` and `stats["bytes_fetched"]` stay honest about the one run-wide counter both phases
 share; and nothing discovery can do — a missing sitemap, malformed XML, an SSRF refusal, an
-exhausted cap — ever fails the run itself, the same "hitting a cap is a success" rule as the
-crawl loop's own six caps, one level earlier.
+exhausted cap, or an unreadable `robots.txt` — ever fails the run itself, the same "hitting a
+cap is a success" rule as the crawl loop's own six caps, one level earlier.
 
 ### 3.5 The database infrastructure layer
 
@@ -1505,6 +1554,12 @@ Deliberately not decided here, and not to be decided by accident in an implement
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**
+- **A per-website "ignore robots.txt" override.** PER-191 made `Disallow` and `Crawl-delay`
+  binding for every run — there is no flag, setting, or per-website column that lets a user
+  crawl a page their own site's `robots.txt` disallows, or crawl faster than its declared
+  `Crawl-delay` allows. Whether such an override should ever exist, and what it would mean for
+  a user to explicitly consent to ignoring a site's own policy file, is undesigned and needs
+  its own ticket rather than a flag added quietly beside this one.
 - **Cleaning up orphaned Storage objects.** `CrawlService.execute_run` uploads a run's
   payload to Storage before `RunService.record_success` writes the row that names it (§5.1),
   and deleting a website cascades its `runs` rows but never touches Storage (§6.4) — both are

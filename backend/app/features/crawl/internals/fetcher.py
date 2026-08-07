@@ -27,7 +27,10 @@ concurrency, deadlines, or the page cap — those remain the crawl loop's job
 returns exactly one `CrawledPage` or raises.
 """
 
+import asyncio
 import logging
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from urllib.parse import urljoin, urlsplit
 
@@ -112,6 +115,66 @@ class ByteBudget:
                 f"crawl byte budget exceeded: {self._used + num_bytes} > {self._max_bytes}"
             )
         self._used += num_bytes
+
+
+class PolitenessGate:
+    """Serializes request STARTS to at least `delay_s` apart, across the whole run.
+
+    One `asyncio.Lock` plus a monotonic "next allowed start" timestamp. Held for the entire
+    wait — including the `asyncio.sleep` — rather than released early, which is what makes
+    "at least `delay_s` apart" true of the order callers actually reach the lock in, not
+    just true on average: a caller computes its own start time from whatever
+    `_next_allowed_start` currently says, sleeps until it, publishes the next one, and only
+    then lets the next waiter in.
+
+    **Public, and defined here rather than in `internals/crawler.py`, for exactly the reason
+    `ByteBudget` above already is** — see that class's own docstring. Before PER-191 this was
+    `crawler.py`'s own private `_PolitenessGate`, awaited once, by the crawl loop alone. As of
+    PER-191 it is shared across TWO phases of one run: `internals/sitemap.py`'s
+    `discover_sitemap_urls` awaits it for its own fetches (at the operator-configured delay,
+    never a site's own `Crawl-delay` — see `internals/robots.py`'s module docstring for why
+    that split is deliberate), and `app.features.crawl.service.CrawlService.execute_run`
+    builds ONE instance, hands it to both, and widens it (`widen_to`, below) once discovery
+    has returned and before `crawl_site`'s own loop begins. Putting it in `crawler.py` and
+    having `sitemap.py` import `crawler` would invert this feature's own pipeline layering —
+    discovery runs BEFORE the crawl loop — so it lives beside `ByteBudget`, the other run-wide
+    shared limiter, instead.
+    """
+
+    def __init__(self, delay_s: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self._delay_s = delay_s
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._next_allowed_start: float | None = None
+
+    @property
+    def delay_s(self) -> float:
+        """The gap this gate currently enforces, in seconds — for logging and stats
+        readability (`runs.stats["crawl_delay_ms"]`, `internals/run_stats.py`)."""
+        return self._delay_s
+
+    async def wait_for_turn(self) -> None:
+        """Block until this caller may start its request, then reserve the next slot."""
+        async with self._lock:
+            now = self._clock()
+            start_at = (
+                now if self._next_allowed_start is None else max(now, self._next_allowed_start)
+            )
+            wait = start_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._next_allowed_start = start_at + self._delay_s
+
+    def widen_to(self, delay_s: float) -> None:
+        """Raise this gate's delay to at least `delay_s`, never lower it.
+
+        Call this BETWEEN phases only — never while a request the gate is serializing might be
+        in flight — which is why it is not guarded by `_lock`: a widen racing a concurrent
+        `wait_for_turn()` could read `_delay_s` mid-update, and the one caller this method has
+        (`CrawlService.execute_run`, after `discover_sitemap_urls` has fully returned and
+        before `crawl_site` starts) never does that.
+        """
+        self._delay_s = max(self._delay_s, delay_s)
 
 
 async def _read_body_within_budget(response: httpx.Response, budget: ByteBudget) -> tuple[str, int]:

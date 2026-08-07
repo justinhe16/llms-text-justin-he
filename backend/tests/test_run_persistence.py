@@ -40,6 +40,7 @@ from conftest import (
 from app.core.settings import settings
 from app.features.crawl.internals.crawler import CrawlResult
 from app.features.crawl.internals.payload import PAYLOAD_CONTENT_TYPE
+from app.features.crawl.internals.robots import ALLOW_ALL
 from app.features.crawl.internals.sitemap import DiscoveryResult
 from app.features.crawl.schemas import CrawledPage
 from app.features.crawl.service import TransientCrawlError, build_crawl_service
@@ -137,7 +138,7 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 5
+    assert stats["version"] == 6
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
     assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
@@ -307,7 +308,10 @@ async def test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats(
         return fake_result
 
     async def fake_discover_sitemap_urls(*args: object, **kwargs: object) -> DiscoveryResult:
-        return DiscoveryResult([], "none")
+        # `robots=ALLOW_ALL` explicit rather than relied on as `DiscoveryResult`'s default
+        # (PER-191) — this fake's whole point is to stand in for a network call, and stating
+        # the value makes that intent legible rather than incidental.
+        return DiscoveryResult([], "none", ALLOW_ALL)
 
     monkeypatch.setattr("app.features.crawl.service.crawl_site", fake_crawl_site)
     monkeypatch.setattr(
@@ -407,7 +411,7 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 5
+    assert stats["version"] == 6
     # A failure row carries the same KEYS as a success row, at their hoisted defaults — the
     # shape `runs.stats` stores must not depend on how far a run got before it failed. The
     # four PER-180 counters are part of that same guarantee now: this suite's `_execute`
@@ -709,11 +713,12 @@ async def test_a_site_with_no_sitemap_falls_back_to_the_links_on_its_seed_page(
     assert stats["urls_discovered"] == 3, "off-origin, mailto: and fragment-only never count"
     assert stats["urls_selected"] == 3
     assert stats["pages_crawled"] == 4
-    assert stats["version"] == 5, (
+    assert stats["version"] == 6, (
         "a new VALUE for an existing key is still not a new shape — PER-178 added "
-        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 5 '
-        "because PER-180 added four enrich KEYS after that, which is a shape change; the "
-        "number moved for a reason that has nothing to do with the value asserted above."
+        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 6 '
+        "because PER-180 added four enrich KEYS and PER-191 added two robots KEYS after "
+        "that, both shape changes; the number moved for a reason that has nothing to do "
+        "with the value asserted above."
     )
 
 
@@ -1064,7 +1069,7 @@ async def test_model_titles_reach_llms_txt_and_the_extracted_title_does_not(
     assert "Extracted Title Nobody Should See In The Artifact" not in row["llms_txt"]
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 5
+    assert stats["version"] == 6
     assert stats["pages_enriched"] == 1
     assert stats["enrich_failures"] == 0
 
@@ -1320,3 +1325,155 @@ async def test_the_anthropic_call_never_happens_inside_a_database_transaction(
     assert saw_enrich, "the Anthropic call never happened at all"
     assert saw_upload, "the Storage upload never happened at all"
     assert depth == 0, "a transaction was left open"
+
+
+# -----------------------------------------------------------------------------------------
+# PER-191: robots.txt's Disallow and Crawl-delay, wired into execute_run behind the shared
+# PolitenessGate and select_urls' own "robots_disallowed" rule. Each test below drives the
+# real discover_sitemap_urls -> select_urls -> crawl_site pipeline through the same
+# httpx.MockTransport every other test in this section shares, and asserts on the run row
+# it produces. tests/test_crawl_robots.py pins the parser in isolation,
+# tests/test_url_ranking.py pins the drop rule, and tests/test_crawler_caps.py pins the
+# seed-only check and the gate — what is pinned here is the end-to-end wiring.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_a_disallowed_sitemap_url_is_never_fetched_and_is_counted(
+    websites_db: Pool,
+) -> None:
+    """[Disallow — frontier]. `robots.txt` disallows `/robots-frontier/private`; the sitemap
+    lists it alongside two allowed pages. The handler raises if it is ever requested — a
+    regression that let it through would surface as `pages_crawled`/`pages_failed` disagreeing
+    with the counts asserted below, not merely as a missing artifact bullet."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "robots-frontier")
+    storage = FakeStorage()
+
+    sitemap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://{_SEED_IP}/robots-frontier/allowed-1</loc></url>
+  <url><loc>http://{_SEED_IP}/robots-frontier/allowed-2</loc></url>
+  <url><loc>http://{_SEED_IP}/robots-frontier/private</loc></url>
+</urlset>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sitemap.xml":
+            return httpx.Response(
+                200, text=sitemap_body, headers={"Content-Type": "application/xml"}
+            )
+        if request.url.path == "/sitemap_index.xml":
+            return httpx.Response(404)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /robots-frontier/private\n")
+        if request.url.path == "/robots-frontier/private":
+            raise AssertionError("a disallowed URL must never be fetched")
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["pages_crawled"] == 3, "seed + allowed-1 + allowed-2 — private never fetched"
+    assert stats["pages_failed"] == 0
+    assert stats["urls_robots_disallowed"] == 1
+
+
+async def test_a_run_whose_seed_is_disallowed_fails_with_a_specific_message(
+    websites_db: Pool,
+) -> None:
+    """[Disallow — seed]. `robots.txt` disallows the run's own seed path. The seed is never
+    requested at all — the handler raises if it is — and the run fails with the fixed,
+    specific message `_safe_error_message` maps `RobotsDisallowedError` to."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "robots-seed")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml"):
+            return httpx.Response(404)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /robots-seed\n")
+        if request.url.path == "/robots-seed":
+            raise AssertionError("a disallowed seed must never be fetched")
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is None
+
+    row = await websites_db.fetchrow("SELECT status, error FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["error"] == "This site's robots.txt disallows crawling this URL."
+
+
+async def test_a_crawl_delay_is_recorded_in_the_stored_stats(websites_db: Pool) -> None:
+    """[Crawl-delay]. `robots.txt` declares `Crawl-delay: 3600`; the sitemap is empty and the
+    seed page carries no links at all, so there is no frontier and the politeness gate is
+    never actually awaited by anything. This shape is mandatory: any test that combines a real
+    frontier with a large `Crawl-delay` would really sleep, since `service.py` injects no fake
+    clock into `PolitenessGate`. `MAX_ROBOTS_CRAWL_DELAY_MS` (10s) is what clamps 3600s down to
+    the value asserted below."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "crawl-delay")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml"):
+            return httpx.Response(404)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nCrawl-delay: 3600\n")
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["crawl_delay_ms"] == 10_000
+
+
+async def test_an_unreadable_robots_txt_completes_the_run(websites_db: Pool) -> None:
+    """[Failure is open], persisted end to end: a 500 at `/robots.txt` allows everything, and
+    the run still completes on the seed alone rather than failing."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "robots-500")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml"):
+            return httpx.Response(404)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(500)
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["urls_robots_disallowed"] == 0
+    assert stats["crawl_delay_ms"] == settings.crawl_politeness_delay_ms
+
+
+async def test_stats_version_is_six(websites_db: Pool) -> None:
+    """[Observability]. A live row lands with `RUN_STATS_VERSION` 6 — the persistence-layer
+    companion to `tests/test_run_stats.py::test_run_stats_version_is_pinned`, which only
+    checks the constant itself."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-six")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    stats = json.loads(row["stats"])
+    assert stats["version"] == 6

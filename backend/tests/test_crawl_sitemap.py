@@ -37,7 +37,8 @@ from conftest import _JsonLogCapture
 
 from app.core.settings import Settings
 from app.features.crawl.internals import sitemap
-from app.features.crawl.internals.fetcher import ByteBudget
+from app.features.crawl.internals.fetcher import ByteBudget, PolitenessGate
+from app.features.crawl.internals.robots import ALLOW_ALL
 from app.features.crawl.internals.sitemap import (
     SITEMAP_BYTE_SHARE,
     DiscoveryResult,
@@ -279,7 +280,10 @@ async def test_a_sitemap_index_is_recursed_one_level_and_child_urls_are_merged()
         "https://docs.test/guides/one",
         "https://docs.test/guides/two",
     ]
+    # PER-191: `robots.txt` is now fetched first, unconditionally, before either well-known
+    # probe.
     assert site.requested_paths == [
+        "/robots.txt",
         "/sitemap.xml",
         "/sitemap_index.xml",
         "/sitemaps/docs.xml",
@@ -377,33 +381,6 @@ async def test_robots_sitemap_directive_is_used_when_neither_well_known_path_exi
 )
 def test_robots_directive_parsing(text: str, expected: list[str]) -> None:
     assert sitemap._robots_sitemap_urls(text, origin=ORIGIN) == expected
-
-
-async def test_robots_disallow_and_crawl_delay_are_ignored() -> None:
-    site = _Site()
-    site.add("/sitemap.xml", 404)
-    site.add("/sitemap_index.xml", 404)
-    site.add(
-        "/robots.txt",
-        200,
-        "User-agent: *\nDisallow: /\nAllow:\nCrawl-delay: 10\nSitemap: /docs.xml\n",
-    )
-    site.add(
-        "/docs.xml", 200, _load_fixture("sitemap_child_docs.xml"), content_type="application/xml"
-    )
-    resolver, _resolved_hosts = _resolver()
-
-    async with site.client() as client:
-        result = await discover_sitemap_urls(
-            client, ORIGIN, budget=ByteBudget(10_000_000), settings=_settings(), resolver=resolver
-        )
-
-    assert result.source == "robots"
-    assert [u.url for u in result.urls] == [
-        "https://docs.test/docs/one",
-        "https://docs.test/docs/two",
-        "https://docs.test/docs/three",
-    ]
 
 
 # -----------------------------------------------------------------------------------------
@@ -537,7 +514,14 @@ async def test_a_grandchild_index_is_fetched_but_not_recursed_into() -> None:
         "https://docs.test/guides/one",
         "https://docs.test/guides/two",
     ]
-    assert site.requested_paths == ["/sitemap.xml", "/sitemaps/docs.xml", "/sitemaps/guides.xml"]
+    # PER-191: `robots.txt` is now fetched first, unconditionally, before either well-known
+    # probe.
+    assert site.requested_paths == [
+        "/robots.txt",
+        "/sitemap.xml",
+        "/sitemaps/docs.xml",
+        "/sitemaps/guides.xml",
+    ]
 
 
 async def test_no_more_than_crawl_sitemap_max_documents_are_fetched() -> None:
@@ -563,8 +547,9 @@ async def test_no_more_than_crawl_sitemap_max_documents_are_fetched() -> None:
             resolver=resolver,
         )
 
-    # index + 2 children — a cap is a SUCCESS, not an empty result.
-    assert len(site.requested_paths) == 3
+    # robots.txt (PER-191: fetched unconditionally, but does not count against the document
+    # cap) + index + 2 children — a cap is a SUCCESS, not an empty result.
+    assert len(site.requested_paths) == 4
     assert result.urls != []
 
 
@@ -1013,3 +998,158 @@ async def test_a_non_2xx_response_carrying_a_valid_sitemap_is_not_parsed() -> No
         )
 
     assert result == DiscoveryResult([], "none")
+
+
+# -----------------------------------------------------------------------------------------
+# 10. PER-191: robots.txt is fetched exactly once, unconditionally, and feeds both
+# consumers — the `Sitemap:` lines AND the parsed `Disallow`/`Allow`/`Crawl-delay` rules.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_robots_txt_is_fetched_exactly_once_on_a_site_with_a_working_sitemap() -> None:
+    """[Unconditional fetch]. A `/sitemap.xml` that answers directly used to mean `robots.txt`
+    was never fetched at all (it was tried only once both well-known probes had failed). As of
+    PER-191 it is fetched anyway — exactly once — and its rules travel out on the same
+    `DiscoveryResult` the sitemap-derived URLs do."""
+    site = _Site()
+    site.add("/sitemap.xml", 200, _load_fixture("sitemap.xml"), content_type="application/xml")
+    site.add("/robots.txt", 200, "User-agent: *\nDisallow: /private/\n")
+    resolver, _resolved_hosts = _resolver()
+
+    async with site.client() as client:
+        result = await discover_sitemap_urls(
+            client, ORIGIN, budget=ByteBudget(10_000_000), settings=_settings(), resolver=resolver
+        )
+
+    assert result.source == "sitemap"
+    assert site.requested_paths.count("/robots.txt") == 1
+    assert result.robots.disallow == ("/private/",)
+
+
+async def test_the_same_robots_response_feeds_both_the_sitemap_lines_and_the_rules() -> None:
+    """[Unconditional fetch]. One `robots.txt` body carrying BOTH a `Sitemap:` line and a
+    `Disallow` rule — the same fetch, read by `_robots_sitemap_urls` and `parse_robots`
+    alike, never fetched twice."""
+    site = _Site()
+    site.add("/sitemap.xml", 404)
+    site.add("/sitemap_index.xml", 404)
+    site.add("/robots.txt", 200, "User-agent: *\nDisallow: /private/\nSitemap: /real.xml\n")
+    site.add(
+        "/real.xml", 200, _urlset_with_one_url(f"{ORIGIN}/page"), content_type="application/xml"
+    )
+    resolver, _resolved_hosts = _resolver()
+
+    async with site.client() as client:
+        result = await discover_sitemap_urls(
+            client, ORIGIN, budget=ByteBudget(10_000_000), settings=_settings(), resolver=resolver
+        )
+
+    assert result.source == "robots"
+    assert [u.url for u in result.urls] == [f"{ORIGIN}/page"]
+    assert result.robots.disallow == ("/private/",)
+    assert site.requested_paths.count("/robots.txt") == 1
+
+
+async def test_discovery_requests_go_through_the_politeness_gate() -> None:
+    """[Discovery politeness]. A caller-supplied `PolitenessGate` is awaited once per document
+    fetch this module makes, `robots.txt` included."""
+
+    class _CountingGate(PolitenessGate):
+        def __init__(self) -> None:
+            super().__init__(0.0)
+            self.calls = 0
+
+        async def wait_for_turn(self) -> None:
+            self.calls += 1
+            await super().wait_for_turn()
+
+    site = _Site()
+    site.add("/sitemap.xml", 404)
+    site.add("/sitemap_index.xml", 404)
+    site.add("/robots.txt", 200, "Sitemap: /real.xml\n")
+    site.add(
+        "/real.xml", 200, _urlset_with_one_url(f"{ORIGIN}/page"), content_type="application/xml"
+    )
+    resolver, _resolved_hosts = _resolver()
+    gate = _CountingGate()
+
+    async with site.client() as client:
+        result = await discover_sitemap_urls(
+            client,
+            ORIGIN,
+            budget=ByteBudget(10_000_000),
+            settings=_settings(),
+            resolver=resolver,
+            gate=gate,
+        )
+
+    assert result.source == "robots"
+    # robots.txt + /sitemap.xml + /sitemap_index.xml + /real.xml — every document fetch this
+    # run made, robots.txt included, went through the gate exactly once.
+    assert gate.calls == 4
+
+
+@pytest.mark.parametrize("failure_mode", ["404", "500", "timeout", "html_error_page"])
+async def test_an_unreadable_robots_txt_allows_everything(failure_mode: str) -> None:
+    """[Failure is open]. A 404, a 500, a timeout, and an HTML error page at `/robots.txt`
+    all collapse to the same `ALLOW_ALL` — and, since `robots.txt` failing is never fatal to
+    discovery, the run still completes rather than raising."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            if failure_mode == "404":
+                return httpx.Response(404)
+            if failure_mode == "500":
+                return httpx.Response(500)
+            if failure_mode == "timeout":
+                raise httpx.TimeoutException("simulated timeout", request=request)
+            return httpx.Response(
+                200,
+                text="<!DOCTYPE html><html><body>Not Found</body></html>",
+                headers={"Content-Type": "text/html"},
+            )
+        return httpx.Response(404)
+
+    resolver, _resolved_hosts = _resolver()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=False
+    ) as client:
+        result = await discover_sitemap_urls(
+            client, ORIGIN, budget=ByteBudget(10_000_000), settings=_settings(), resolver=resolver
+        )
+
+    assert result.robots == ALLOW_ALL
+    assert result == DiscoveryResult([], "none")
+
+
+async def test_a_crawl_delay_does_not_slow_discoverys_own_remaining_fetches() -> None:
+    """[Crawl-delay] / D3. `robots.txt` publishes `Crawl-delay: 10`, but the gate
+    `discover_sitemap_urls` was handed stays at whatever the caller configured it at — nothing
+    inside discovery ever widens its own gate to a site's requested delay. That widening is
+    `service.py`'s job, done AFTER discovery has returned
+    (`internals/robots.py`'s module docstring's D3 section). A real 10-second wait here would
+    make this test hang; completing quickly IS the assertion."""
+    site = _Site()
+    site.add("/sitemap.xml", 404)
+    site.add("/sitemap_index.xml", 404)
+    site.add("/robots.txt", 200, "User-agent: *\nCrawl-delay: 10\nSitemap: /real.xml\n")
+    site.add(
+        "/real.xml", 200, _urlset_with_one_url(f"{ORIGIN}/page"), content_type="application/xml"
+    )
+    resolver, _resolved_hosts = _resolver()
+    gate = PolitenessGate(0.01)
+
+    async with site.client() as client:
+        result = await discover_sitemap_urls(
+            client,
+            ORIGIN,
+            budget=ByteBudget(10_000_000),
+            settings=_settings(),
+            resolver=resolver,
+            gate=gate,
+        )
+
+    assert result.source == "robots"
+    assert result.robots.crawl_delay_s == 10.0
+    assert gate.delay_s == 0.01

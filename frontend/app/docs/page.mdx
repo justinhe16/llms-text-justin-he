@@ -61,30 +61,37 @@ most 25% of the run's byte budget, which is 12.5 MiB. It reads `<loc>`, `<lastmo
 `<priority>`, and follows a sitemap index one level down. A document containing a `<!DOCTYPE`
 declaration is refused before parsing.
 
-Every other `robots.txt` directive is ignored. A failure at any source is logged and skipped.
+`/robots.txt` is read once per run, before the sitemap probes, whether or not the run needs it
+for a `Sitemap:` line. The group naming this crawler (`llms-text-bot`) wins over a `*` group,
+and the two are never combined. `Allow` and `Disallow` support `*` and `$` wildcards, and the
+longest matching rule wins. A `robots.txt` that cannot be read — missing, unreachable, or not
+parseable — allows everything. A failure at any discovery source is logged and skipped.
 Discovery returns an empty list on total failure, and the run continues with the seed page
 alone.
 
 This ordering is not novel. [Firecrawl](https://firecrawl.dev) and most tools that turn a site
 into an `llms.txt` read the sitemap first and fall back to page links, because a sitemap is the
 site's own statement of what it considers canonical and costs one request to read. Discovery
-here follows that shape and departs from it in three places: it never recurses past the seed
-page, where a general crawler follows links to a configured depth; it does not supplement the
-frontier with search results or with pages cached from an earlier run; and it reads
-`robots.txt` for `Sitemap:` lines rather than as a set of rules to obey. The borrowing is more
-literal further down the pipeline — the prompt under Summarize is Firecrawl's, word for
-word.
+here follows that shape and departs from it in two places: it never recurses past the seed
+page, where a general crawler follows links to a configured depth, and it does not supplement
+the frontier with search results or with pages cached from an earlier run. It reads
+`robots.txt` fully — `Disallow`, `Allow`, and `Crawl-delay`, not only `Sitemap:` lines — which
+aligns it with the prior art rather than departing from it. The borrowing is more literal
+further down the pipeline — the prompt under Summarize is Firecrawl's, word for word.
 
 ## Selection
 
 Selection turns discovered URLs into the fetch list. It normalizes each URL, drops URLs by
 rule, scores the survivors, sorts them, and caps the result.
 
-Eleven drop rules apply in a fixed order: unparseable, duplicate, seed, off-origin, dated
-archive, taxonomy, pagination, feed, changelog, localized duplicate, and over-limit. A dated
-archive is a path segment holding a year from 1990 to 2099. A taxonomy path contains a segment
-such as `tag`, `category` or `author`. A localized duplicate sits under a locale prefix whose
-unprefixed form ranked higher and was already selected.
+Twelve drop rules apply in a fixed order: unparseable, duplicate, seed, off-origin, robots
+disallow, dated archive, taxonomy, pagination, feed, changelog, localized duplicate, and
+over-limit. A dated archive is a path segment holding a year from 1990 to 2099. A taxonomy
+path contains a segment such as `tag`, `category` or `author`. A localized duplicate sits
+under a locale prefix whose unprefixed form ranked higher and was already selected. The
+robots disallow rule is the one operator-authored rule in the list — every other rule guesses
+from a URL's shape; this one drops exactly what the site's own `robots.txt` asked not to be
+fetched.
 
 Scoring starts at zero. The site root adds 6.0. A path segment such as `docs`, `guide`,
 `reference` or `api` adds 4.0. Each path segment subtracts 1.0. A sitemap `priority` moves the
@@ -95,7 +102,8 @@ selects the same pages.
 ## Fetch
 
 Fetching runs under six caps: 100 pages, 5 minutes, 50 MiB, 10 seconds per request, 5
-concurrent requests, and 200 ms between requests.
+concurrent requests, and 200 ms between requests, or the site's own `Crawl-delay` where it
+asks for more, up to 10 seconds.
 
 Every URL passes an SSRF check before a socket opens. The check requires an `http` or `https`
 scheme, port 80 or 443, and no embedded credentials. It resolves the host and refuses the URL
@@ -193,9 +201,11 @@ here so nobody discovers one by hitting it.
 The page and byte caps are budgets. Reaching one part-way through ends the run with the pages
 already collected, so a large site yields a partial file and a `completed` run.
 
-Two cases fail a run outright. The first is a seed page that cannot be fetched. The second is
-a seed page over the byte cap, which reports "The site's response was too large." A run
-stopped at 5 minutes is cut off mid-flight.
+Three cases fail a run outright. The first is a seed page that cannot be fetched. The second
+is a seed page over the byte cap, which reports "The site's response was too large." The
+third is a seed page the site's own `robots.txt` disallows, which reports "This site's
+robots.txt disallows crawling this URL." and is never fetched at all. A run stopped at 5
+minutes is cut off mid-flight.
 
 A run gets 3 attempts when it fails on a request timeout, a transport error, or a storage
 upload failure. The two retries wait 10 seconds and 60 seconds. Every other failure is

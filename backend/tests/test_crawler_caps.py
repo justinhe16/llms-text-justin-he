@@ -14,8 +14,8 @@ from pathlib import Path
 import httpx
 
 from app.core.settings import Settings
-from app.features.crawl.internals.crawler import CrawlLimits, crawl_site
-from app.features.crawl.internals.fetcher import ByteBudget
+from app.features.crawl.internals.crawler import CrawlLimits, RobotsDisallowedError, crawl_site
+from app.features.crawl.internals.fetcher import ByteBudget, PolitenessGate
 from app.features.crawl.internals.links import extract_links
 from app.features.crawl.internals.sitemap import SITEMAP_BYTE_SHARE, discover_sitemap_urls
 from app.features.crawl.internals.ssrf import Resolver
@@ -220,7 +220,7 @@ async def test_politeness_delay_spaces_out_frontier_request_starts() -> None:
     assert len(frontier_starts) == 3
     for earlier, later in zip(frontier_starts, frontier_starts[1:], strict=False):
         # A small tolerance below 50ms guards against scheduler jitter, not against the
-        # gate itself: `_PolitenessGate` only ever sleeps to reach or exceed its target.
+        # gate itself: `PolitenessGate` only ever sleeps to reach or exceed its target.
         assert later - earlier >= 0.045
 
 
@@ -405,6 +405,14 @@ async def test_a_huge_sitemap_does_not_starve_the_page_crawl() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/sitemap.xml":
             return httpx.Response(200, content=huge_sitemap)
+        # PER-191: `discover_sitemap_urls` now fetches `/robots.txt` unconditionally, before
+        # the sitemap probes. Without this branch it would fall through to the `seed_body`
+        # default below and serve 300 KB at `/robots.txt` too — tripping the 12.5% discovery
+        # byte share on ROBOTS alone, before `/sitemap.xml` is ever reached, and silently
+        # gutting what this test is actually pinning (that the oversized SITEMAP does not
+        # starve the seed fetch that follows it).
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
         return httpx.Response(200, text=seed_body)
 
     budget = ByteBudget(settings.crawl_max_bytes)
@@ -676,3 +684,112 @@ async def test_a_seed_page_with_no_links_is_a_successful_single_page_run() -> No
     assert result.seed_error is None
     assert result.cap_hit is None
     assert [page.url for page in result.pages] == ["https://seed.test/"]
+
+
+# -----------------------------------------------------------------------------------------
+# PER-191: `is_allowed`, the seed-only robots.txt check, and the caller-supplied `gate`.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_a_disallowed_seed_is_never_fetched_and_becomes_a_seed_error() -> None:
+    """[Disallow — seed]. `is_allowed` refusing the seed means no request is ever made — the
+    handler raises on ANY request, so a passing test proves the socket was never opened, not
+    merely that the fetch happened to fail some other way."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(
+            f"unreachable: a disallowed seed must never be fetched ({request.url})"
+        )
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            is_allowed=lambda url: False,
+            resolver=_fake_resolver(),
+        )
+
+    assert result.pages == []
+    assert isinstance(result.seed_error, RobotsDisallowedError)
+    assert result.cap_hit is None
+
+
+async def test_an_allowed_seed_is_fetched_normally_with_the_same_predicate_shape() -> None:
+    """Falsifiability partner: the identical predicate shape, answering `True` this time —
+    the seed is fetched exactly as it would be with no `is_allowed` at all."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="ok")
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            is_allowed=lambda url: True,
+            resolver=_fake_resolver(),
+        )
+
+    assert result.seed_error is None
+    assert [page.url for page in result.pages] == ["https://seed.test/"]
+
+
+async def test_an_injected_gate_is_used_instead_of_limits_politeness_delay() -> None:
+    """Mirrors `test_a_caller_supplied_budget_is_used_instead_of_limits_max_bytes`: a
+    caller-supplied `PolitenessGate`, built at a delay `limits.politeness_delay_ms` does not
+    itself carry, is what actually binds — `limits`' own (zero) delay would space out nothing,
+    so a gap this large can only be explained by the injected gate."""
+    start_times: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start_times.append(time.monotonic())
+        return httpx.Response(200, text="ok")
+
+    seed = "http://seed.test/"
+    extra = [f"http://f{i}.test/" for i in range(2)]
+    gate = PolitenessGate(0.05)
+
+    async with _client(handler) as client:
+        await crawl_site(
+            client,
+            seed,
+            limits=_limits(politeness_delay_ms=0, concurrency=2),
+            extra_urls=extra,
+            gate=gate,
+            resolver=_fake_resolver(),
+        )
+
+    frontier_starts = start_times[1:]
+    assert len(frontier_starts) == 2
+    assert frontier_starts[1] - frontier_starts[0] >= 0.045
+
+
+async def test_widening_a_gate_between_phases_applies_to_the_frontier() -> None:
+    """`PolitenessGate.widen_to`, called BEFORE `crawl_site` — exactly the shape `service.py`
+    uses once `internals/robots.py`'s `effective_crawl_delay_ms` has been computed from a run's
+    one `robots.txt` fetch."""
+    start_times: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start_times.append(time.monotonic())
+        return httpx.Response(200, text="ok")
+
+    seed = "http://seed.test/"
+    extra = [f"http://f{i}.test/" for i in range(2)]
+    gate = PolitenessGate(0.0)
+    gate.widen_to(0.05)
+
+    async with _client(handler) as client:
+        await crawl_site(
+            client,
+            seed,
+            limits=_limits(politeness_delay_ms=0, concurrency=2),
+            extra_urls=extra,
+            gate=gate,
+            resolver=_fake_resolver(),
+        )
+
+    frontier_starts = start_times[1:]
+    assert len(frontier_starts) == 2
+    assert frontier_starts[1] - frontier_starts[0] >= 0.045

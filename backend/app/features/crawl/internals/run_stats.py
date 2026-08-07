@@ -41,7 +41,7 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
-RUN_STATS_VERSION: Final = 5
+RUN_STATS_VERSION: Final = 6
 """Which definition of this whole dict's shape a stored row was written under — not just
 `links_emitted`'s meaning, but which KEYS a row of this version even has.
 
@@ -151,7 +151,34 @@ having nothing to send.
 The two token keys exist so a run's model spend is readable from the row that already
 describes everything else about it, rather than requiring a trip to a billing dashboard to
 answer "did this run's enrichment pass cost anything, and how much" — the same motivation
-`bytes_fetched` already serves for the crawl's own network cost."""
+`bytes_fetched` already serves for the crawl's own network cost.
+
+**Version 6** rows add two keys and redefine nothing (PER-191): `urls_robots_disallowed` and
+`crawl_delay_ms` describe how this run's `robots.txt` — read once, unconditionally, by
+`internals/sitemap.py`'s `discover_sitemap_urls` — affected the frontier and the fetch
+pace. `urls_robots_disallowed` is `SelectionResult.dropped.get("robots_disallowed", 0)` from
+whichever `select_urls` call actually produced this run's frontier (the sitemap-derived one,
+or the depth-1 link fallback's, exactly as `urls_discovered`/`urls_selected` already do —
+`service.py` overwrites all three together when the fallback runs). `crawl_delay_ms` is the
+politeness gap this run's crawl phase actually used —
+`internals/robots.py`'s `effective_crawl_delay_ms(configured_ms, robots.crawl_delay_s)` — not
+merely `Settings.crawl_politeness_delay_ms` copied across.
+
+Every version-5 key keeps its version-5 meaning here. Both new keys are recorded on EVERY row
+from this version onward, including a run whose `robots.txt` was unreadable or declared no
+restriction at all: `urls_robots_disallowed: 0` there is a real, recorded zero — this run's
+robots.txt disallowed nothing — the same "0 is data, not an absent key" rule version 5's own
+paragraph makes for `pages_enriched`.
+
+**`crawl_delay_ms == Settings.crawl_politeness_delay_ms` is not, by itself, evidence that the
+site published no `Crawl-delay`** — the same "cannot be read alone" caveat `pages_enriched`
+carries, and for a structurally identical reason: a site can publish `Crawl-delay: 0.1` and
+still leave this key exactly at the operator's own configured floor, because
+`effective_crawl_delay_ms` never lowers it, only ever raises it. Reading `crawl_delay_ms` on
+its own tells you the pace this run's crawl phase actually used; it does not, alone, tell you
+whether that pace came from `Settings` or from the site itself — `robots.txt`'s own
+`Crawl-delay`, when the run needs that answered, is not itself a stored field (this key is
+the derived NUMBER a run used, not the site's raw declaration)."""
 
 
 def build_run_stats(
@@ -162,6 +189,8 @@ def build_run_stats(
     discovery_source: str,
     urls_discovered: int,
     urls_selected: int,
+    urls_robots_disallowed: int,
+    crawl_delay_ms: int,
     pages_enriched: int,
     enrich_failures: int,
     enrich_input_tokens: int,
@@ -225,6 +254,16 @@ def build_run_stats(
             instead of it because the RATIO is the tunable thing: a run that discovered 4,000
             URLs and selected 24 says something about the ranking that neither number says
             alone.
+        urls_robots_disallowed: How many candidates `url_ranking.select_urls` dropped under
+            `"robots_disallowed"` — `SelectionResult.dropped.get("robots_disallowed", 0)` from
+            whichever `select_urls` call actually produced this run's frontier (PER-191). `0`
+            is a real, recorded value here — either this run's `robots.txt` disallowed
+            nothing, or there was no `robots.txt` to read — never an absent key.
+        crawl_delay_ms: The politeness gap this run's crawl phase actually used, in
+            milliseconds — `internals/robots.py`'s `effective_crawl_delay_ms(configured_ms,
+            robots.crawl_delay_s)`. See `RUN_STATS_VERSION`'s own version-6 paragraph for why
+            this being equal to `Settings.crawl_politeness_delay_ms` is not, by itself,
+            evidence the site published no `Crawl-delay`.
         pages_enriched: How many pages `internals/enrich.py`'s `enrich_pages` gave a
             model-written title and description — `len(EnrichmentResult.summaries)`. `0` on
             every run where `crawl_enrich_with_llm` is off, and see `RUN_STATS_VERSION`'s own
@@ -243,11 +282,11 @@ def build_run_stats(
 
     Returns:
         `crawl_stats` spread first, followed by `links_emitted`, `full_txt_truncated`,
-        `discovery_source`, `urls_discovered`, `urls_selected`, `pages_enriched`,
-        `enrich_failures`, `enrich_input_tokens`, `enrich_output_tokens`, and `version`.
-        `crawl_stats`'s own keys come first and are never overwritten by the ten added here,
-        because none of those ten names is a key
-        `CrawlResult.stats` has ever produced.
+        `discovery_source`, `urls_discovered`, `urls_selected`, `urls_robots_disallowed`,
+        `crawl_delay_ms`, `pages_enriched`, `enrich_failures`, `enrich_input_tokens`,
+        `enrich_output_tokens`, and `version`. `crawl_stats`'s own keys come first and are
+        never overwritten by the twelve added here, because none of those twelve names is a
+        key `CrawlResult.stats` has ever produced.
     """
     stats = {
         **crawl_stats,
@@ -256,6 +295,8 @@ def build_run_stats(
         "discovery_source": discovery_source,
         "urls_discovered": urls_discovered,
         "urls_selected": urls_selected,
+        "urls_robots_disallowed": urls_robots_disallowed,
+        "crawl_delay_ms": crawl_delay_ms,
         "pages_enriched": pages_enriched,
         "enrich_failures": enrich_failures,
         "enrich_input_tokens": enrich_input_tokens,

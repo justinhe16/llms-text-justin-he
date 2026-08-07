@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from app.features.crawl.internals import url_ranking
+from app.features.crawl.internals.robots import RobotsRules
 from app.features.crawl.internals.url_ranking import (
     DiscoveredUrl,
     DiscoveredUrlSource,
@@ -569,6 +570,82 @@ def test_over_limit_counts_every_survivor_beyond_the_cap() -> None:
     _assert_reconciles(result)
 
 
+# --- Robots (PER-191) -------------------------------------------------------------------------
+
+
+def test_a_disallowed_url_is_dropped_under_robots_disallowed() -> None:
+    """[Disallow — frontier]."""
+    candidates = [_url(f"{SEED}/docs/allowed"), _url(f"{SEED}/private/secret")]
+    robots = RobotsRules(allow=(), disallow=("/private",), crawl_delay_s=None)
+
+    result = select_urls(candidates, seed_url=SEED, limit=10, robots=robots)
+
+    assert result.selected == [f"{SEED}/docs/allowed"]
+    assert result.dropped["robots_disallowed"] == 1
+    _assert_reconciles(result)
+
+
+def test_robots_none_drops_nothing() -> None:
+    """Falsifiability partner: the identical candidates and pattern, `robots=None` (the
+    default) instead — nothing is dropped under `"robots_disallowed"`, because there is no
+    rule to consult."""
+    candidates = [_url(f"{SEED}/docs/allowed"), _url(f"{SEED}/private/secret")]
+
+    result = select_urls(candidates, seed_url=SEED, limit=10)
+
+    assert "robots_disallowed" not in result.dropped
+    assert sorted(result.selected) == sorted([f"{SEED}/docs/allowed", f"{SEED}/private/secret"])
+
+
+def test_a_disallowed_url_is_attributed_to_robots_rather_than_a_guessed_rule() -> None:
+    """A URL that would ALSO match one of the five guessed structural rules is still
+    attributed to `"robots_disallowed"` — the operator-authored rule wins the attribution
+    because it is checked first (module docstring, step 2)."""
+    candidates = [_url(f"{SEED}/tag/platform")]
+    robots = RobotsRules(allow=(), disallow=("/tag",), crawl_delay_s=None)
+
+    result = select_urls(candidates, seed_url=SEED, limit=10, robots=robots)
+
+    assert result.dropped == {"robots_disallowed": 1}
+    _assert_reconciles(result)
+
+
+def test_robots_matching_uses_the_normalized_url() -> None:
+    """A `Disallow: /docs/` with a trailing slash does not match a normalized `/docs` that
+    has shed its own — `select_urls` compares against `normalized.url`, never the raw
+    candidate string."""
+    candidates = [_url(f"{SEED}/docs/")]
+    robots = RobotsRules(allow=(), disallow=("/docs/",), crawl_delay_s=None)
+
+    result = select_urls(candidates, seed_url=SEED, limit=10, robots=robots)
+
+    # `/docs/` normalizes to `/docs` (module docstring's normalization step), which the
+    # `/docs/` pattern's trailing slash does not match as a prefix.
+    assert result.selected == [f"{SEED}/docs"]
+    assert "robots_disallowed" not in result.dropped
+
+
+def test_selection_with_robots_rules_is_deterministic_across_repeated_calls_and_shuffles() -> None:
+    """[Determinism]. The same guarantee `test_fixture_selection_is_deterministic_across_
+    shuffles` pins for the plain pipeline, with a `robots` argument in play."""
+    candidates = _load_fixture_candidates()
+    robots = RobotsRules(
+        allow=(), disallow=("/reference/authentication", "/api"), crawl_delay_s=None
+    )
+
+    baseline = select_urls(candidates, seed_url=FIXTURE_SEED, limit=40, robots=robots)
+    again = select_urls(candidates, seed_url=FIXTURE_SEED, limit=40, robots=robots)
+    assert again == baseline
+
+    for seed in range(8):
+        shuffled = list(candidates)
+        random.Random(seed).shuffle(shuffled)
+        result = select_urls(shuffled, seed_url=FIXTURE_SEED, limit=40, robots=robots)
+
+        assert result.selected == baseline.selected, f"shuffle seed {seed} moved the selection"
+        assert result.dropped == baseline.dropped, f"shuffle seed {seed} moved the drop counts"
+
+
 # --- Determinism -----------------------------------------------------------------------------
 
 
@@ -698,6 +775,7 @@ def test_dropped_keys_are_in_the_documented_pipeline_order() -> None:
         "duplicate",
         "seed",
         "off_origin",
+        "robots_disallowed",
         "dated_archive",
         "taxonomy",
         "pagination",
@@ -756,14 +834,19 @@ def test_fixture_selection_favors_documentation_pages_and_respects_the_cap() -> 
 
 def test_fixture_selection_exercises_every_drop_rule() -> None:
     candidates = _load_fixture_candidates()
+    # `/reference/authentication` would otherwise survive selection (it is doc-shaped and
+    # carries no other disqualifying trait) — disallowing it is what exercises
+    # `"robots_disallowed"` without touching the fixture file itself.
+    robots = RobotsRules(allow=(), disallow=("/reference/authentication",), crawl_delay_s=None)
 
-    result = select_urls(candidates, seed_url=FIXTURE_SEED, limit=40)
+    result = select_urls(candidates, seed_url=FIXTURE_SEED, limit=40, robots=robots)
 
     expected_rules = {
         "unparseable",
         "duplicate",
         "seed",
         "off_origin",
+        "robots_disallowed",
         "dated_archive",
         "taxonomy",
         "pagination",

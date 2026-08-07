@@ -9,18 +9,36 @@ and `crawl_site`'s `extra_urls` to fetch. It is not link extraction: nothing her
 fetched page's HTML — every URL this module returns came out of a sitemap or a `robots.txt`
 `Sitemap:` line, never out of an `<a href>`. That is `internals/links.py`'s job (PER-178),
 and it is a strictly SECONDARY one: `service.py` runs it only when this module comes back
-with nothing, so a site that ships a sitemap never has its markup read for links at all. It
-is not politeness either: `robots.txt`'s
-`Disallow`, `Allow`, and `Crawl-delay` directives are read by nothing here — see
-`_robots_sitemap_urls` — because respecting them for a crawler that already caps itself at
-`crawl_max_pages` pages a user explicitly asked to run is a different product decision than
-this ticket makes, and `crawler.py`'s `_PolitenessGate` already owns rate-limiting on the
-requests this module does not make (frontier fetches, not discovery ones). It caches nothing
-across runs — every run starts its discovery cold, the same way `crawl_site` starts its
-frontier cold. And it does not special-case a sitemap's `<image:image>`, `<video:video>`, or
-`<news:news>` extensions, or any element besides `<loc>`, `<lastmod>`, and `<priority>` under
-a `<url>` — `<changefreq>` included, despite being named in the sitemap spec right next to the
-two this module does read.
+with nothing, so a site that ships a sitemap never has its markup read for links at all.
+
+**`robots.txt` is fetched exactly once per run, unconditionally, before either well-known
+probe — a PER-191 change from earlier revisions of this module, which fetched it only when
+both probes had already come back empty, and read nothing out of it but `Sitemap:` lines.**
+`_fetch_robots` is that ONE fetch, and it hands the SAME response to both consumers:
+`internals/robots.py`'s `parse_robots`, which this module never re-implements, and
+`_robots_sitemap_urls`, which still reads only `Sitemap:` lines. A hostile or slow
+`robots.txt` therefore still costs this run one fetch, never two. The parsed `RobotsRules`
+travel out on `DiscoveryResult.robots`, unconditionally, on every return path this function
+has, including its failure ones — see "document counting," below, for the one deliberate
+consequence of fetching `robots.txt` FIRST rather than last. What this module still does not
+do is ENFORCE those rules: `internals/url_ranking.py`'s `select_urls` is what drops a
+`Disallow`-covered candidate, and `internals/crawler.py`'s `crawl_site` is what refuses a
+disallowed seed. This module only reads `robots.txt` and reports what it said.
+
+**Every request this module makes — both well-known probes, `robots.txt` itself, every
+`robots.txt`-declared target, and every child of a sitemap index — goes through the run's
+`PolitenessGate` (`internals/fetcher.py`) when the caller supplies one, at the SAME delay
+`crawl_site`'s own frontier fetches wait on — never a site's own `Crawl-delay`, which
+`internals/robots.py`'s module docstring explains is deliberately deferred to the CRAWL
+phase. An earlier revision of this paragraph claimed `crawler.py`'s politeness gate "already
+owns rate-limiting on the requests this module does not make" — that was true only because
+this module made no gated requests of its own at the time. It does now, and that sentence is
+corrected here rather than left to mislead a future reader.** It caches nothing across runs —
+every run starts its discovery cold, the same way `crawl_site` starts its frontier cold. And
+it does not special-case a sitemap's `<image:image>`, `<video:video>`, or `<news:news>`
+extensions, or any element besides `<loc>`, `<lastmod>`, and `<priority>` under a `<url>` —
+`<changefreq>` included, despite being named in the sitemap spec right next to the two this
+module does read.
 
 **Every fetch goes through `internals/fetcher.py`'s `fetch_page`, so SSRF is not re-derived
 here.** `fetch_page` calls `internals/ssrf.py`'s `validate_url` on every hop before a socket
@@ -179,12 +197,31 @@ fetch this module attempts — both well-known probes, every `robots.txt`-declar
 every child of a sitemap index — regardless of whether it 404s, is refused by the SSRF guard,
 or fails to parse. A success-only counter would let a hostile `robots.txt` list ten thousand
 dead `Sitemap:` lines and this module would fetch every single one of them before giving up;
-counting attempts closes that for the cost of one integer. `robots.txt` ITSELF is not
+counting attempts closes that for the cost of one integer. `robots.txt` ITSELF is STILL not
 counted — it is not a sitemap document, and is fetched at most once per run (`_fetch_robots`,
-which bypasses the counter entirely). At the default of 5, a site that falls through both
-well-known probes to `robots.txt` has 3 documents left for whatever it declares;
-`/sitemap.xml` serving an index with ten children only gets to fetch 4 of them before the cap
-silently stops the rest.
+which bypasses the counter entirely, exactly as it did before PER-191). At the default of 5,
+a site whose `robots.txt`-declared targets are all this module ever reaches has 5 documents
+to spend on them (`robots.txt` itself costs nothing against the cap); `/sitemap.xml` serving
+an index with ten children only gets to fetch 4 of them before the cap silently stops the
+rest.
+
+**`robots.txt` is now fetched BEFORE either well-known probe, not after — a deliberate
+consequence of making it unconditional (PER-191), not an oversight.** Earlier revisions of
+this module fetched `robots.txt` only once both probes had already failed, so a hostile or
+oversized `robots.txt` could never cost a run anything on a site whose `/sitemap.xml`
+answered directly. That ordering is no longer available once `robots.txt` must be fetched
+every run to read its `Disallow`/`Crawl-delay` rules (`internals/robots.py`) — the rules this
+module reports on `DiscoveryResult.robots` are needed whether or not `/sitemap.xml` exists,
+so the one fetch that produces them cannot wait on either probe failing first. The
+consequence: a `robots.txt` large enough to exhaust the discovery byte share
+(`SITEMAP_BYTE_SHARE`, above) can now do so before either probe has even been attempted,
+where previously it could only do so after both had already failed. This is accepted rather
+than engineered around, for the same reason the discovery byte share itself is accepted: a
+run that loses its sitemap discovery to a byte cap still crawls the seed successfully
+(ARCHITECTURE.md §3.4's "hitting a cap is a success" rule), and `tests/test_crawl_sitemap.py`
+pins an unreadable `robots.txt` — a 404, a timeout, a 500, an HTML error page, or one that
+tripped the byte share mid-fetch — as allow-everything (`DiscoveryResult.robots ==
+robots.ALLOW_ALL`) rather than as a reason to fail the run.
 
 **Byte-budget exhaustion STOPS discovery and returns whatever was already harvested — this is
 a deliberate refinement on the ticket's own "returns `[]`" wording, not a contradiction of
@@ -208,7 +245,14 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from app.core.settings import Settings
-from app.features.crawl.internals.fetcher import ByteBudget, ByteBudgetExceededError, fetch_page
+from app.features.crawl.http_client import CRAWL_USER_AGENT
+from app.features.crawl.internals.fetcher import (
+    ByteBudget,
+    ByteBudgetExceededError,
+    PolitenessGate,
+    fetch_page,
+)
+from app.features.crawl.internals.robots import ALLOW_ALL, RobotsRules, parse_robots
 from app.features.crawl.internals.ssrf import Resolver
 from app.features.crawl.internals.url_ranking import DiscoveredUrl
 
@@ -270,6 +314,16 @@ class DiscoveryResult:
     for `/sitemap_index.xml`, `"robots"` for a `robots.txt` `Sitemap:` target, or `"none"`
     when nothing was found. Names the entry point, not the document's own root element — see
     the module docstring for why that reading is the only one that is well-defined."""
+
+    robots: RobotsRules = ALLOW_ALL
+    """This run's parsed `robots.txt` rules — `internals/robots.py`'s `parse_robots`, run over
+    the SAME response `_fetch_robots` reads `Sitemap:` targets from, never a second fetch.
+    Defaulted, and appended LAST, so every `DiscoveryResult(urls, source)` construction that
+    predates PER-191 keeps compiling. Present on every return path this function has,
+    including the failure ones (an unparseable `origin`, an exhausted cap, an unhandled
+    exception) — `ALLOW_ALL` there is not a placeholder, it is the honest answer for "this run
+    never got far enough to read a robots.txt," which fails OPEN exactly as an unreadable
+    `robots.txt` does."""
 
 
 class _DiscoveryBudget(ByteBudget):
@@ -342,6 +396,11 @@ class _DiscoveryState:
     """Set once ANY cap trips — the document cap, the byte share, or the URL cap — so every
     loop in this module can stop at the next opportunity instead of continuing to spend a
     budget that is already gone."""
+
+    gate: PolitenessGate | None = None
+    """The run's shared `PolitenessGate` (`internals/fetcher.py`), or `None` when the caller
+    supplied none — see `discover_sitemap_urls`'s own `gate` parameter. `_guarded_fetch`
+    awaits it, when set, immediately before every fetch this module makes."""
 
     def remaining_urls(self) -> int:
         """How many more `DiscoveredUrl`s this run's discovery may still accumulate before
@@ -528,10 +587,13 @@ def _robots_sitemap_urls(text: str, *, origin: str) -> list[str]:
     """Every `Sitemap:` target `robots.txt`'s `text` declares, same-origin only, deduped in
     the order they were declared.
 
-    Every OTHER directive — `User-agent`, `Disallow`, `Allow`, `Crawl-delay` — is ignored by
-    construction: this function reads `Sitemap:` lines and nothing else, because discovery is
-    not politeness (module docstring). Each line is cut at its first `#` before anything else
-    happens, so a trailing comment (`Sitemap: ...   # off-origin, never fetched`) is stripped
+    Every OTHER directive — `User-agent`, `Disallow`, `Allow`, `Crawl-delay` — is read by
+    nothing here: this function reads `Sitemap:` lines and nothing else. Since PER-191 those
+    other directives ARE read, just not by this function — `_fetch_robots` runs
+    `internals/robots.py`'s `parse_robots` over the SAME `text` this function reads, so the
+    two consumers see identical bytes without a second fetch. Each line is cut at its first
+    `#` before anything else happens, so a trailing comment (`Sitemap: ...   # off-origin,
+    never fetched`) is stripped
     rather than becoming part of the URL. `line.lower().startswith(...)` makes the match
     case-insensitive (`SITEMAP:`, `sitemap:`, `Sitemap:` all match), and
     `urljoin(origin + "/", value)` accepts the RELATIVE form real sites emit
@@ -562,7 +624,17 @@ async def _guarded_fetch(state: _DiscoveryState, url: str) -> str | None:
     probe, a `robots.txt`-declared target, a sitemap-index child, or `robots.txt` itself.
     Every failure mode described in the module docstring's "not fatal" argument lives here,
     in one place, so `_fetch_text` and `_fetch_robots` only have to decide WHETHER to count
-    the attempt, never HOW to survive one:
+    the attempt, never HOW to survive one.
+
+    Awaits `state.gate.wait_for_turn()` first, when the caller supplied one — the same
+    position `internals/crawler.py`'s `fetch_frontier_url` awaits its own gate, and the ONE
+    place every request this module makes (including `robots.txt` itself) is serialized to
+    the run's politeness delay. See the module docstring's "every request this module makes"
+    paragraph for why that includes `robots.txt`, and `internals/robots.py`'s module
+    docstring for why that delay is the OPERATOR-CONFIGURED one, never a site's own
+    `Crawl-delay`.
+
+    Each failure mode this function can meet is handled once, here:
 
     * `ByteBudgetExceededError` stops discovery outright (`state.stop = True`) — the shared
       budget's share is spent, and every later fetch in this module would fail the same way,
@@ -590,6 +662,8 @@ async def _guarded_fetch(state: _DiscoveryState, url: str) -> str | None:
     regardless of what trafilatura made of it — so this module reads `page.content` and
     ignores everything else `fetch_page` computed for a document it was never really about.
     """
+    if state.gate is not None:
+        await state.gate.wait_for_turn()
     try:
         page = await fetch_page(state.client, url, budget=state.budget, resolver=state.resolver)
     except ByteBudgetExceededError:
@@ -629,26 +703,31 @@ async def _fetch_text(state: _DiscoveryState, url: str) -> str | None:
     return await _guarded_fetch(state, url)
 
 
-async def _fetch_robots(state: _DiscoveryState, url: str) -> str | None:
-    """Fetch `robots.txt` itself. Deliberately bypasses `_fetch_text`'s document counter —
-    `robots.txt` is not a sitemap document, and the module docstring's arithmetic
-    (`crawl_sitemap_max_documents` leaves N documents for whatever it declares) only holds if
-    fetching it is free. Still goes through the same `_guarded_fetch` as everything else, so
-    a byte-budget trip or an SSRF refusal on `robots.txt` itself stops discovery exactly like
-    it would for any other document.
-    """
-    return await _guarded_fetch(state, url)
+async def _fetch_robots(state: _DiscoveryState, origin: str) -> tuple[RobotsRules, list[str]]:
+    """The ONE `robots.txt` fetch of a run — see the module docstring's opening section.
+    Returns this run's parsed `RobotsRules` (`internals/robots.py`'s `parse_robots`) and the
+    same-origin `Sitemap:` targets `_robots_sitemap_urls` reads, BOTH derived from the SAME
+    response — `robots.txt` is never fetched a second time to satisfy the second consumer.
 
+    Deliberately bypasses `_fetch_text`'s document counter — `robots.txt` is not a sitemap
+    document, and the module docstring's document-counting arithmetic
+    (`crawl_sitemap_max_documents` leaves N documents for whatever `robots.txt` declares) only
+    holds if fetching it is free. Still goes through the same `_guarded_fetch` as everything
+    else, so a byte-budget trip or an SSRF refusal on `robots.txt` itself stops discovery
+    exactly like it would for any other document.
 
-async def _robots_targets(state: _DiscoveryState, origin: str) -> list[str]:
-    """Fetch `robots.txt` at `origin` and return whatever same-origin `Sitemap:` targets it
-    declares, in the order they were declared. `[]` for a missing, unfetchable, or
-    directive-free `robots.txt` — never raises, matching every other helper in this module.
+    Never raises: `parse_robots` has its own "never raises, fail open" contract, and a missing
+    or unfetchable `robots.txt` (`_guarded_fetch` returning `None`) returns `(ALLOW_ALL, [])`
+    — the same fail-open answer a `robots.txt` this module COULD fetch but not parse would
+    produce, so a caller cannot distinguish "unreachable" from "unreadable" and does not need
+    to.
     """
-    text = await _fetch_robots(state, origin + _ROBOTS_PATH)
+    text = await _guarded_fetch(state, origin + _ROBOTS_PATH)
     if text is None:
-        return []
-    return _robots_sitemap_urls(text, origin=origin)
+        return ALLOW_ALL, []
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+    targets = _robots_sitemap_urls(text, origin=origin)
+    return rules, targets
 
 
 async def _collect(state: _DiscoveryState, url: str, *, allow_index: bool) -> list[DiscoveredUrl]:
@@ -703,13 +782,16 @@ async def discover_sitemap_urls(
     budget: ByteBudget,
     settings: Settings,
     resolver: Resolver | None = None,
+    gate: PolitenessGate | None = None,
 ) -> DiscoveryResult:
     """Discover this website's crawl frontier from its sitemap, before `crawl_site` runs.
 
-    Tries, in order, `origin + "/sitemap.xml"`, then `origin + "/sitemap_index.xml"`, then
-    every same-origin `Sitemap:` target `origin`'s own `robots.txt` declares — stopping at
-    the first entry point that yields at least one URL. See the module docstring for the full
-    reasoning behind every cap, refusal, and the return type.
+    Fetches `origin`'s `robots.txt` first, unconditionally — see the module docstring's
+    opening section — then tries, in order, `origin + "/sitemap.xml"`, then
+    `origin + "/sitemap_index.xml"`, then every same-origin `Sitemap:` target that same
+    `robots.txt` fetch declared, stopping at the first entry point that yields at least one
+    URL. See the module docstring for the full reasoning behind every cap, refusal, and the
+    return type.
 
     Args:
         client: The shared crawl client (`build_crawl_client`) — the same one `crawl_site`
@@ -727,13 +809,21 @@ async def discover_sitemap_urls(
             `crawl_sitemap_max_documents`, and `crawl_sitemap_max_urls`.
         resolver: Forwarded to every `fetch_page` call. Tests inject a fake one; production
             code never does.
+        gate: The run's shared `PolitenessGate` (`internals/fetcher.py`) — the SAME object
+            `crawl_site`'s own frontier fetches will wait on afterwards, at the SAME,
+            operator-configured delay (never a site's own `Crawl-delay` — see
+            `internals/robots.py`'s module docstring for why widening it to that is deferred
+            to the crawl phase). `None` — the default — means this function's own fetches are
+            not gated at all, which is what every call site before PER-191 is equivalent to.
 
     Returns:
         A `DiscoveryResult`. Never raises: every failure mode this module can produce — a
         failed fetch, malformed XML, an SSRF refusal, an exhausted document, URL, or byte
         cap, or a bug in this module itself — is caught, logged, and turned into an empty or
         partial result instead, because discovery failing is never allowed to fail the run it
-        is trying to help (ARCHITECTURE.md §3.4).
+        is trying to help (ARCHITECTURE.md §3.4). `DiscoveryResult.robots` carries whatever
+        `robots.txt` was actually read on every one of those paths — `ALLOW_ALL` when it was
+        never reachable at all (an unparseable `origin`, below) or never usable once fetched.
     """
     origin_key = _origin_key(origin)
     if origin_key is None:
@@ -742,7 +832,9 @@ async def discover_sitemap_urls(
         # safely compare anything against, so nothing is discovered rather than everything
         # being treated as same-origin by default. Defensive rather than expected — `origin`
         # is `website.origin`, already validated by `url_normalize.normalize_url` at
-        # website-creation time.
+        # website-creation time. No `robots.txt` fetch is attempted either — there is nothing
+        # this module could safely compare a `Sitemap:` target's origin against — so `robots`
+        # stays `ALLOW_ALL` on the `DiscoveryResult` this returns.
         logger.warning("crawl: sitemap discovery given an unparseable origin %r", origin)
         return DiscoveryResult([], "none")
 
@@ -753,13 +845,22 @@ async def discover_sitemap_urls(
         settings=settings,
         resolver=resolver,
         origin_key=origin_key,
+        gate=gate,
     )
 
+    rules: RobotsRules = ALLOW_ALL
     try:
+        # THE ONE `robots.txt` FETCH OF THIS RUN, first thing inside the `try` and before
+        # either well-known probe — module docstring's opening section, and its "document
+        # counting" section for the byte-share consequence of fetching it here rather than
+        # last. `robots_targets` is fed to the SAME `if not state.stop:` block below that used
+        # to fetch `robots.txt` itself; there is no second fetch anywhere in this function.
+        rules, robots_targets = await _fetch_robots(state, origin)
+
         for path, source in _ENTRY_POINTS:
             urls = await _collect(state, origin + path, allow_index=True)
             if urls:
-                return DiscoveryResult(urls, source)
+                return DiscoveryResult(urls, source, rules)
             if state.stop:
                 break
 
@@ -770,17 +871,18 @@ async def discover_sitemap_urls(
             # `priority`/`lastmod` order-independently downstream, so a second pass here
             # would only repeat work that module already has to do for every OTHER source of
             # duplication (a URL two `Sitemap:` targets both list).
-            for target in await _robots_targets(state, origin):
+            for target in robots_targets:
                 collected.extend(await _collect(state, target, allow_index=True))
                 if state.stop or state.remaining_urls() == 0:
                     break
             if collected:
-                return DiscoveryResult(collected, "robots")
+                return DiscoveryResult(collected, "robots", rules)
     except Exception:
         # Nothing above this line may fail the run that is waiting on this result (module
         # docstring) — a bug in THIS module is exactly as harmless to a crawl as a missing
         # sitemap, so it is caught, logged with its full traceback, and the run proceeds on
-        # the seed alone.
+        # the seed alone. `rules` still carries whatever `_fetch_robots` managed before the
+        # exception, which is `ALLOW_ALL` unless the failure happened after it returned.
         logger.warning("crawl: sitemap discovery failed", exc_info=True)
 
     logger.info(
@@ -791,4 +893,4 @@ async def discover_sitemap_urls(
             "bytes_used": state.budget.used,
         },
     )
-    return DiscoveryResult([], "none")
+    return DiscoveryResult([], "none", rules)

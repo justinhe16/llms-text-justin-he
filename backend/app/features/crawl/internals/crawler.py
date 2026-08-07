@@ -39,6 +39,21 @@ which is the backstop for the case the first mechanism cannot cover: a single co
 is already in flight and hangs past its own per-request timeout. Without the second
 mechanism, one stuck socket could keep a run alive well past its wall-clock budget; the
 per-fetch check alone only ever runs *between* fetches.
+
+**`robots.txt` is obeyed, as of PER-191, and this module holds exactly one corner of it.**
+`internals/robots.py`'s `parse_robots` never runs here — that happens once, in
+`internals/sitemap.py`, on the ONE `robots.txt` fetch a run makes — but this module is where
+the seed's own answer is honoured. `crawl_site` gains `is_allowed`, a synchronous predicate
+consulted for the SEED ONLY, before the seed is ever fetched: when it says no, `seed_error`
+becomes a `RobotsDisallowedError` and the function returns exactly as it does for any other
+seed failure, never opening a socket for a URL its own operator asked this crawler not to
+fetch. Frontier URLs are NOT re-checked here — `internals/url_ranking.py`'s `select_urls`
+already filtered them upstream, under its own `"robots_disallowed"` rule, and a second check
+in this module would either duplicate that counter or silently disagree with it. `crawl_site`
+also gains `gate`, an optional caller-supplied `PolitenessGate` (`internals/fetcher.py`) — see
+that parameter's own docstring, and `internals/robots.py`'s module docstring for why the gate
+handed to THIS function may already be wider than `limits.politeness_delay_ms` by the time it
+arrives.
 """
 
 import asyncio
@@ -51,7 +66,12 @@ from typing import Any
 import httpx
 
 from app.core.settings import Settings
-from app.features.crawl.internals.fetcher import ByteBudget, ByteBudgetExceededError, fetch_page
+from app.features.crawl.internals.fetcher import (
+    ByteBudget,
+    ByteBudgetExceededError,
+    PolitenessGate,
+    fetch_page,
+)
 from app.features.crawl.internals.ssrf import Resolver
 from app.features.crawl.schemas import CrawledPage
 
@@ -98,7 +118,13 @@ class CrawlLimits:
 
     politeness_delay_ms: int
     """Minimum gap between the START of one frontier request and the next, across the
-    whole run — see `_PolitenessGate` below."""
+    whole run — see `internals/fetcher.py`'s `PolitenessGate`. **Unless the caller passes its
+    own `gate` to `crawl_site`, in which case this field is never consulted at all** — the
+    same "caller-supplied value wins" shape `max_bytes` documents above. `service.py` always
+    passes one: it builds a single `PolitenessGate` before sitemap discovery runs, widens it
+    to `internals/robots.py`'s `effective_crawl_delay_ms(...)` once discovery has returned,
+    and hands the SAME, already-widened gate to `crawl_site` — so this field can name the
+    operator's own configured floor while the gate actually in force may already be wider."""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "CrawlLimits":
@@ -150,34 +176,32 @@ class CrawlResult:
     is never shown to a caller as-is."""
 
 
-class _PolitenessGate:
-    """Serializes frontier request STARTS to at least `delay_s` apart, across the whole run.
+class RobotsDisallowedError(Exception):
+    """Raised (as `CrawlResult.seed_error`) when the run's own `is_allowed` predicate refuses
+    the SEED URL — a site's `robots.txt` disallows crawling it.
 
-    One `asyncio.Lock` plus a monotonic "next allowed start" timestamp. Held for the entire
-    wait — including the `asyncio.sleep` — rather than released early, which is what makes
-    "at least `delay_s` apart" true of the order callers actually reach the lock in, not
-    just true on average: a caller computes its own start time from whatever
-    `_next_allowed_start` currently says, sleeps until it, publishes the next one, and only
-    then lets the next waiter in.
+    **The decision this exception encodes is to HONOUR the refusal and fail the run**, rather
+    than silently crawling the seed anyway (this crawler has no per-website "ignore
+    robots.txt" override — ARCHITECTURE.md §11) or silently producing an empty artifact
+    instead. `app.features.crawl.service.CrawlService._safe_error_message` maps this to the
+    fixed string "This site's robots.txt disallows crawling this URL." — no new database
+    column, because `runs.error` is already free text and already the UI's rendered failure
+    reason — and `_is_retryable` treats it as permanent by NOT listing it: a site's
+    `robots.txt` will still disallow the same URL in sixty seconds, so retrying it is pure
+    latency, the same reasoning that already applies to `SsrfBlockedError` and `FetchError`.
+
+    **Known limitation, stated rather than hidden: the predicate sees the CONFIGURED seed
+    URL, not the post-redirect one.** `fetch_page` follows redirects internally and this
+    check runs before the seed is ever fetched, so a site that redirects an allowed URL into a
+    disallowed path is not caught by this check — only `robots.txt`'s answer for the URL a
+    run was actually configured with. Closing that gap would mean fetching, at minimum, the
+    redirect chain's headers before this decision could be made, which is a materially
+    different (and slower) shape than "consult a synchronous predicate before the first
+    request."
+
+    Deliberately its OWN type, following the rule `FetchError` and `ByteBudgetExceededError`
+    already set for this feature: an exception lives in the module that raises it.
     """
-
-    def __init__(self, delay_s: float, clock: Callable[[], float]) -> None:
-        self._delay_s = delay_s
-        self._clock = clock
-        self._lock = asyncio.Lock()
-        self._next_allowed_start: float | None = None
-
-    async def wait_for_turn(self) -> None:
-        """Block until this caller may start its request, then reserve the next slot."""
-        async with self._lock:
-            now = self._clock()
-            start_at = (
-                now if self._next_allowed_start is None else max(now, self._next_allowed_start)
-            )
-            wait = start_at - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._next_allowed_start = start_at + self._delay_s
 
 
 async def crawl_site(
@@ -188,6 +212,8 @@ async def crawl_site(
     extra_urls: Sequence[str] = (),
     frontier_from_seed: Callable[[CrawledPage], Sequence[str]] | None = None,
     budget: ByteBudget | None = None,
+    gate: PolitenessGate | None = None,
+    is_allowed: Callable[[str], bool] | None = None,
     resolver: Resolver | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> CrawlResult:
@@ -272,6 +298,34 @@ async def crawl_site(
             average size once any pre-crawl discovery ran. Defaults to
             `ByteBudget(limits.max_bytes)`, matching every call site before this parameter
             existed.
+        gate: A caller-supplied `PolitenessGate` (`internals/fetcher.py`) to serialize
+            frontier request starts through, instead of a fresh one built from
+            `limits.politeness_delay_ms`. `service.py` always passes one — the SAME gate
+            `discover_sitemap_urls` already used for its own fetches, possibly already
+            widened past `limits.politeness_delay_ms` by `internals/robots.py`'s
+            `effective_crawl_delay_ms` (see `CrawlLimits.politeness_delay_ms`'s own
+            docstring). Defaults to `PolitenessGate(limits.politeness_delay_ms / 1000,
+            clock)`, matching every call site before this parameter existed.
+        is_allowed: A synchronous predicate consulted for the SEED URL ONLY, before it is
+            fetched — `None` means "no robots.txt restriction," and is what every call site
+            before PER-191 is equivalent to. When it returns `False`, `seed_error` becomes a
+            `RobotsDisallowedError` and this function returns immediately, exactly as it does
+            for any other seed failure — no request is made. `service.py` passes
+            `RobotsRules.is_allowed` (`internals/robots.py`), bound to the rules
+            `discover_sitemap_urls` already parsed from the run's one `robots.txt` fetch.
+
+            **Two obligations, the same two `frontier_from_seed` carries and neither enforced
+            by this module.** It MUST NOT RAISE — `RobotsRules.is_allowed` never does, by its
+            own contract — and it is SYNCHRONOUS, so consulting it can never itself make a
+            request. Frontier URLs are NOT re-checked against this predicate: they were
+            already filtered upstream by `internals/url_ranking.py`'s `select_urls` under its
+            own `"robots_disallowed"` rule, and re-checking them here would either duplicate
+            that counter or silently disagree with it (module docstring).
+
+            **Known limitation:** this sees the CONFIGURED `seed_url`, never a post-redirect
+            one — `fetch_page` follows redirects internally, after this check has already
+            passed. A redirect into a disallowed path is not caught. See
+            `RobotsDisallowedError`'s own docstring.
         resolver: Forwarded to every `fetch_page` call. Tests inject a fake one; production
             code never does.
         clock: The monotonic clock the wall-clock deadline and the politeness gate are
@@ -291,7 +345,7 @@ async def crawl_site(
 
     start = clock()
     deadline = start + limits.max_wall_clock_s
-    gate = _PolitenessGate(limits.politeness_delay_ms / 1000, clock)
+    gate = gate if gate is not None else PolitenessGate(limits.politeness_delay_ms / 1000, clock)
     semaphore = asyncio.Semaphore(limits.concurrency)
 
     def _mark_cap_hit(hit: str) -> None:
@@ -340,38 +394,43 @@ async def crawl_site(
 
     try:
         async with asyncio.timeout(limits.max_wall_clock_s):
-            try:
-                seed_page = await fetch_page(client, seed_url, budget=budget, resolver=resolver)
-            except Exception as exc:
-                seed_error = exc
+            if is_allowed is not None and not is_allowed(seed_url):
+                # Honoured, not merely logged: no request is made at all. See
+                # `RobotsDisallowedError`'s own docstring for the decision and its reasoning.
+                seed_error = RobotsDisallowedError(f"robots.txt disallows {seed_url}")
             else:
-                pages.append(seed_page)
+                try:
+                    seed_page = await fetch_page(client, seed_url, budget=budget, resolver=resolver)
+                except Exception as exc:
+                    seed_error = exc
+                else:
+                    pages.append(seed_page)
 
-                # The frontier, from whichever of the two sources supplied one. The
-                # `if not frontier` guard is what keeps them mutually exclusive rather than
-                # additive — see `frontier_from_seed`'s own docstring — and it is also why
-                # `frontier_from_seed` cannot be reached at all on the seed-failure path
-                # above: this whole block is the seed fetch's `else`.
-                frontier = list(extra_urls)
-                if not frontier and frontier_from_seed is not None:
-                    frontier = list(frontier_from_seed(seed_page))
+                    # The frontier, from whichever of the two sources supplied one. The
+                    # `if not frontier` guard is what keeps them mutually exclusive rather
+                    # than additive — see `frontier_from_seed`'s own docstring — and it is
+                    # also why `frontier_from_seed` cannot be reached at all on the
+                    # seed-failure path above: this whole block is the seed fetch's `else`.
+                    frontier = list(extra_urls)
+                    if not frontier and frontier_from_seed is not None:
+                        frontier = list(frontier_from_seed(seed_page))
 
-                # Truncated up front — but `cap_hit` is deliberately NOT set here yet.
-                # Setting it before the gather below would make every truncated task's own
-                # `if cap_hit is not None: return` check fire immediately, since that same
-                # flag is what marks "stop early" — the truncated frontier would never run
-                # at all. Whether truncation happened is remembered separately
-                # (`frontier_was_truncated`) and only turned into `cap_hit` once the
-                # truncated batch has actually been attempted, below.
-                allowed = max(0, limits.max_pages - 1)
-                frontier_was_truncated = len(frontier) > allowed
-                frontier = frontier[:allowed]
+                    # Truncated up front — but `cap_hit` is deliberately NOT set here yet.
+                    # Setting it before the gather below would make every truncated task's
+                    # own `if cap_hit is not None: return` check fire immediately, since that
+                    # same flag is what marks "stop early" — the truncated frontier would
+                    # never run at all. Whether truncation happened is remembered separately
+                    # (`frontier_was_truncated`) and only turned into `cap_hit` once the
+                    # truncated batch has actually been attempted, below.
+                    allowed = max(0, limits.max_pages - 1)
+                    frontier_was_truncated = len(frontier) > allowed
+                    frontier = frontier[:allowed]
 
-                if frontier:
-                    await asyncio.gather(*(fetch_frontier_url(url) for url in frontier))
+                    if frontier:
+                        await asyncio.gather(*(fetch_frontier_url(url) for url in frontier))
 
-                if frontier_was_truncated and cap_hit is None:
-                    _mark_cap_hit("pages")
+                    if frontier_was_truncated and cap_hit is None:
+                        _mark_cap_hit("pages")
     except TimeoutError:
         _mark_cap_hit("wall_clock")
 

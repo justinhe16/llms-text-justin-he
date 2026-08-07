@@ -1,0 +1,12 @@
+# robots.txt for docs.test, carrying both a wildcard group and a named one
+User-agent: *
+Disallow: /private/
+Crawl-delay: 1
+
+Sitemap: https://docs.test/sitemap.xml
+
+User-agent: llms-text-bot
+Disallow: /admin
+Allow: /admin/public
+Disallow: /*.pdf$
+Crawl-delay: 5
