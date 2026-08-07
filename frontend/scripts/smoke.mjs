@@ -737,6 +737,22 @@ async function checkArchitecture(page) {
   await page.setViewport({ width: 375, height: 812 });
   await page.reload({ waitUntil: "load" });
   await page.evaluate(() => document.fonts.ready);
+  // Same bounded wait `checkDocs`'s initial load uses: a reload at a new viewport re-runs
+  // AnimatedBeam's measuring effect from scratch, and probing before it has committed a path
+  // reads every beam as unmeasured (d="") rather than misaligned — a fast local machine can
+  // hide that race entirely, which is exactly what happened here before this wait existed.
+  await page
+    .waitForFunction(
+      () => {
+        const container = document.querySelector("[data-arch-diagram]");
+        const svg = container?.querySelector(":scope > svg path");
+        return Boolean(svg?.getAttribute("d"));
+      },
+      { timeout: 10_000 },
+    )
+    .catch(() => {
+      // Reported by the assertions below, with the measurements attached.
+    });
   const narrow = await page.evaluate(probeDiagram, {
     containerAttr: "data-arch-diagram",
     nodeAttr: "data-arch-node",
