@@ -48,9 +48,13 @@ export function DocsDiagram() {
 
   return (
     <nav aria-label="Pipeline stages" className="lg:sticky lg:top-14">
-      <h2 className="mb-5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
+      {/* A <p>, not a heading. This column renders before the article in the DOM, so an <h2>
+          here would land above the page's <h1> and leave the document outline starting at
+          level 2. The <nav>'s aria-label already names the landmark, so the heading bought
+          nothing a screen reader did not already have. */}
+      <p className="mb-5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
         How a run works
-      </h2>
+      </p>
 
       <div
         ref={containerRef}
