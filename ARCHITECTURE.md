@@ -1304,9 +1304,9 @@ very same rows. `runs.forWebsite(id)` exists to be invalidated and is a prefix o
 `["runs", "list", websiteId]`; nesting stats under `runs` would either fall outside that
 prefix, making the nesting decorative, or inside it, so that every "this website's history
 changed" invalidation also dropped an aggregate the Trends tab may be rendering. Its
-`window` is part of the key for the reason `include` is part of `websites.list`: `?window=7d`
-and `?window=90d` are different responses with different `bucket` fields and different
-series lengths, and one key for both would render 7d's hourly buckets under day labels until
+`window` is part of the key for the reason `include` is part of `websites.list`: `?window=1d`
+and `?window=14d` are different responses with different `bucket` fields and different
+series lengths, and one key for both would render 1d's hourly buckets under day labels until
 the refetch landed.
 
 `runs` carries two further keys, both added for the detail page. `.infinite(websiteId,

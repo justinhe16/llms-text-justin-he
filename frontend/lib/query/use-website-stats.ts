@@ -18,7 +18,7 @@ import { queryKeys } from "./query-keys";
  * query does not fire while another tab is active"), not about Radix's current mounting
  * behaviour. `forceMount` on a `TabsContent`, or a future switch to keeping panels alive to
  * preserve their scroll position, would quietly turn every detail-page load into an
- * aggregate query over 90 days of runs — and nothing would fail, it would just get slower.
+ * aggregate query over 14 days of runs — and nothing would fail, it would just get slower.
  * One boolean makes that non-negotiable instead of incidental.
  *
  * ## No polling, and no invalidation on trigger either
@@ -29,7 +29,7 @@ import { queryKeys } from "./query-keys";
  * inventing an interval anyway would look like a feature and do nothing.
  *
  * `useTriggerRun` deliberately does *not* invalidate this key, either. It is tempting — a
- * queued run does bump `total_runs` by one — but a trend over 7 to 90 days does not
+ * queued run does bump `total_runs` by one — but a trend over 1 to 14 days does not
  * meaningfully change when a single `pending` run appears, and the refetch it would cost is
  * a full re-aggregation over the window. Switching windows refetches, and the 10s
  * `staleTime` in app/providers.tsx means simply leaving and re-entering the tab does too.
@@ -46,7 +46,7 @@ export function useWebsiteStats(
     enabled: options.enabled,
 
     // Keep the previous window's response on screen while the next one loads, instead of
-    // dropping back to the skeleton. Switching 30d → 90d is a refinement of what is already
+    // dropping back to the skeleton. Switching 7d → 14d is a refinement of what is already
     // being read, and blanking four tiles and three charts for the length of a round trip
     // makes the switcher feel like it reloaded the page. `isFetching` is what the panel
     // dims on meanwhile, so the stale data never claims to be current.

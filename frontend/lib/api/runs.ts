@@ -88,12 +88,12 @@ export type StatsTotals = components["schemas"]["RunStatsTotals"];
  * The three windows `?window=` accepts. Read off the *response* type rather than the request
  * parameter because the response echoes the resolved window back and the two unions are the
  * same by construction — and this spelling stays a one-hop alias of generated code, which a
- * hand-written `"7d" | "30d" | "90d"` would not.
+ * hand-written `"1d" | "7d" | "14d"` would not.
  */
 export type StatsWindow = WebsiteStats["window"];
 
 /**
- * The bucket size the backend chose for a window — `hour` for 7d, `day` for 30d and 90d.
+ * The bucket size the backend chose for a window — `hour` for 1d and 7d, `day` for 14d.
  *
  * Derived from `window` by the server (`internals/stats_window.py`) and never supplied by the
  * caller, which is exactly why it is echoed back: a client formats its axis from **this
@@ -202,7 +202,7 @@ export function triggerRun(websiteId: string): Promise<TriggeredRun> {
  * `GET /websites/{id}/stats?window=`. Unfiltered by caller identity like the two reads above
  * (ARCHITECTURE.md §4.1) — any signed-in user may read any website's statistics.
  *
- * `window` is required *here* although the endpoint defaults it to `30d` server-side. The
+ * `window` is required *here* although the endpoint defaults it to `7d` server-side. The
  * default is not the interesting part: the caller (lib/query/use-website-stats.ts) puts the
  * window in the React Query cache key, and a helper that let it be omitted would make
  * "fetched with no window" and "fetched with 30d" two keys for one response. Deciding the

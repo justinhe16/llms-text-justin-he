@@ -884,7 +884,7 @@ export interface components {
              * Window
              * @enum {string}
              */
-            window: "7d" | "30d" | "90d";
+            window: "1d" | "7d" | "14d";
         };
     };
     responses: never;
@@ -1320,8 +1320,8 @@ export interface operations {
     get_website_stats_websites__id__stats_get: {
         parameters: {
             query?: {
-                /** @description Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422. */
-                window?: "7d" | "30d" | "90d";
+                /** @description One of 1d, 7d, 14d; anything else is a 422. */
+                window?: "1d" | "7d" | "14d";
             };
             header?: never;
             path: {

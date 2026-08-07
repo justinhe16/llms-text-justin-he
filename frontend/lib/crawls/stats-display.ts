@@ -47,9 +47,16 @@ const dayTickFormatter = new Intl.DateTimeFormat("en-US", {
 /**
  * "Thu, 14:00" — an `hour` bucket's axis tick.
  *
- * The weekday is what makes an hourly tick unambiguous without a date: `hour` buckets are
- * only ever used for the 7d window, and no weekday repeats inside seven days. A bare "14:00"
- * would appear seven times on one axis meaning seven different afternoons.
+ * The weekday is what makes an hourly tick unambiguous without a date. As of PER-193, `hour`
+ * buckets serve **both** the 1d and 7d windows (`internals/stats_window.py`) — 24 buckets or
+ * 168 — and this formatter cannot tell which window produced a given point, because it formats
+ * from `bucket`, not from `window` (see `formatBucketTick`'s docstring for why that is the
+ * rule and must stay the rule). For 1d, the weekday prefix is redundant — it repeats the same
+ * word across all 24 ticks — but redundant is the safe failure mode: for 7d, a bare "14:00"
+ * would appear seven times on one axis meaning seven different afternoons, which is actively
+ * misleading rather than merely repetitive. Do not add a `window` parameter to this formatter
+ * (or `hourLabelFormatter`) to special-case 1d — that would require threading `window` through
+ * every call site for a cosmetic difference on the shortest, least ambiguous window.
  */
 const hourTickFormatter = new Intl.DateTimeFormat("en-US", {
   timeZone: UTC,

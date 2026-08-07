@@ -36,7 +36,7 @@ RunTriggerName = Literal["manual", "scheduled"]
 # buckets on. Both `Literal`, not `enum.Enum`, for the same reason as the two above: it
 # renders as an OpenAPI enum and an unrecognized value is a 422 that names the valid options.
 # See `app.features.runs.internals.stats_window` for the window -> bucket -> step mapping.
-StatsWindowName = Literal["7d", "30d", "90d"]
+StatsWindowName = Literal["1d", "7d", "14d"]
 StatsBucketName = Literal["hour", "day"]
 
 

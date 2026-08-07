@@ -64,7 +64,7 @@ async def test_seeded_runs_produce_hand_verifiable_aggregates(
     website_id = await seed_website(
         websites_db, TEST_USER_A_ID, "https://stats-hand-verified.example"
     )
-    window = resolve_window("30d", _NOW)
+    window = resolve_window("14d", _NOW)
     # A bucket boundary well inside the window -- not `window.start` itself, so this test
     # exercises an ordinary bucket rather than doubling as the boundary test (see #13 below).
     target_bucket = window.start + timedelta(days=5)
@@ -104,11 +104,11 @@ async def test_seeded_runs_produce_hand_verifiable_aggregates(
         stats=None,
     )
 
-    response = await user_client.get(f"/websites/{website_id}/stats")
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
 
     assert response.status_code == 200
     body = response.json()
-    assert body["window"] == "30d"
+    assert body["window"] == "14d"
     assert body["bucket"] == "day"
 
     bucket = _series_bucket(body["series"], target_bucket)
@@ -135,26 +135,26 @@ async def test_seeded_runs_produce_hand_verifiable_aggregates(
 # -----------------------------------------------------------------------------------------
 
 
-async def test_a_30_day_window_with_runs_on_three_days_zero_fills_the_rest(
+async def test_a_14_day_window_with_runs_on_three_days_zero_fills_the_rest(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-sparse.example")
-    window = resolve_window("30d", _NOW)
-    active_days = [window.start, window.start + timedelta(days=10), window.end - window.step]
+    window = resolve_window("14d", _NOW)
+    active_days = [window.start, window.start + timedelta(days=5), window.end - window.step]
 
     for day in active_days:
         await seed_run(websites_db, website_id, started_at=day + timedelta(hours=6))
 
-    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "30d"})
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
 
     assert response.status_code == 200
     series = response.json()["series"]
-    assert len(series) == 30
+    assert len(series) == 14
 
     nonzero = [point for point in series if point["runs"] > 0]
     zero = [point for point in series if point["runs"] == 0]
     assert len(nonzero) == 3
-    assert len(zero) == 27
+    assert len(zero) == 11
     assert {parse(point["t"]) for point in nonzero} == set(active_days)
 
     for point in zero:
@@ -169,7 +169,7 @@ async def test_a_30_day_window_with_runs_on_three_days_zero_fills_the_rest(
 # -----------------------------------------------------------------------------------------
 
 
-async def test_a_website_with_no_runs_returns_thirty_zeroed_buckets_and_null_summary(
+async def test_a_website_with_no_runs_returns_zeroed_buckets_and_null_summary(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-empty.example")
@@ -178,7 +178,8 @@ async def test_a_website_with_no_runs_returns_thirty_zeroed_buckets_and_null_sum
 
     assert response.status_code == 200
     body = response.json()
-    assert len(body["series"]) == 30
+    # The default window is 7d/hour — 168 zeroed buckets.
+    assert len(body["series"]) == 168
     assert all(point["runs"] == 0 for point in body["series"])
 
     totals = body["totals"]
@@ -292,7 +293,7 @@ async def test_in_flight_runs_are_excluded_from_the_duration_average_but_counted
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["1d", "30", "", "DROP TABLE"])
+@pytest.mark.parametrize("window", ["30d", "90d", "30", "", "DROP TABLE"])
 async def test_an_invalid_window_value_is_422(
     user_client: AsyncClient, websites_db: Pool, window: str
 ) -> None:
@@ -308,7 +309,7 @@ async def test_an_invalid_window_value_is_422(
 # -----------------------------------------------------------------------------------------
 
 
-async def test_default_window_is_30d_and_bucket_is_day(
+async def test_default_window_is_7d_and_bucket_is_hour(
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     website_id = await seed_website(
@@ -319,9 +320,21 @@ async def test_default_window_is_30d_and_bucket_is_day(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["window"] == "30d"
-    assert body["bucket"] == "day"
-    assert len(body["series"]) == 30
+    assert body["window"] == "7d"
+    assert body["bucket"] == "hour"
+    assert len(body["series"]) == 168
+
+
+async def test_1d_returns_24_hourly_buckets(user_client: AsyncClient, websites_db: Pool) -> None:
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-1d.example")
+
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "1d"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["window"] == "1d"
+    assert body["bucket"] == "hour"
+    assert len(body["series"]) == 24
 
 
 async def test_7d_returns_168_hourly_buckets(user_client: AsyncClient, websites_db: Pool) -> None:
@@ -336,16 +349,16 @@ async def test_7d_returns_168_hourly_buckets(user_client: AsyncClient, websites_
     assert len(body["series"]) == 168
 
 
-async def test_90d_returns_90_daily_buckets(user_client: AsyncClient, websites_db: Pool) -> None:
-    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-90d.example")
+async def test_14d_returns_14_daily_buckets(user_client: AsyncClient, websites_db: Pool) -> None:
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-14d.example")
 
-    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "90d"})
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
 
     assert response.status_code == 200
     body = response.json()
-    assert body["window"] == "90d"
+    assert body["window"] == "14d"
     assert body["bucket"] == "day"
-    assert len(body["series"]) == 90
+    assert len(body["series"]) == 14
 
 
 # -----------------------------------------------------------------------------------------
@@ -392,12 +405,12 @@ async def test_a_run_exactly_at_window_start_is_counted_one_microsecond_earlier_
     user_client: AsyncClient, websites_db: Pool
 ) -> None:
     website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-boundary.example")
-    window = resolve_window("30d", _NOW)
+    window = resolve_window("14d", _NOW)
 
     await seed_run(websites_db, website_id, started_at=window.start)
     await seed_run(websites_db, website_id, started_at=window.start - timedelta(microseconds=1))
 
-    response = await user_client.get(f"/websites/{website_id}/stats")
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
 
     assert response.status_code == 200
     body = response.json()
@@ -440,9 +453,9 @@ async def test_runs_belonging_to_a_different_website_are_not_counted(
 # Deliberately a LONG, SPARSE history (~20k rows spread over roughly a decade) rather than
 # `test_runs_api.py`'s dense, recent one: that suite's keyset query pages through "this
 # website's whole history" and wants most of a shallow scan to matter, so a dense recent
-# fixture is the right shape for it. This query's WHERE is a 30-day date range, and the claim
+# fixture is the right shape for it. This query's WHERE is a 14-day date range, and the claim
 # under test is that such a narrow, *selective* range rides the index rather than being
-# scanned sequentially — which only reproduces if the 30-day window is actually a small slice
+# scanned sequentially — which only reproduces if the 14-day window is actually a small slice
 # of the table. A dense recent history would make Postgres correctly prefer a Seq Scan, and a
 # test asserting an index scan against that fixture would just be asserting the cost model,
 # not this query's behavior.
@@ -450,14 +463,14 @@ async def test_runs_belonging_to_a_different_website_are_not_counted(
 
 _EXPLAIN_ROW_COUNT = 20_000
 # ~10 years of history spread evenly across _EXPLAIN_ROW_COUNT rows: 10 * 365 * 86_400
-# seconds, divided by the row count, rounded to a whole number of seconds. A 30-day window
-# against this fixture covers roughly 30 / 3650 ≈ 0.8% of the table.
+# seconds, divided by the row count, rounded to a whole number of seconds. A 14-day window
+# against this fixture covers roughly 14 / 3650 ≈ 0.38% of the table.
 _EXPLAIN_STEP_SECONDS = (10 * 365 * 86_400) // _EXPLAIN_ROW_COUNT
 
 
 async def _seed_long_sparse_history_for_explain(pool: Pool, website_id: UUID) -> None:
     """Bulk-insert `_EXPLAIN_ROW_COUNT` rows in one round trip, evenly spread across roughly
-    a decade ending now, so a 30-day window from `resolve_window` is a small, highly
+    a decade ending now, so a 14-day window from `resolve_window` is a small, highly
     selective slice of the table. See the section docstring above for why this fixture is
     sparse rather than dense, unlike `test_runs_api.py`'s.
     """
@@ -515,7 +528,7 @@ async def test_stats_query_plan_avoids_a_seq_scan_and_touches_runs_exactly_once(
 ) -> None:
     website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-explain.example")
     await _seed_long_sparse_history_for_explain(websites_db, website_id)
-    window = resolve_window("30d", _NOW)
+    window = resolve_window("14d", _NOW)
 
     plan = await explain_plan(
         websites_db,

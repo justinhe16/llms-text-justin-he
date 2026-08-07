@@ -29,12 +29,12 @@ export const DEFAULT_DETAIL_TAB: DetailTab = "runs";
  * `tsc` error here on the next `npm run gen:api` rather than a switcher quietly missing a
  * button. The order is this app's, not the schema's.
  */
-export const STATS_WINDOWS: readonly StatsWindow[] = ["7d", "30d", "90d"];
+export const STATS_WINDOWS: readonly StatsWindow[] = ["1d", "7d", "14d"];
 
-/** The window a URL with no (or an unrecognized) `?window=` resolves to. Thirty days is the
- * ticket's default: seven is too short to show a trend and ninety is too coarse to show a
- * recent change. */
-export const DEFAULT_STATS_WINDOW: StatsWindow = "30d";
+/** The window a URL with no (or an unrecognized) `?window=` resolves to. Seven days is the
+ * ticket's default: one day is too short to show a trend and fourteen is coarser than most
+ * readers need for "how is this site's index doing lately". */
+export const DEFAULT_STATS_WINDOW: StatsWindow = "7d";
 
 // A `readonly [...]` tuple's `.includes` only accepts its own member type, so the argument
 // is widened to `string` for the check. The predicate signature is what narrows afterwards,
@@ -49,6 +49,14 @@ function isDetailTab(value: string | null): value is DetailTab {
 // An unvalidated `?window=../../x` would be a guaranteed `422` (the backend's
 // `StatsWindowName` is a `Literal`) presented to the reader as a broken panel, when falling
 // back to the default renders the thing they almost certainly wanted.
+//
+// This is also what makes a DROPPED window safe rather than a hard failure. `?window=30d` and
+// `?window=90d` were live URLs before this ticket shortened `STATS_WINDOWS` to `1d`/`7d`/`14d`,
+// and this guard already falls back to `DEFAULT_STATS_WINDOW` for either one — nothing about
+// the fallback needed to change when the array did. Resist "simplifying" this into a check
+// against a hardcoded list of the old values, or an assumption that every unrecognized string
+// is a typo: a bookmarked `30d` link is exactly the case this exists to degrade gracefully
+// rather than 422.
 function isStatsWindow(value: string | null): value is StatsWindow {
   return value !== null && (STATS_WINDOWS as readonly string[]).includes(value);
 }
@@ -67,7 +75,7 @@ function isStatsWindow(value: string | null): value is StatsWindow {
  * be lost on the refresh the acceptance criteria ask about.
  *
  * `?window=` is the Trends tab's time span, and it is here rather than in `useState` inside
- * that panel for exactly the same reason: `?tab=trends&window=90d` has to restore that view
+ * that panel for exactly the same reason: `?tab=trends&window=14d` has to restore that view
  * on load. It lives in this hook rather than a second `useSearchParams` reader of its own so
  * that all three parameters are written through the one `updateView` below — two independent
  * writers racing on the same query string is how one of them loses a parameter.
@@ -141,7 +149,7 @@ export function useDetailView() {
    * Change the Trends tab's window.
    *
    * `?window=` is written even when it equals the default, rather than being deleted to keep
-   * the URL tidy. Picking "30d" after looking at "90d" is a deliberate choice, and the URL
+   * the URL tidy. Picking "7d" after looking at "14d" is a deliberate choice, and the URL
    * that results has to be copyable as *that* view — a URL that drops the parameter would
    * reopen on whatever the default happens to be at the time, which is the same thing only
    * by coincidence.

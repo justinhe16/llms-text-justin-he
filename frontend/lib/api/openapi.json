@@ -955,9 +955,9 @@
           },
           "window": {
             "enum": [
+              "1d",
               "7d",
-              "30d",
-              "90d"
+              "14d"
             ],
             "title": "Window",
             "type": "string"
@@ -1694,17 +1694,17 @@
             }
           },
           {
-            "description": "Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422.",
+            "description": "One of 1d, 7d, 14d; anything else is a 422.",
             "in": "query",
             "name": "window",
             "required": false,
             "schema": {
-              "default": "30d",
-              "description": "Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422.",
+              "default": "7d",
+              "description": "One of 1d, 7d, 14d; anything else is a 422.",
               "enum": [
+                "1d",
                 "7d",
-                "30d",
-                "90d"
+                "14d"
               ],
               "title": "Window",
               "type": "string"
