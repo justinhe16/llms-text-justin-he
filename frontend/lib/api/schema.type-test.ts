@@ -58,7 +58,7 @@ export type AssertCreateWebsiteReturnsWebsite = Expect<
 >;
 
 // `deleteWebsite` resolves `void`, matching the backend's `204 No Content` — see
-// `JsonBodyOf` in lib/api/fetcher.ts for why a response with no `content` key resolves to
+// `SuccessBodyOf` in lib/api/fetcher.ts for why a response with no `content` key resolves to
 // `void` rather than `never`.
 export type AssertDeleteWebsiteReturnsVoid = Expect<
   Equal<Awaited<ReturnType<typeof deleteWebsite>>, void>
@@ -91,6 +91,32 @@ export type AssertGetScheduleReturnsNullableSchedule = Expect<
 // just wrote, so a caller never has to null-check the thing it just set.
 export type AssertPutScheduleReturnsSchedule = Expect<
   Equal<Awaited<ReturnType<typeof putSchedule>>, Schedule>
+>;
+
+// --- the two text/plain artifact endpoints resolve to `string`, not `void` ---------------
+//
+// PER-181's acceptance criterion for the `SuccessBodyOf` change in lib/api/fetcher.ts, and
+// the only thing standing between "these operations return text" and the silent
+// `Promise<void>` that the `application/json`-only version produced. Asserted through
+// `api.get` directly rather than through a named helper because there is deliberately no
+// `lib/api/runs.ts` helper for these yet — the frontend download button is its own ticket —
+// so this is the call the eventual helper will be built on.
+//
+// `Equal<>` is exact, so this fails just as loudly if the fix is ever over-applied and the
+// branch starts swallowing a JSON response as `string`.
+export type AssertLlmsTxtDownloadResolvesToText = Expect<
+  Equal<Awaited<ReturnType<typeof api.get<"/runs/{id}/llms.txt">>>, string>
+>;
+
+export type AssertLlmsFullTxtDownloadResolvesToText = Expect<
+  Equal<Awaited<ReturnType<typeof api.get<"/runs/{id}/llms-full.txt">>>, string>
+>;
+
+// The regression guard in the other direction: adding a `text/plain` branch must not have
+// changed what a JSON operation resolves to. `AssertDeleteWebsiteReturnsVoid` above covers
+// the third branch (a 204 with no `content` key at all) for the same reason.
+export type AssertGetRunStillResolvesToJson = Expect<
+  Equal<Awaited<ReturnType<typeof api.get<"/runs/{id}">>>, RunDetail>
 >;
 
 // --- RunStatus is derived from the generated schema, not hand-copied --------------------
@@ -147,6 +173,9 @@ async function assertInvalidCallsDoNotCompile(): Promise<void> {
 
   // @ts-expect-error the "/websites/{id}/runs" path parameter is a string, not a number
   await api.get("/websites/{id}/runs", { params: { id: 123 } });
+
+  // @ts-expect-error the "/runs/{id}/llms.txt" path parameter is a string, not a number
+  await api.get("/runs/{id}/llms.txt", { params: { id: 123 } });
 
   // @ts-expect-error "queued" is not a member of RunStatusName
   await api.get("/websites/{id}/runs", { params: { id: "abc" }, query: { status: "queued" } });

@@ -1,5 +1,5 @@
-"""Private to the runs feature: its reader, its writer, its pagination-cursor codec, and its
-pure rate-limit-message helpers.
+"""Private to the runs feature: its reader, its writer, its pagination-cursor codec, its pure
+rate-limit-message helpers, and — as of PER-181 — its pure artifact-naming helpers.
 
 `internals/` means what it says (ARCHITECTURE.md §3.1): **no other feature imports anything
 in this package.** A feature that needs run data calls `RunService`, never `RunsReader` or
@@ -9,10 +9,14 @@ this boundary exists to enforce.
 Within the runs feature itself, three modules import from here, and the distinction between
 them matters:
 
-* `service.py` imports `runs_reader`, `runs_writer`, and `run_limits` — every `SELECT` and
-  every `INSERT`/`UPDATE` this feature runs is in the first two, and `RunService` is the
-  only thing allowed to call either. `run_limits` is imported here too, but it is pure (see
-  below), so this is not the same kind of dependency as the other two.
+* `service.py` imports `runs_reader`, `runs_writer`, `run_limits`, and — as of PER-181 —
+  `artifact_filename` — every `SELECT` and every `INSERT`/`UPDATE` this feature runs is in
+  the first two, and `RunService` is the only thing allowed to call either. `run_limits` and
+  `artifact_filename` are imported here too, but both are pure (see below), so neither is the
+  same kind of dependency as the reader and writer. `runs_reader.py` also imports
+  `artifact_filename`'s `ArtifactKind`, purely as a `Literal` to key its artifact-query
+  allowlist by — the same "pure helper, not a layering violation" exception `run_cursor`
+  documents below.
 * `api/routers/runs.py` imports `run_cursor` (`decode_cursor`, `RunCursor`, `CursorError`) so
   that a malformed `?cursor=` becomes a `422` in a `Depends()` before any service method
   runs. A router reaching into `internals/` looks like a layering violation and is not one:

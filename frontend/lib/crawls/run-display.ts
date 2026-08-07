@@ -75,6 +75,16 @@ export function formatDuration(durationMs: number | null | undefined): string | 
  * This names only the local copy — the file's *contents* are the artifact unchanged — so a
  * user downloading three sites' artifacts gets three distinguishable files instead of
  * `llms.txt`, `llms (1).txt`, `llms (2).txt`.
+ *
+ * **A second implementation of this function exists in Python**, `artifact_filename` in
+ * `backend/app/features/runs/internals/artifact_filename.py` — it names the download
+ * `GET /runs/{id}/llms.txt` and `GET /runs/{id}/llms-full.txt` (PER-181) offer, and it must
+ * agree with this function character for character or the same website's artifact lands in
+ * a user's Downloads folder under two different names depending on which button produced
+ * it. There is no seam between the two — this one names a `Blob` the browser already holds
+ * and never makes a request — so what keeps them from drifting is
+ * `backend/tests/test_artifact_filename.py`'s parity table, checked against both
+ * implementations by hand whenever either one changes.
  */
 export function llmsTxtFilename(origin: string): string {
   const withoutScheme = origin.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
