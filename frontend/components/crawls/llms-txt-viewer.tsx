@@ -6,6 +6,9 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { llmsTxtFilename } from "@/lib/crawls/run-display";
+import { saveTextFile } from "@/lib/crawls/save-text-file";
+
+import { DownloadFullButton } from "./download-full-button";
 
 /**
  * The `llms.txt` artifact itself: line numbers, a copy button, a download button, and
@@ -33,7 +36,19 @@ import { llmsTxtFilename } from "@/lib/crawls/run-display";
  * `<pre>`s in the same font and the same line-height have the same baselines. The gutter is
  * `sticky left-0` so it stays put while the code scrolls horizontally under it.
  */
-export function LlmsTxtViewer({ content, origin }: { content: string; origin: string }) {
+export function LlmsTxtViewer({
+  content,
+  origin,
+  runId,
+}: {
+  content: string;
+  origin: string;
+  /** The run this artifact belongs to — threaded through to `DownloadFullButton` below, whose
+   * `useDownloadFullArtifact` needs it to fetch `GET /runs/{id}/llms-full.txt`. This viewer
+   * itself never reads it otherwise: the `llms.txt` Download button already has `content` in
+   * hand and makes no request of its own. */
+  runId: string;
+}) {
   const codeRef = useRef<HTMLPreElement>(null);
 
   // Split once per artifact, not once per render: a poll tick re-renders this component
@@ -72,22 +87,17 @@ export function LlmsTxtViewer({ content, origin }: { content: string; origin: st
   };
 
   const download = () => {
-    // A Blob and an object URL, not a `data:` URI: a multi-megabyte artifact exceeds what
-    // some browsers accept in a URL, and the object URL costs nothing to create.
-    const url = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = llmsTxtFilename(origin);
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    // Revoked on the next macrotask rather than synchronously. Every current browser has
-    // handed the download off by the time `click()` returns, but some have historically
-    // processed the anchor's navigation asynchronously, and a URL revoked before that lands
-    // produces a silently empty file. Deferring costs one tick and removes the class of bug;
-    // not revoking at all would leak the whole artifact for the document's lifetime.
-    setTimeout(() => URL.revokeObjectURL(url), 0);
-    toast.success(`Downloaded ${llmsTxtFilename(origin)}`);
+    // Computed once and reused for both the save and the toast, rather than calling
+    // `llmsTxtFilename(origin)` twice — two calls would always agree (it is a pure function
+    // of `origin`), but there is no reason to make a reader re-derive that instead of just
+    // reading one `const`.
+    const filename = llmsTxtFilename(origin);
+    // `content` is already in memory — this is the same string the viewer is rendering — so
+    // saving it is a pure client-side `Blob` write with no request behind it. See
+    // `saveTextFile` (lib/crawls/save-text-file.ts) for the object-URL lifecycle this shares
+    // with `DownloadFullButton`'s `useDownloadFullArtifact`.
+    saveTextFile(content, filename);
+    toast.success(`Downloaded ${filename}`);
   };
 
   return (
@@ -105,6 +115,11 @@ export function LlmsTxtViewer({ content, origin }: { content: string; origin: st
             <DownloadIcon aria-hidden />
             Download
           </Button>
+          {/* Enabled, unconditionally: this viewer only renders once `content` exists, so
+              the run it belongs to has an `llms.txt` — but a completed run's `llms-full.txt`
+              is a separate artifact this component has no opinion on, and `DownloadFullButton`
+              fetches it fresh on click rather than assuming it exists. */}
+          <DownloadFullButton runId={runId} origin={origin} />
         </div>
       </div>
 

@@ -18,6 +18,7 @@ import { rowStatusFromRunStatus } from "@/lib/crawls/row-status";
 import { selectRunToShow } from "@/lib/crawls/select-run";
 
 import { CrawlsError } from "./crawls-error";
+import { DownloadFullButton } from "./download-full-button";
 import { LlmsTxtViewer } from "./llms-txt-viewer";
 import { RelativeTime } from "./relative-time";
 import { RunStatusIndicator } from "./run-status-indicator";
@@ -198,14 +199,26 @@ function RunOutput({ runId, origin }: { runId: string; origin: string }) {
   // State 2 of 4: the run is still going. A skeleton plus a live status, rather than an
   // empty viewer — there is genuinely no artifact yet, and saying so is more useful than
   // rendering zero lines as though that were the result.
+  //
+  // `DownloadFullButton` appears here too, disabled — the control is a fixture of this tab
+  // regardless of which of the four states is showing, so it is disabled with a reason
+  // rather than left out. A control that appears only once a run succeeds would look, on
+  // every run before that, like a bug rather than a state the person is currently in.
   if (isActiveRunStatus(run.status)) {
     return (
       <div className="space-y-3 rounded-lg border border-border bg-card p-6">
-        <div className="flex items-center gap-2 text-sm text-foreground">
-          <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
-          <span className="text-muted-foreground">
-            Generating… this page updates on its own when the crawl finishes.
-          </span>
+        <div className="flex items-center justify-between gap-3 text-sm text-foreground">
+          <div className="flex items-center gap-2">
+            <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
+            <span className="text-muted-foreground">
+              Generating… this page updates on its own when the crawl finishes.
+            </span>
+          </div>
+          <DownloadFullButton
+            runId={runId}
+            origin={origin}
+            disabledReason="This run hasn't finished yet — its llms-full.txt isn't ready."
+          />
         </div>
         <Skeleton className="h-4 w-3/4" />
         <Skeleton className="h-4 w-1/2" />
@@ -219,11 +232,18 @@ function RunOutput({ runId, origin }: { runId: string; origin: string }) {
   if (run.status === "failed") {
     return (
       <div className="space-y-3 rounded-lg border border-border bg-card p-6">
-        <div className="flex items-center gap-2">
-          <RunStatusIndicator status="failed" />
-          <span className="text-sm text-muted-foreground">
-            This run produced no llms.txt.
-          </span>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <RunStatusIndicator status="failed" />
+            <span className="text-sm text-muted-foreground">
+              This run produced no llms.txt.
+            </span>
+          </div>
+          <DownloadFullButton
+            runId={runId}
+            origin={origin}
+            disabledReason="This run failed before it could produce an llms-full.txt."
+          />
         </div>
         <pre className="max-h-64 overflow-auto rounded-md bg-status-failed-surface px-4 py-3 font-mono text-xs whitespace-pre-wrap break-words text-status-failed">
           {run.error ?? "The run failed, but recorded no error message."}
@@ -238,12 +258,19 @@ function RunOutput({ runId, origin }: { runId: string; origin: string }) {
   // would look identical to a crawl that legitimately found nothing.
   if (run.llms_txt === null || run.llms_txt === undefined) {
     return (
-      <p className="rounded-lg border border-border bg-card p-6 text-sm text-muted-foreground">
-        This run completed without storing an llms.txt.
-      </p>
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-6">
+        <p className="text-sm text-muted-foreground">
+          This run completed without storing an llms.txt.
+        </p>
+        <DownloadFullButton
+          runId={runId}
+          origin={origin}
+          disabledReason="This run completed without storing an llms-full.txt."
+        />
+      </div>
     );
   }
 
   // State 4 of 4: success.
-  return <LlmsTxtViewer content={run.llms_txt} origin={origin} />;
+  return <LlmsTxtViewer content={run.llms_txt} origin={origin} runId={runId} />;
 }
