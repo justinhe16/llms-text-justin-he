@@ -639,6 +639,329 @@ async def test_discovery_counters_and_the_selected_frontier_land_in_the_stored_s
 
 
 # -----------------------------------------------------------------------------------------
+# PER-178: the depth-1 link-extraction fallback, wired into `execute_run` behind sitemap
+# discovery. Each test below drives the real `extract_links` -> `select_urls` -> `crawl_site`
+# pipeline through the same `httpx.MockTransport` the seed fetch and the sitemap probes
+# share, and asserts on the run row it produces. `tests/test_crawl_links.py` pins the parser
+# in isolation and `tests/test_crawler_caps.py` pins the callback contract; what is pinned
+# here is WHEN the fallback runs at all, and what `runs.stats` says when it does.
+# -----------------------------------------------------------------------------------------
+
+
+def _links_page(*hrefs: str) -> str:
+    """An HTML page linking to each of `hrefs`, padded with enough prose to clear
+    `extract.MIN_BODY_CHARS` so the page is not counted as empty — these tests are about the
+    frontier, and a page's `is_empty` flag is a different ticket's assertion."""
+    links = "".join(f'<a href="{href}">{href}</a>' for href in hrefs)
+    prose = "This page documents the configuration options this service accepts. " * 6
+    return f"<html><body><nav>{links}</nav><main><p>{prose}</p></main></body></html>"
+
+
+def _no_sitemap(response: httpx.Response) -> Callable[[httpx.Request], httpx.Response]:
+    """A handler serving 404 for all three sitemap discovery probes and `response` for
+    everything else — the shape of a site that ships no sitemap at all."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        return response
+
+    return handler
+
+
+async def test_a_site_with_no_sitemap_falls_back_to_the_links_on_its_seed_page(
+    websites_db: Pool,
+) -> None:
+    """The [Fallback ordering] criterion's second half, end to end: all three discovery
+    probes 404, so the seed page's own links become the frontier, are fetched, and land in
+    `runs.stats` under `discovery_source: "links"`.
+
+    `pages_crawled == 4` — the seed plus its three same-origin links — is what proves the
+    extracted URLs genuinely reached `crawl_site`, rather than merely being counted.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "links-fallback")
+    storage = FakeStorage()
+
+    seed_html = _links_page(
+        "/docs/intro",
+        "/docs/config",
+        "/docs/deploy",
+        "https://other.test/off-origin",
+        "mailto:support@acme.test",
+        "#on-this-page",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        if request.url.path == "/links-fallback":
+            return httpx.Response(200, html=seed_html)
+        return httpx.Response(200, html=_links_page())
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["discovery_source"] == "links"
+    assert stats["urls_discovered"] == 3, "off-origin, mailto: and fragment-only never count"
+    assert stats["urls_selected"] == 3
+    assert stats["pages_crawled"] == 4
+    assert stats["version"] == 5, (
+        "a new VALUE for an existing key is still not a new shape — PER-178 added "
+        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 5 '
+        "because PER-180 added four enrich KEYS after that, which is a shape change; the "
+        "number moved for a reason that has nothing to do with the value asserted above."
+    )
+
+
+async def test_a_site_with_a_sitemap_never_consults_the_links_on_its_seed_page(
+    websites_db: Pool,
+) -> None:
+    """The [Fallback ordering] criterion's first half. The seed page here links to two pages
+    that the sitemap does not list; the handler raises if either is ever requested, so this
+    goes red on the request itself rather than on a `discovery_source` that merely disagrees.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "sitemap-wins")
+    storage = FakeStorage()
+
+    sitemap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://{_SEED_IP}/from-the-sitemap</loc></url>
+</urlset>"""
+    seed_html = _links_page("/only-in-the-markup", "/also-only-in-the-markup")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sitemap.xml":
+            return httpx.Response(
+                200, text=sitemap_body, headers={"Content-Type": "application/xml"}
+            )
+        if request.url.path.endswith("only-in-the-markup"):
+            raise AssertionError(
+                f"link extraction ran on a site that has a sitemap: {request.url.path}"
+            )
+        if request.url.path == "/sitemap-wins":
+            return httpx.Response(200, html=seed_html)
+        return httpx.Response(200, html=_links_page())
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["discovery_source"] == "sitemap"
+    assert stats["urls_discovered"] == 1
+    assert stats["pages_crawled"] == 2
+
+
+async def test_a_sitemap_whose_urls_ranking_drops_does_not_fall_back_to_links(
+    websites_db: Pool,
+) -> None:
+    """The fallback's trigger is "sitemap discovery found NOTHING", not "the frontier came out
+    empty" — and this is the one case where those two differ.
+
+    The sitemap here lists a single `/tag/` page, which `select_urls` drops under its
+    `"taxonomy"` rule, so `extra_urls` is empty even though discovery succeeded. Falling back
+    to scraped links here would quietly overrule the site operator's own statement about which
+    pages matter; the run stays a single-page one and still reports `discovery_source:
+    "sitemap"`, because that IS where its (subsequently emptied) frontier came from.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "all-dropped")
+    storage = FakeStorage()
+
+    sitemap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://{_SEED_IP}/tag/release-notes</loc></url>
+</urlset>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sitemap.xml":
+            return httpx.Response(
+                200, text=sitemap_body, headers={"Content-Type": "application/xml"}
+            )
+        if request.url.path == "/only-in-the-markup":
+            raise AssertionError("the link fallback ran for a site that has a sitemap")
+        if request.url.path == "/all-dropped":
+            return httpx.Response(200, html=_links_page("/only-in-the-markup"))
+        return httpx.Response(200, html=_links_page())
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["discovery_source"] == "sitemap"
+    assert stats["urls_discovered"] == 1
+    assert stats["urls_selected"] == 0
+    assert stats["pages_crawled"] == 1
+
+
+async def test_extracted_links_are_ranked_by_select_urls_before_anything_is_fetched(
+    websites_db: Pool,
+) -> None:
+    """The [Ranking] criterion. Extracted links are candidates, not a frontier: they go
+    through the SAME `select_urls` a sitemap's URLs do, so its drop rules apply to them
+    unchanged.
+
+    Four of the six same-origin links below are structurally not worth fetching — a `/tag/`
+    taxonomy, a dated archive, a feed, and a changelog — and the handler raises if any of them
+    is requested. `urls_discovered: 6, urls_selected: 2` is the reconciliation this ticket
+    asks for: extraction found six, ranking kept two.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "ranked")
+    storage = FakeStorage()
+
+    seed_html = _links_page(
+        "/docs/intro",
+        "/docs/config",
+        "/tag/releases",
+        "/blog/2019/hello",
+        "/feed.xml",
+        "/changelog",
+    )
+    dropped = ("/tag/releases", "/blog/2019/hello", "/feed.xml", "/changelog")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        if request.url.path in dropped:
+            raise AssertionError(f"select_urls should have dropped {request.url.path}")
+        if request.url.path == "/ranked":
+            return httpx.Response(200, html=seed_html)
+        return httpx.Response(200, html=_links_page())
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["discovery_source"] == "links"
+    assert stats["urls_discovered"] == 6
+    assert stats["urls_selected"] == 2
+    assert stats["pages_crawled"] == 3
+
+
+async def test_a_link_derived_frontier_respects_crawl_max_pages(websites_db: Pool) -> None:
+    """The [Ranking] criterion's other half: the same `crawl_max_pages` cap, applied to a
+    frontier that came off a page rather than out of a sitemap. `select_urls` is handed
+    `limit=max_pages - 1` because the seed already spends one of the budget's pages, so a cap
+    of three yields the seed plus the two best-ranked links — and `cap_hit` stays `None`,
+    because a frontier trimmed by RANKING never reached the loop's own truncation.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "capped")
+    storage = FakeStorage()
+
+    seed_html = _links_page(*(f"/docs/page-{i}" for i in range(10)))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        if request.url.path == "/capped":
+            return httpx.Response(200, html=seed_html)
+        return httpx.Response(200, html=_links_page())
+
+    capped_settings = settings.model_copy(update={"crawl_max_pages": 3})
+    async with _mock_client(handler) as http_client:
+        service = build_crawl_service(websites_db, http_client, storage, capped_settings)
+        outcome = await service.execute_run(run_id, max_attempts=1)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["discovery_source"] == "links"
+    assert stats["urls_discovered"] == 10
+    assert stats["urls_selected"] == 2
+    assert stats["pages_crawled"] == 3
+    assert stats["cap_hit"] is None
+
+
+async def test_a_site_whose_seed_page_has_no_links_still_completes_a_single_page_run(
+    websites_db: Pool,
+) -> None:
+    """The [Edge] criterion, end to end. No sitemap and no links is not a failure — it is the
+    same successful single-page run a site with no sitemap already produced before this
+    fallback existed, and it reports `discovery_source: "none"` rather than `"links"`: the
+    same rule `internals/sitemap.py` applies to its own entry points, where a path that ran
+    and yielded nothing is not the source of anything.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "no-links")
+    storage = FakeStorage()
+
+    handler = _no_sitemap(httpx.Response(200, html=_links_page()))
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["discovery_source"] == "none"
+    assert stats["urls_discovered"] == 0
+    assert stats["urls_selected"] == 0
+    assert stats["pages_crawled"] == 1
+
+
+async def test_a_failed_seed_reports_no_discovery_source_even_with_the_fallback_armed(
+    websites_db: Pool,
+) -> None:
+    """The fallback needs a fetched seed page to read, so a run whose seed never landed never
+    reaches it — and the hoisted `"none"`/0/0 defaults in `execute_run` fall straight through
+    into the failure row's partial stats, with no extra plumbing."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "dead-seed")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        raise httpx.ConnectError("simulated connection failure", request=request)
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "failed"
+    stats = json.loads(row["stats"])
+    assert stats["discovery_source"] == "none"
+    assert stats["urls_discovered"] == 0
+    assert stats["pages_crawled"] == 0
+
+
+async def test_links_found_but_all_ranked_away_still_report_the_links_source(
+    websites_db: Pool,
+) -> None:
+    """The direct mirror of `test_a_sitemap_whose_urls_ranking_drops_does_not_fall_back_to_
+    links`, for the fallback path — and the reason `discovery_source` is decided on what
+    EXTRACTION found rather than on what ranking kept.
+
+    Every link on this seed page is structurally not worth fetching, so `select_urls` empties
+    the frontier and the run is a single-page one. `discovery_source` is still `"links"`,
+    exactly as a sitemap whose every URL is dropped still reports `"sitemap"`: the key names
+    where the frontier came from, and `urls_discovered`/`urls_selected` are what say how much
+    of it survived. Reporting `"none"` here would make a run that found six links
+    indistinguishable from one that found a blank page.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "all-ranked-away")
+    storage = FakeStorage()
+
+    seed_html = _links_page("/tag/releases", "/blog/2019/hello", "/feed.xml")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        if request.url.path == "/all-ranked-away":
+            return httpx.Response(200, html=seed_html)
+        raise AssertionError(f"select_urls should have dropped {request.url.path}")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["discovery_source"] == "links"
+    assert stats["urls_discovered"] == 3
+    assert stats["urls_selected"] == 0
+    assert stats["pages_crawled"] == 1
+
+
+# -----------------------------------------------------------------------------------------
 # PER-180: flag-gated, model-assisted per-page summarization
 # (`app.features.crawl.internals.enrich`), end to end against a real Postgres row. Every
 # test below monkeypatches `settings.crawl_enrich_with_llm` to `True` and hands `_execute`

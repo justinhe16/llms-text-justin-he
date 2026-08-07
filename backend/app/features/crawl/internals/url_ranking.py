@@ -1,7 +1,7 @@
 """Ranking and selecting a crawl's frontier from raw discovered URLs.
 
-**What this module is for.** A sitemap, a `robots.txt` `Sitemap:` line, and (once link
-extraction lands) links found on already-fetched pages all surface far more URLs than any run
+**What this module is for.** A sitemap, a `robots.txt` `Sitemap:` line, and — since
+PER-178 — the `<a href>` links on a crawl's seed page all surface far more URLs than any run
 should ever fetch — a documentation site's sitemap alone can list thousands. `select_urls`
 takes whatever was discovered, in whatever order it was discovered in, and decides which
 subset `internals/crawler.py`'s `crawl_site(seed_url, extra_urls=...)` should actually spend
@@ -57,8 +57,10 @@ next to its one consumer instead of in the shared schemas module.
    to appear first in `candidates`.
 
 **Why `"off_origin"` exists at all — it is not on the ticket's own list of drop rules.**
-PER-176's link extraction will surface links to other domains (a partner's docs, a CDN, a
-social share target) exactly as readily as it surfaces links to the site being crawled. An
+PER-178's link extraction surfaces links to other domains (a partner's docs, a CDN, a
+social share target) exactly as readily as it surfaces links to the site being crawled —
+`internals/links.py` drops them on its own side too, so this rule and that filter agree by
+construction rather than by coincidence, and either one alone would still hold the line. An
 `llms.txt` that quietly includes another site's pages is `url_normalize.py`'s `www.`
 problem's other, worse half: not two spellings of one site failing to dedupe, but one site's
 artifact silently describing a different site — "a wrong artifact that looks right," in that
@@ -70,8 +72,8 @@ codebase, and this rule is deliberately the same equality it already uses for
 another feature's `internals/`); only the small piece needed — collapsing a default port —
 is reimplemented here.
 
-**Why a duplicate's metadata is merged rather than discarded.** PER-176's link extraction
-will routinely rediscover a URL a sitemap already listed — the same page, now carrying no
+**Why a duplicate's metadata is merged rather than discarded.** A discovery step routinely
+rediscovers a URL another one already listed — the same page, now carrying no
 `lastmod`/`priority` at all (`source="links"` never populates either field). Simply keeping
 whichever `DiscoveredUrl` `select_urls` happened to visit first would make a page's score
 depend on `candidates`' input order — silently, and in the one place this module promises
@@ -250,8 +252,8 @@ DiscoveredUrlSource = Literal["sitemap", "robots", "links"]
 @dataclass(frozen=True, slots=True)
 class DiscoveredUrl:
     """One URL as a discovery step (sitemap parsing, a `robots.txt` `Sitemap:` line, or —
-    once PER-176 lands — link extraction) found it, before `select_urls` has done anything
-    to it. Frozen because a discovery is a fact about what was found, not something a caller
+    since PER-178 — the seed page's own links) found it, before `select_urls` has done
+    anything to it. Frozen because a discovery is a fact about what was found, not something a caller
     should be able to edit in place.
 
     Never leaves the worker process and crosses no HTTP boundary — see the module docstring
