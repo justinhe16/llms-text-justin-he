@@ -22,6 +22,7 @@ from app.features.crawl.internals import llms_txt
 from app.features.crawl.internals.llms_txt import (
     MAX_FULL_TEXT_BYTES,
     MAX_PAGE_TEXT_BYTES,
+    MAX_TEXT_CHARS,
     count_full_txt_truncations,
     count_indexed_pages,
     generate_llms_full_txt,
@@ -369,6 +370,18 @@ def test_two_pages_sharing_a_url_cannot_reorder_the_output() -> None:
     assert generate_llms_txt([first, second]) == generate_llms_txt([second, first])
 
 
+def test_two_root_pages_sharing_a_url_cannot_change_the_project_name() -> None:
+    """The same hazard as above, on the OTHER pass over `pages`. `_project_name` scans for the
+    root page independently of the index, and keying that scan on the URL alone made the H1
+    depend on which duplicate the caller happened to list first — a determinism hole that the
+    index-level test above cannot reach, because the H1 is not derived from the index."""
+    alpha = _page("https://example.test/", title="Alpha")
+    beta = _page("https://example.test/", title="Beta")
+
+    assert generate_llms_txt([alpha, beta]) == generate_llms_txt([beta, alpha])
+    assert generate_llms_full_txt([alpha, beta]) == generate_llms_full_txt([beta, alpha])
+
+
 # --- the empty and all-empty cases ---------------------------------------------------------
 
 
@@ -590,6 +603,43 @@ def test_a_page_both_trimmed_and_then_dropped_is_counted_once(
     ]
 
     assert count_full_txt_truncations(pages) == len(pages)
+
+
+def test_an_enormous_title_cannot_push_the_full_text_past_the_run_cap() -> None:
+    """The crawled site chooses the `<title>`, and `extract.py` bounds neither it nor the
+    description. Before `MAX_TEXT_CHARS`, a single page with an eight-megabyte title produced
+    an eight-megabyte header before the first page section was even considered, so
+    `MAX_FULL_TEXT_BYTES` never got a say and an unbounded value reached a Postgres column."""
+    pages = [_page("https://example.test/", title="T" * (8 * 1024 * 1024))]
+
+    assert len(generate_llms_full_txt(pages).encode()) <= MAX_FULL_TEXT_BYTES
+    assert len(generate_llms_txt(pages).encode()) <= MAX_FULL_TEXT_BYTES
+
+
+def test_an_enormous_description_cannot_bloat_the_index() -> None:
+    """`llms.txt` has no size cap of its own — bullets were assumed small — so the bound on a
+    description is what makes that assumption true."""
+    pages = [_page("https://example.test/docs/a", title="A", description="D" * (8 * 1024 * 1024))]
+
+    assert len(generate_llms_txt(pages).encode()) < 10_000
+
+
+@pytest.mark.parametrize("field", ["title", "description"])
+def test_an_over_long_title_or_description_is_cut_and_marked(field: str) -> None:
+    pages = [_page("https://example.test/docs/a", **{field: "word " * 500})]
+    output = generate_llms_txt(pages)
+
+    assert "…" in output
+    assert len(max(output.splitlines(), key=len)) < MAX_TEXT_CHARS + 200
+
+
+def test_a_title_at_the_limit_is_left_exactly_as_it_is() -> None:
+    """The cut is a guard against a pathological page, not a house style — a value that fits
+    must survive byte for byte, ellipsis included nowhere."""
+    title = "T" * MAX_TEXT_CHARS
+    pages = [_page("https://example.test/docs/a", title=title)]
+
+    assert f"- [{title}](https://example.test/docs/a)" in generate_llms_txt(pages)
 
 
 def test_a_page_with_no_markdown_body_is_not_counted_as_truncated() -> None:

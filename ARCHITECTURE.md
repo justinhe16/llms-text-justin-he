@@ -331,7 +331,12 @@ as trimmed in the text) and **5 MiB per run** (stopped at a page boundary, never
 with a closing line naming how many pages were dropped). Both are measured in UTF-8 bytes,
 because what is being bounded is a column rather than a character count. `crawl_max_bytes`
 does not stand in for either: it bounds what comes off the wire, and a document's extracted
-markdown can be larger or far smaller than its own compressed transfer.
+markdown can be larger or far smaller than its own compressed transfer. A third bound covers
+what those two miss — a title and a description are chosen by the crawled site and bounded by
+nothing in `extract.py`, so both are cut at 500 characters. Without it a single page with an
+eight-megabyte `<title>` produces an eight-megabyte artifact header before the per-run cap is
+consulted at all. URLs are deliberately left unbounded: a truncated URL is a broken link, and
+the place to decline an over-long one is the frontier, before it is fetched.
 `runs.stats["full_txt_truncated"]` counts the pages that lost content either way, and
 `links_emitted` counts the bullets actually emitted — which is why it diverges from
 `pages_crawled` from `RUN_STATS_VERSION` 3 onwards (§6.4).

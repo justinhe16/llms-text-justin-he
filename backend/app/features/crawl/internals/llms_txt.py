@@ -86,9 +86,17 @@ the cap that actually protects `runs.llms_full_txt`, and it is enforced at a PAG
 (see `_plan_full_txt`), never mid-page.
 
 A backstop rather than the common path: at today's defaults this binds only if nearly every
-page in a run is at its own cap. `llms.txt` gets no equivalent cap because it cannot approach
-one — a bullet is a title, a URL and a sentence, so the index is tens of kilobytes at any
-page count this crawler will reach. The asymmetry is deliberate, not an omission."""
+page in a run is at its own cap.
+
+**`llms.txt` deliberately gets no equivalent cap**, and the asymmetry is reasoned rather than
+an omission. A bullet is a bounded title (`MAX_TEXT_CHARS`), a bounded description (likewise)
+and a URL, repeated at most `crawl_max_pages` times — so the index's size is bounded by the
+page count times the longest URL in the run, which is kilobytes for any site a crawler
+actually meets. The URL is the one part that is NOT bounded here, and deliberately so: a
+truncated URL is a broken link, which is strictly worse than a long one, and dropping bullets
+to hit a byte target would defeat the point of an index. If a pathological run ever makes
+this matter, the fix is a cap on URL length at the frontier — upstream, where an over-long
+URL can be declined before it is fetched — not a truncation at the point of writing it out."""
 
 _RUN_NOTICE_RESERVE_BYTES: Final = 256
 """Bytes held back from `MAX_FULL_TEXT_BYTES` so `_run_truncation_notice` always fits.
@@ -106,6 +114,28 @@ _PAGE_TRUNCATION_NOTICE: Final = (
 text rather than only in `runs.stats`, because a reader — human or model — consuming
 `llms-full.txt` on its own has no access to the stats row, and a body that simply stops
 mid-sentence is indistinguishable from a page the crawler genuinely found nothing more of."""
+
+MAX_TEXT_CHARS: Final = 500
+"""How long a title or a description may be before `_clean` cuts it.
+
+**This is a cap, not a formatting preference, and it is what makes the other two caps hold.**
+Every other bound in this module governs a page's markdown, and none of them covers a title
+or a description — but both are extracted from a crawled page, which is to say both are
+chosen by the site being crawled rather than by this codebase. Without this, a single page
+with an eight-megabyte `<title>` produces an eight-megabyte `llms-full.txt` header before the
+first page section is even considered, and `MAX_FULL_TEXT_BYTES` never gets a say; the index,
+which has no size cap of its own precisely because bullets were assumed to be small, has the
+same hole through a long description. `internals/extract.py` bounds neither, and should not
+have to — it reports what the document said, and what is safe to inline into a column is this
+module's question.
+
+500 characters is far past any real value and still trivially bounded: a `<title>` is
+conventionally under 60, an `og:description` under 200. Cutting at a limit no honest page
+reaches means the truncation is invisible in practice and total in the adversarial case."""
+
+_TEXT_ELLIPSIS: Final = "…"
+"""Marks a title or description cut at `MAX_TEXT_CHARS`, so a truncated value is not passed
+off as the whole of what the page said."""
 
 _OTHER_SECTION: Final = "Other"
 """The catch-all heading, and the only section never derived from a readable path segment.
@@ -415,10 +445,7 @@ def _index_entries(pages: list[CrawledPage]) -> list[_Entry]:
     visits each URL once — but a hand-built list can, and without them a shuffle of such a
     list would change the output and quietly break the one property this module promises.
     """
-    ordered = sorted(
-        pages,
-        key=lambda page: (page.url, page.title or "", page.description or "", page.markdown),
-    )
+    ordered = sorted(pages, key=_ordering_key)
     entries = [
         _Entry(
             section=_section_for(page.url),
@@ -432,6 +459,23 @@ def _index_entries(pages: list[CrawledPage]) -> list[_Entry]:
     ]
     entries.sort(key=lambda entry: (_section_rank(entry.section), entry.section))
     return entries
+
+
+def _ordering_key(page: CrawledPage) -> tuple[str, str, str, str]:
+    """The total order every pass over `pages` in this module uses.
+
+    URL first — the determinism contract the module docstring states. The three fields after
+    it only ever break a tie between two pages that share a URL, which `crawl_site` cannot
+    produce (its frontier visits each URL once) but a hand-built list can. Without them the
+    sort is merely STABLE rather than total, which means it preserves input order for such a
+    pair — and input order is exactly what this module promises never to depend on.
+
+    Shared by `_index_entries` and `_project_name` rather than written out at each call site,
+    because the two disagreeing is the specific bug this function exists to prevent: an
+    earlier revision keyed `_project_name` on the URL alone, and two root pages with different
+    titles produced a different H1 depending on which one the caller happened to list first.
+    """
+    return (page.url, page.title or "", page.description or "", page.markdown)
 
 
 def _section_for(url: str) -> str:
@@ -497,11 +541,12 @@ def _label_for(page: CrawledPage) -> str:
         return title
     segments = _path_segments(page.url)
     if segments:
-        stem = segments[-1].rsplit(".", 1)[0]
-        label = _humanize(stem)
+        # Through `_clean` as well, not just the title above: a path segment is as much the
+        # crawled site's choice as a `<title>` is, so the fallback needs the same bound.
+        label = _clean(_humanize(segments[-1].rsplit(".", 1)[0]))
         if label:
             return label
-    return urlsplit(page.url).netloc
+    return _clean(urlsplit(page.url).netloc) or urlsplit(page.url).netloc
 
 
 def _origin(pages: list[CrawledPage]) -> str:
@@ -533,7 +578,7 @@ def _project_name(pages: list[CrawledPage], origin: str) -> str:
     is the FINAL url after redirects (`CrawledPage.url`), so a redirect off-origin can leave a
     page here whose root is not this run's root.
     """
-    for page in sorted(pages, key=lambda page: page.url):
+    for page in sorted(pages, key=_ordering_key):
         parts = urlsplit(page.url)
         if f"{parts.scheme}://{parts.netloc}" != origin or parts.path.strip("/") or parts.query:
             continue
@@ -599,7 +644,15 @@ def _clean(text: str | None) -> str | None:
     Returns `None`, never `""`, for both an absent value and one that was entirely whitespace,
     so callers can keep writing `_clean(x) or fallback` — the same reason
     `ExtractedContent.title` is `None` rather than empty.
+
+    Also the one place a title or description is bounded, at `MAX_TEXT_CHARS` — see that
+    constant for why an unbounded one is a real problem rather than an untidy one. Every value
+    this module puts in an H1, an H2 or a bullet passes through here, which is what makes one
+    check sufficient.
     """
     if text is None:
         return None
-    return " ".join(text.split()) or None
+    collapsed = " ".join(text.split())
+    if len(collapsed) > MAX_TEXT_CHARS:
+        return collapsed[:MAX_TEXT_CHARS].rstrip() + _TEXT_ELLIPSIS
+    return collapsed or None
