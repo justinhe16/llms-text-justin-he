@@ -9,13 +9,20 @@
 // Two things it deliberately does NOT do. It does not call Supabase from the browser to
 // look other users up — the frontend never talks to anything but the BFF proxy
 // (ARCHITECTURE.md §8.1), and the Auth admin API is a service-role credential that belongs
-// nowhere near this bundle. And it does not dress the UUID prefix up as `@something`: a
-// fabricated handle that looks like a GitHub handle but is not one is worse than an honest
-// short id, because it is the kind of thing someone copies into a search box.
+// nowhere near this bundle. And for anybody else, it does not dress the UUID prefix up as
+// `@something`: a fabricated handle that looks like a GitHub handle but is not one is worse
+// than an honest short id, because it is the kind of thing someone copies into a search box.
+// PER-195 renders *your own* real handle and avatar on your own row, read from your own
+// session via `lib/auth/use-user.ts` — the opposite of fabricating one, since it is an
+// identity the frontend genuinely has. The prohibition above was always about inventing an
+// identity for someone the frontend cannot see, not about the one identity it can.
 //
 // Closing the gap properly means the backend returning an owner handle/avatar on the list
 // response, which is a schema change and therefore its own ticket. When it lands, this file
 // is the only thing that changes.
+
+import { initials } from "@/lib/auth/initials";
+import type { AuthUser } from "@/lib/auth/use-user";
 
 /** The rendered identity of a website's owner. */
 export interface OwnerIdentity {
@@ -24,8 +31,6 @@ export interface OwnerIdentity {
   isYou: boolean;
   /** What the Owner column prints. */
   label: string;
-  /** One or two characters for the monogram chip beside the label. */
-  monogram: string;
   /** The full `user_id`, for the tooltip — the only complete, unambiguous thing we have. */
   userId: string;
 }
@@ -52,7 +57,47 @@ export function ownerIdentity(userId: string, currentUserId: string | null): Own
   return {
     isYou,
     label: isYou ? "you" : short,
-    monogram: isYou ? "•" : short.slice(0, 2).toUpperCase(),
     userId,
+  };
+}
+
+/** The fields of `AuthUser` (lib/auth/use-user.ts) this module reads. Structural, so
+ * lib/crawls/ depends on four named fields rather than on the whole auth shape. */
+export type OwnerViewer = Pick<AuthUser, "id" | "handle" | "avatarUrl" | "displayName">;
+
+/** What the Owner pill renders. Exactly one of `avatarUrl`/`initial` is non-null on your
+ * own row; both are null on everybody else's — their pill is the short id alone. */
+export interface OwnerPill {
+  /** True only when the signed-in user added this website. False while the session is
+   * still resolving, for the reason `ownerIdentity` documents. */
+  isYou: boolean;
+  /** The pill's own text: "you", or the eight-character short id. */
+  text: string;
+  /** Your own GitHub handle, `@`-prefixed, when the session carries one. `null` on every
+   * other row, and on yours if you signed in without one (the dev password path). */
+  handle: string | null;
+  /** The full `user_id`. The tooltip whenever `handle` is null, and the only complete,
+   * unambiguous thing this frontend has for anybody else. */
+  userId: string;
+  /** Your own GitHub avatar. `null` on every other row and while the session resolves. */
+  avatarUrl: string | null;
+  /** The letter drawn in place of a missing avatar on your own row. */
+  initial: string | null;
+}
+
+export function ownerPill(userId: string, viewer: OwnerViewer | null): OwnerPill {
+  const { isYou, label } = ownerIdentity(userId, viewer?.id ?? null);
+
+  if (!isYou || viewer === null) {
+    return { isYou: false, text: label, handle: null, userId, avatarUrl: null, initial: null };
+  }
+
+  return {
+    isYou: true,
+    text: label,
+    handle: viewer.handle === null ? null : `@${viewer.handle}`,
+    userId,
+    avatarUrl: viewer.avatarUrl,
+    initial: viewer.avatarUrl === null ? initials(viewer.displayName) : null,
   };
 }

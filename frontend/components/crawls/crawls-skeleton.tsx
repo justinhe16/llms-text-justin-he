@@ -97,10 +97,7 @@ export function CrawlsSkeleton() {
                     <Skeleton className="h-5 w-12 rounded-4xl" />
                   </TableCell>
                   <TableCell className="px-3">
-                    <div className="flex items-center gap-2">
-                      <Skeleton className="size-5 rounded-full" />
-                      <Skeleton className="h-4 w-16" />
-                    </div>
+                    <Skeleton className="h-5 w-20 rounded-4xl" />
                   </TableCell>
                 </TableRow>
               ))}
