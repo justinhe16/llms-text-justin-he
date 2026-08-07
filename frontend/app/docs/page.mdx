@@ -65,6 +65,16 @@ Every other `robots.txt` directive is ignored. A failure at any source is logged
 Discovery returns an empty list on total failure, and the run continues with the seed page
 alone.
 
+This ordering is not novel. [Firecrawl](https://firecrawl.dev) and most tools that turn a site
+into an `llms.txt` read the sitemap first and fall back to page links, because a sitemap is the
+site's own statement of what it considers canonical and costs one request to read. Discovery
+here follows that shape and departs from it in three places: it never recurses past the seed
+page, where a general crawler follows links to a configured depth; it does not supplement the
+frontier with search results or with pages cached from an earlier run; and it reads
+`robots.txt` for `Sitemap:` lines rather than as a set of rules to obey. The borrowing is more
+literal further down the pipeline — the prompt under Summarize is Firecrawl's, word for
+word.
+
 ## Selection
 
 Selection turns discovered URLs into the fetch list. It normalizes each URL, drops URLs by
