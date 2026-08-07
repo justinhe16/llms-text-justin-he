@@ -302,14 +302,40 @@ the documentation generators this crawler actually meets (Docusaurus, Mintlify, 
 Nextra), asserting that a page's prose survives and its navbar, sidebar, table of contents,
 pagination and footer do not. Landing it as an unwired module keeps that judgement reviewable
 in isolation instead of buried inside a behaviour change to the fetch path, and it leaves the
-seam above exactly as narrow as it was. Ranking, summarization, and anything that calls a
-model remain undesigned and out of scope.
+seam above exactly as narrow as it was. Summarization and anything that calls a model remain
+undesigned and out of scope; ranking now exists too, but only the kind that happens *before*
+a fetch — see the next exception.
 
 `ExtractedContent.is_empty` is instrumentation, not a branch. It is set when a page yields
 less than `MIN_BODY_CHARS` of body — the signature of a JavaScript-rendered shell that
 returned a mount div and a bundle. Whether to pay for headless rendering is an open question
 with a real cost attached, and this flag exists to measure how often it would matter (counted
 by PER-176), not to decide it. Nothing branches on it.
+
+**A second exception, the same shape: `internals/url_ranking.py`.** `select_urls(candidates,
+*, seed_url, limit) -> SelectionResult` turns the URLs a discovery step found into the subset
+worth spending a run's page budget on. It normalizes every candidate, drops the ones
+structurally not worth fetching under named, individually-counted rules (dated archives,
+`/tag/` and `/author/` taxonomies, pagination, feeds, changelogs, off-origin links, and
+localized duplicates of a page already chosen), scores the rest on path shape plus the
+sitemap's own `<priority>` and `<lastmod>`, and takes the top `limit`. Pure and clock-free
+like the two modules above, and **called by nothing today**: `crawl_site`'s `extra_urls` is
+still an empty tuple, and wiring discovery and selection into it is PER-176.
+
+The distinction that matters is *where* that ranking sits. It runs entirely **before** any
+page is fetched, so it ranks on URL shape and sitemap metadata only — "fetch it and see
+whether it was worth fetching" is explicitly not a pass this module may grow, because that
+would put content judgement upstream of the seam instead of behind it. How *fetched* pages
+are ranked, summarized, or chosen for the artifact is still undesigned and still lives behind
+`generate_llms_txt`.
+
+`select_urls` is deterministic by construction: survivors sort by `(-score, url)`, so the URL
+tie-break makes a selection a pure function of *which* URLs were discovered rather than of
+the order a sitemap or a set of racing fetches happened to yield them in. That is the
+upstream half of the guarantee `internals/llms_txt.py`'s own docstring makes for the artifact.
+Its per-rule `SelectionResult.dropped` counters reconcile exactly — `discovered_count ==
+len(selected) + sum(dropped.values())`, every candidate either selected or dropped under
+exactly one rule — and recording them in `runs.stats` belongs to PER-176, not here.
 
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
@@ -1198,10 +1224,12 @@ PUT    /websites/{id}/schedule
 Deliberately not decided here, and not to be decided by accident in an implementation PR:
 
 - **The crawler pipeline design.** That milestone has not been designed. Until it is,
-  everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Content extraction is the
-  one piece that has landed — `internals/extract.py`, pure and called by nothing (§3.4) —
-  and it does not constitute a design for the rest: how pages are ranked, what a generated
-  artifact selects, and whether a model is involved at all are all still open.
+  everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Two pieces have landed,
+  both pure and both called by nothing (§3.4): `internals/extract.py`, which turns one
+  page's HTML into text, and `internals/url_ranking.py`, which decides which discovered URLs
+  are worth fetching at all. Together they still do not constitute a design for the rest —
+  how *fetched* pages are ranked, what a generated artifact selects and summarizes, and
+  whether a model is involved at all are all still open.
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**

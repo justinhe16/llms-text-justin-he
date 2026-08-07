@@ -1,0 +1,2306 @@
+[
+  {
+    "url": "https://docs.fictional-cloud.test/blog/page/2/",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/rest",
+    "lastmod": "2024-12-04T22:00:00+00:00",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/quickstart?ref=homepage",
+    "lastmod": "2024-02-07T21:00:00+00:00",
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/saml",
+    "lastmod": "2025-06-05T20:00:00",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2019/09/",
+    "lastmod": "2025-06-16T22:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2023/03/",
+    "lastmod": "2025-02-11T19:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test:8443/internal/admin",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/authentication",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2023/06/",
+    "lastmod": "2024-05-02T02:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/permissions",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2023/11/",
+    "lastmod": "2025-07-12T10:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/sso",
+    "lastmod": "2024-07-08T06:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/2021/",
+    "lastmod": "2025-03-11T18:00:00Z",
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/environments/advanced",
+    "lastmod": "2025-04-02T23:00:00Z",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/authorization",
+    "lastmod": "2024-08-24T06:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/configuration",
+    "lastmod": "2024-10-20T07:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/rate-limits",
+    "lastmod": "2024-05-13T05:00:00+00:00",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/page/4/",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/teams",
+    "lastmod": "2025-03-17T12:00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/authorization",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/deployment",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/streaming/troubleshooting",
+    "lastmod": "2025-02-15T15:00:00",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/networking/overview",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/zh-CN/getting-started/quickstart",
+    "lastmod": "2024-05-24T18:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/pt-br/reference/authorization",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2020/11/",
+    "lastmod": "2024-06-03T12:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/scaling",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/storage",
+    "lastmod": "2024-07-04T10:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/scaling",
+    "lastmod": "2025-09-05T13:00:00Z",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/oauth",
+    "lastmod": "2024-07-20T11:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/faq",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/deployment",
+    "lastmod": "2024-08-30T11:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://community.fictional-cloud.test/t/some-thread/42",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/rest",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/cli",
+    "lastmod": "2025-02-07T02:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/category/release-notes-topic",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/sso/examples",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/fr/guides/changelog-format",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/author/platform",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=4",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/rate-limits/overview",
+    "lastmod": null,
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/installation?utm_source=newsletter&utm_campaign=spring",
+    "lastmod": "2025-09-08T22:00:00",
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/authors/engineering",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/faq/overview",
+    "lastmod": null,
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/shipping-fast-without-breaking-things",
+    "lastmod": "2025-06-07T09:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/sso",
+    "lastmod": "2025-07-02T01:00:00Z",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/networking",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/authorization/advanced",
+    "lastmod": "2024-03-30T07:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/databases",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/oauth",
+    "lastmod": "2025-04-30T16:00:00+00:00",
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/changelog-format/best-practices",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/scaling",
+    "lastmod": "2024-12-26T10:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/de/guide/rest",
+    "lastmod": null,
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/es/docs/databases",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/storage",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/configuration",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/saml",
+    "lastmod": null,
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/rss.xml",
+    "lastmod": null,
+    "priority": 0.1,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/releases/v2",
+    "lastmod": "2024-12-16T01:00:00Z",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "javascript:void(0)",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/installation",
+    "lastmod": "2025-07-12T11:00:00+00:00",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2022/11/",
+    "lastmod": "2024-10-04T05:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/streaming",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/billing/limits",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/release-process",
+    "lastmod": "2025-04-15T06:00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/category/jane-doe",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/installation/overview",
+    "lastmod": null,
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/errors/advanced",
+    "lastmod": null,
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/networking",
+    "lastmod": "2024-03-30T02:00:00Z",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/faq",
+    "lastmod": "2024-04-22T23:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/changelog-format",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/saml",
+    "lastmod": "2024-01-30T01:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "mailto:support@fictional-cloud.test",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tag/platform",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/databases",
+    "lastmod": null,
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/changelog-format",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/audit-logs",
+    "lastmod": "2024-11-22T02:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/networking/advanced",
+    "lastmod": "2024-09-24T04:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/configuration/limits",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/permissions",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/deployment",
+    "lastmod": "2025-07-15T18:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/de/reference/oauth",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/errors",
+    "lastmod": "2025-06-22T12:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2021/01/",
+    "lastmod": "2024-01-07T02:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/zh-CN/docs/billing",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/es/guides/networking",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/changelog-format",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://partner-integrations.test/docs/fictional-cloud",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/pagination",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/billing/advanced",
+    "lastmod": null,
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/permissions",
+    "lastmod": "2024-06-10T21:00:00+00:00",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/graphql",
+    "lastmod": "2024-09-10T19:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/sdks",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/pagination/overview",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/errors",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/audit-logs/advanced",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tags/engineering",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/webhooks",
+    "lastmod": "2024-04-07T07:00:00+00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/quickstart?mc_cid=1&mc_eid=2",
+    "lastmod": "2024-11-16T07:00:00+00:00",
+    "priority": 0.7,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/page/5/",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/databases",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/deployment",
+    "lastmod": "2024-08-04T11:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/changelog-format",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/authentication",
+    "lastmod": "2024-09-25T12:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/networking",
+    "lastmod": "2025-04-17T22:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/zh-CN/getting-started/sdks",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/installation",
+    "lastmod": "2025-05-27T15:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/pagination",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/scaling",
+    "lastmod": "2024-01-16T01:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=7",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/es/docs/faq",
+    "lastmod": "2024-11-16T14:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/configuration",
+    "lastmod": "2024-06-30T12:00:00",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tag/product",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/sso",
+    "lastmod": "2024-02-11T14:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/environments",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/networking",
+    "lastmod": "2025-04-13T11:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/de/docs/configuration",
+    "lastmod": "2024-12-20T03:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/errors",
+    "lastmod": "2025-04-20T16:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2024/01/",
+    "lastmod": "2025-07-24T21:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/faq",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/billing",
+    "lastmod": "2024-04-03T16:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/errors",
+    "lastmod": "2024-08-21T04:00:00Z",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://status.fictional-cloud.test/",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/categories/release-notes-topic",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/audit-logs",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/scaling",
+    "lastmod": "2025-07-26T00:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/installation",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/rate-limits/advanced",
+    "lastmod": "2025-05-03T22:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/secrets",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/teams/troubleshooting",
+    "lastmod": "2024-07-10T17:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/what-we-learned-from-our-outage",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/oauth",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "not a url at all",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/cli",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/rate-limits",
+    "lastmod": null,
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=6",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/deployment",
+    "lastmod": "2024-07-27T05:00:00Z",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/rate-limits",
+    "lastmod": "2024-04-13T05:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/pt-br/api/deployment",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/permissions",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/rest",
+    "lastmod": "2024-07-30T06:00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/quickstart",
+    "lastmod": "2024-02-07T21:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/es/reference/pagination",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/authorization",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/saml",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/de/guide/errors",
+    "lastmod": "2024-09-24T03:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/webhooks",
+    "lastmod": "2024-06-05T13:00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/audit-logs",
+    "lastmod": "2025-04-30T01:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/audit-logs",
+    "lastmod": "2024-06-19T06:00:00Z",
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/graphql",
+    "lastmod": "2025-08-08T00:00:00",
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/page/3/",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/scaling/troubleshooting",
+    "lastmod": "2024-04-10T12:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/faq",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/changelog-format",
+    "lastmod": "2024-05-12T08:00:00Z",
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/graphql",
+    "lastmod": "2025-03-16T06:00:00+00:00",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/environments/best-practices",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/authors/product",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/pagination",
+    "lastmod": "2025-06-16T15:00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/es/guide/rest",
+    "lastmod": "2024-05-02T00:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/graphql",
+    "lastmod": "2025-03-24T05:00:00+00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/behind-the-scenes-of-launch-week",
+    "lastmod": "2024-10-07T07:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/changelog",
+    "lastmod": "2024-07-09T10:00:00+00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/changelog-format?page=2",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/scaling/examples",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/secrets/best-practices",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/networking/best-practices",
+    "lastmod": "2024-03-18T22:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2021/09/",
+    "lastmod": "2025-02-15T05:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/rest",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2021/03/",
+    "lastmod": "2025-02-27T08:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/webhooks?fbclid=abc123",
+    "lastmod": "2024-06-05T13:00:00",
+    "priority": 0.7,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/storage",
+    "lastmod": "2024-01-13T10:00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/zh-CN/docs/audit-logs",
+    "lastmod": "2025-06-21T20:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/2019/",
+    "lastmod": "2024-09-17T00:00:00",
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/fr/guide/environments",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2022/06/",
+    "lastmod": "2024-07-13T23:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/authorization",
+    "lastmod": "2024-02-17T10:00:00",
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test:notaport/docs/installation",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/faq",
+    "lastmod": "2024-03-08T04:00:00",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/oauth",
+    "lastmod": "2024-12-03T22:00:00Z",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/fr/api/faq",
+    "lastmod": "2025-08-10T13:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/pagination",
+    "lastmod": "2024-06-30T16:00:00Z",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/categories/jane-doe",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/deployment",
+    "lastmod": "2024-10-07T16:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/configuration",
+    "lastmod": "2024-06-24T16:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/configuration",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/billing",
+    "lastmod": "2024-01-19T18:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/changelog-format/best-practices",
+    "lastmod": "2024-01-04T12:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/author/engineering",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/streaming",
+    "lastmod": "2024-01-11T20:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tag/jane-doe",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/feed",
+    "lastmod": null,
+    "priority": 0.1,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/saml",
+    "lastmod": "2025-05-25T18:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/pt-br/getting-started/scaling",
+    "lastmod": "2025-01-12T13:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/category/engineering",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/configuration",
+    "lastmod": "2025-06-25T22:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/cli",
+    "lastmod": "2024-05-28T13:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/sso",
+    "lastmod": null,
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/categories/product",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/errors/best-practices",
+    "lastmod": "2024-08-30T02:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2021/11/",
+    "lastmod": "2024-08-23T08:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/a-day-in-the-life-of-an-sre",
+    "lastmod": "2025-08-26T10:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/categories/platform",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/secrets",
+    "lastmod": "2024-05-26T23:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/teams",
+    "lastmod": "2024-08-22T21:00:00+00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/cli",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/streaming",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/installation",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/category/product",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/errors",
+    "lastmod": "2024-10-21T04:00:00+00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/faq/overview",
+    "lastmod": null,
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/teams",
+    "lastmod": "2024-09-12T16:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/graphql/overview",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/permissions/overview",
+    "lastmod": "2025-01-21T21:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/ja/getting-started/graphql",
+    "lastmod": "2025-06-21T01:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2024/11/",
+    "lastmod": "2025-09-06T10:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/storage",
+    "lastmod": "2024-08-12T16:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/authorization",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/oauth",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/storage/overview",
+    "lastmod": "2024-06-10T02:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/changelog-format",
+    "lastmod": "2024-03-29T16:00:00",
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/cli/limits",
+    "lastmod": "2024-09-22T10:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/installation/overview",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/environments",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/an-interview-with-our-founder",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/",
+    "lastmod": "2025-01-09T08:00:00+00:00",
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/cli",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2019/03/",
+    "lastmod": "2025-03-05T16:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/2024/",
+    "lastmod": "2024-06-19T14:00:00Z",
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/pagination/troubleshooting",
+    "lastmod": "2024-06-15T00:00:00Z",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/secrets",
+    "lastmod": "2025-01-31T00:00:00+00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/sdks",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/designing-for-offline-first",
+    "lastmod": "2024-10-16T11:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/streaming",
+    "lastmod": null,
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/fr/getting-started/audit-logs",
+    "lastmod": "2025-08-13T16:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/webhooks",
+    "lastmod": "2024-08-17T22:00:00Z",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/databases",
+    "lastmod": null,
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/sdks",
+    "lastmod": "2024-09-08T04:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/databases",
+    "lastmod": "2024-09-11T23:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tags/jane-doe",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/feed",
+    "lastmod": null,
+    "priority": 0.1,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/cli/troubleshooting",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/ja/docs/installation",
+    "lastmod": "2025-02-04T18:00:00Z",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/audit-logs",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/networking",
+    "lastmod": "2025-02-23T01:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/cli/overview",
+    "lastmod": "2025-03-01T22:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://cdn.fictional-cloud-assets.test/logo.svg",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2024/06/",
+    "lastmod": "2025-06-18T01:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/quickstart",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/authorization",
+    "lastmod": "2025-03-12T00:00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/pagination",
+    "lastmod": "2024-11-05T20:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=5",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "ftp://files.fictional-cloud.test/package.tar.gz",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/graphql",
+    "lastmod": "2024-04-24T18:00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/rate-limits",
+    "lastmod": "2024-06-02T11:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2022/03/",
+    "lastmod": "2024-09-13T20:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/release-notes/v3",
+    "lastmod": "2024-03-14T04:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/changelog/2024",
+    "lastmod": "2025-01-29T09:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/rest/advanced",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2024/03/",
+    "lastmod": "2024-02-03T09:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/environments",
+    "lastmod": "2024-09-02T10:00:00Z",
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/fr/docs/oauth",
+    "lastmod": "2024-10-28T08:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/streaming",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/permissions",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2020/09/",
+    "lastmod": "2025-06-06T10:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/errors?gclid=xyz",
+    "lastmod": "2024-10-21T04:00:00+00:00",
+    "priority": 0.5,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2020/01/",
+    "lastmod": "2024-06-11T21:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/release-notes",
+    "lastmod": "2024-06-04T09:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/networking",
+    "lastmod": "2024-05-28T02:00:00",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/author/product",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/rest",
+    "lastmod": "2024-02-12T19:00:00+00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/installation/",
+    "lastmod": "2025-09-08T22:00:00",
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/webhooks",
+    "lastmod": "2024-10-16T20:00:00Z",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/rate-limits",
+    "lastmod": null,
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2019/01/",
+    "lastmod": "2024-04-23T14:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/webhooks",
+    "lastmod": "2025-04-10T06:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/zh-CN/docs/teams",
+    "lastmod": "2024-09-17T02:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/author/release-notes-topic",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/audit-logs",
+    "lastmod": "2024-03-19T06:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/cli",
+    "lastmod": "2024-02-08T19:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/js/sdk-reference",
+    "lastmod": "2025-05-11T08:00:00Z",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=8",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/rate-limits",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/rest/examples",
+    "lastmod": "2025-03-21T09:00:00Z",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/graphql",
+    "lastmod": null,
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/releases",
+    "lastmod": "2024-06-02T03:00:00Z",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "http://docs.fictional-cloud.test/docs/installation",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/secrets",
+    "lastmod": "2025-03-05T17:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/storage",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/sdks",
+    "lastmod": "2024-07-27T15:00:00+00:00",
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/author/jane-doe",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/ja/api/authentication",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/installation/troubleshooting",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/quickstart",
+    "lastmod": "2025-02-24T23:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/streaming",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/environments",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/sso",
+    "lastmod": null,
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/errors",
+    "lastmod": "2024-11-24T00:00:00+00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/permissions",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/billing",
+    "lastmod": "2024-09-07T01:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/databases",
+    "lastmod": "2024-11-02T01:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/ja/reference/changelog-format",
+    "lastmod": "2024-03-22T03:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/configuration/advanced",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tags/product",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/authors/release-notes-topic",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/environments",
+    "lastmod": "2024-02-05T05:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/installation",
+    "lastmod": "2025-09-08T22:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2020/06/",
+    "lastmod": "2025-03-30T10:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/billing",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/teams",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/authors/platform",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=2",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/configuration#section-two",
+    "lastmod": "2024-06-30T12:00:00",
+    "priority": 0.6,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/oauth",
+    "lastmod": "2024-08-07T15:00:00Z",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2022/01/",
+    "lastmod": "2024-04-19T08:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://blog.fictional-cloud.test/posts/launch-week",
+    "lastmod": null,
+    "priority": null,
+    "source": "links"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2023/09/",
+    "lastmod": "2025-03-01T10:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tags/release-notes-topic",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/notes-from-the-postmortem",
+    "lastmod": "2024-07-29T02:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/webhooks/overview",
+    "lastmod": null,
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/why-we-rebuilt-our-queue",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/de/api/faq",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/feed.xml",
+    "lastmod": null,
+    "priority": 0.1,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/rate-limits/troubleshooting",
+    "lastmod": null,
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/hiring-our-tenth-engineer",
+    "lastmod": "2024-06-18T18:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/sso",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/sdks",
+    "lastmod": "2024-03-09T22:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog?page=3",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/authentication",
+    "lastmod": null,
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/authentication",
+    "lastmod": "2024-10-17T01:00:00+00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/billing/troubleshooting",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tags/platform",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/authentication",
+    "lastmod": "2025-04-25T02:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/secrets",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2023/01/",
+    "lastmod": "2024-05-06T08:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tag/engineering",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/networking/advanced",
+    "lastmod": "2024-11-02T20:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/authentication",
+    "lastmod": "2024-03-17T00:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/teams",
+    "lastmod": "2025-04-10T00:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/webhooks",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/categories/engineering",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/quickstart",
+    "lastmod": "2024-11-16T07:00:00+00:00",
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/billing",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/secrets/overview",
+    "lastmod": null,
+    "priority": 0.7,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/permissions/advanced",
+    "lastmod": null,
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/2022/",
+    "lastmod": "2025-07-10T14:00:00Z",
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/the-cost-of-a-bad-default",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/category/platform",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/environments/advanced",
+    "lastmod": "2024-04-13T12:00:00Z",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/quickstart",
+    "lastmod": "2024-10-16T16:00:00Z",
+    "priority": 0.9,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2019/11/",
+    "lastmod": "2025-08-05T11:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/storage/best-practices",
+    "lastmod": "2025-02-09T18:00:00",
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/ja/guides/sdks",
+    "lastmod": "2024-11-09T07:00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/tag/release-notes-topic",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2021/06/",
+    "lastmod": "2024-07-16T12:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2019/06/",
+    "lastmod": "2024-03-30T16:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guides/installation",
+    "lastmod": "2024-03-11T20:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/environments",
+    "lastmod": "2025-05-22T22:00:00Z",
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2022/09/",
+    "lastmod": "2024-02-24T06:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/2023/",
+    "lastmod": "2024-08-06T19:00:00+00:00",
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/ui/components",
+    "lastmod": "2025-03-24T07:00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/sdks",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/secrets",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/news/2018/annual-recap",
+    "lastmod": "2025-04-13T23:00:00+00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/pagination",
+    "lastmod": null,
+    "priority": 0.8,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/teams",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2020/03/",
+    "lastmod": "2025-03-20T18:00:00",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/authors/jane-doe",
+    "lastmod": null,
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/pt-br/reference/environments",
+    "lastmod": "2024-04-23T07:00:00Z",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/os/compatibility",
+    "lastmod": "2024-12-15T13:00:00+00:00",
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/api/quickstart",
+    "lastmod": null,
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/pt-br/guides/errors",
+    "lastmod": "2024-02-18T11:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/getting-started/faq",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/2020/",
+    "lastmod": "2024-11-26T14:00:00Z",
+    "priority": 0.2,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/saml",
+    "lastmod": "2025-05-06T01:00:00",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/guide/storage",
+    "lastmod": "2025-06-30T17:00:00Z",
+    "priority": 0.6,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/blog/2024/09/",
+    "lastmod": "2024-04-27T05:00:00Z",
+    "priority": 0.3,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/rest/examples",
+    "lastmod": "2024-02-18T11:00:00Z",
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/change-log",
+    "lastmod": "2024-12-09T08:00:00",
+    "priority": 0.4,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/atom.xml",
+    "lastmod": null,
+    "priority": 0.1,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/rest",
+    "lastmod": null,
+    "priority": 0.5,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/docs/scaling",
+    "lastmod": null,
+    "priority": null,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/billing",
+    "lastmod": "2024-09-11T17:00:00",
+    "priority": 1.0,
+    "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/saml/",
+    "lastmod": "2025-06-18T00:00:00+00:00",
+    "priority": null,
+    "source": "links"
+  }
+]
