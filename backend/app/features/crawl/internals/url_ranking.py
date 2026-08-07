@@ -41,7 +41,14 @@ next to its one consumer instead of in the shared schemas module.
    already survived pre-filtering — an order-independent merge of its `priority` (the max of
    the non-`None` values seen) and `lastmod` (the latest of the non-`None` values seen) into
    the surviving candidate, so a URL's score never depends on which of its several
-   discoveries `select_urls` happened to visit first.
+   discoveries `select_urls` happened to visit first. **`"robots_disallowed"` (PER-191) is
+   checked immediately after `"off_origin"` and before the five guessed structural rules
+   (`"dated_archive"` onward)** — a `robots.txt` only speaks for its own origin, so it makes
+   no sense to consult before that check, and it is operator-AUTHORED rather than guessed
+   from a URL's shape, so it wins the attribution over every rule this module infers on its
+   own. Matched against `normalized.url` — the exact string that would be fetched — not the
+   raw candidate, so a `Disallow: /docs/` does not match a normalized `/docs` that happens to
+   have shed its trailing slash.
 3. **Score.** Only survivors are scored, deterministically and without a clock — see the
    weight constants below for the reasoning behind each term's magnitude.
 4. **Sort** by `(-score, url)`. The URL tie-break is what makes the whole pipeline
@@ -97,6 +104,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit
+
+from app.features.crawl.internals.robots import RobotsRules
 
 
 _DEFAULT_PORTS: Final[dict[str, int]] = {"http": 80, "https": 443}
@@ -591,12 +600,15 @@ def _score(
 
 # Pre-filter rules in the order they are checked (module docstring, step 2), followed by the
 # two during-selection rules (step 5) — the fixed order `SelectionResult.dropped`'s keys
-# appear in, regardless of what order candidates happened to trip them in.
+# appear in, regardless of what order candidates happened to trip them in. `"robots_disallowed"`
+# (PER-191) sits right after `"off_origin"` and before the five guessed structural rules — see
+# the module docstring's step 2 for why.
 _RULE_ORDER: Final[tuple[str, ...]] = (
     "unparseable",
     "duplicate",
     "seed",
     "off_origin",
+    "robots_disallowed",
     "dated_archive",
     "taxonomy",
     "pagination",
@@ -608,7 +620,11 @@ _RULE_ORDER: Final[tuple[str, ...]] = (
 
 
 def select_urls(
-    candidates: Sequence[DiscoveredUrl], *, seed_url: str, limit: int
+    candidates: Sequence[DiscoveredUrl],
+    *,
+    seed_url: str,
+    limit: int,
+    robots: RobotsRules | None = None,
 ) -> SelectionResult:
     """Rank `candidates` and select at most `limit` of them to crawl.
 
@@ -635,6 +651,13 @@ def select_urls(
         limit: The maximum number of URLs to select. `limit <= 0` returns an empty
             `selected` without raising — every surviving candidate is counted under
             `"over_limit"` instead.
+        robots: This run's parsed `robots.txt` rules (`internals/robots.py`), or `None` —
+            the default, and what every call site before PER-191 is equivalent to — meaning
+            "no `robots.txt` restriction, allow everything." When given, a candidate whose
+            NORMALIZED url (`normalized.url` — the exact string that would be fetched, not
+            the raw candidate) `robots.is_allowed(...)` refuses is dropped under
+            `"robots_disallowed"` rather than being scored — see the module docstring's step
+            2 for why this check sits where it does in the pipeline.
 
     Returns:
         A `SelectionResult`. See its own docstring, and the module docstring's
@@ -686,6 +709,9 @@ def select_urls(
             continue
         if _origin(normalized) != seed_origin:
             _drop("off_origin")
+            continue
+        if robots is not None and not robots.is_allowed(normalized.url):
+            _drop("robots_disallowed")
             continue
         if _is_dated_archive(normalized.path):
             _drop("dated_archive")

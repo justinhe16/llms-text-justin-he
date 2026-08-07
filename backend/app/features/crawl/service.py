@@ -38,10 +38,25 @@ run — unlike the Storage upload, whose failure is `StorageUploadError` and end
 one way or another, a bad or unreachable model call degrades silently to the deterministic
 artifact `internals/llms_txt.py` has always produced. See `execute_run`'s own comment at the
 call site for exactly where it sits and why nowhere else would do.
+
+**PER-191: `robots.txt` is obeyed, and this method owns the one shared `PolitenessGate`
+(`internals/fetcher.py`) both discovery and the crawl loop wait on.** `execute_run` builds one
+gate BEFORE calling `discover_sitemap_urls` — at `Settings.crawl_politeness_delay_ms`, the
+operator-configured floor — hands it to that call, then WIDENS the SAME gate, once, to
+`internals/robots.py`'s `effective_crawl_delay_ms(configured_ms, discovery.robots
+.crawl_delay_s)` before handing it to `crawl_site`. That single widening call is the entire
+implementation of "a site's `Crawl-delay` slows the CRAWL phase, never discovery's own
+remaining fetches" (`internals/robots.py`'s module docstring works through why the split has
+to be this way). The seed's own disallow check is symmetric with the pipeline this method
+already runs: `discover_sitemap_urls` returns `DiscoveryResult.robots`, this method threads it
+into `select_urls(..., robots=...)` for frontier filtering and into `crawl_site(...,
+is_allowed=robots.is_allowed)` for the seed — one parsed `RobotsRules`, two consumers, neither
+of which re-fetches or re-parses anything.
 """
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Any, Final, Literal
 from uuid import UUID
 
@@ -51,9 +66,19 @@ from asyncpg import Pool
 from fastapi import HTTPException
 
 from app.core.settings import Settings
-from app.features.crawl.internals.crawler import CrawlLimits, CrawlResult, crawl_site
+from app.features.crawl.internals.crawler import (
+    CrawlLimits,
+    CrawlResult,
+    RobotsDisallowedError,
+    crawl_site,
+)
 from app.features.crawl.internals.enrich import apply_summaries, enrich_pages
-from app.features.crawl.internals.fetcher import ByteBudget, ByteBudgetExceededError, FetchError
+from app.features.crawl.internals.fetcher import (
+    ByteBudget,
+    ByteBudgetExceededError,
+    FetchError,
+    PolitenessGate,
+)
 from app.features.crawl.internals.links import extract_links
 from app.features.crawl.internals.llms_txt import (
     count_full_txt_truncations,
@@ -66,6 +91,7 @@ from app.features.crawl.internals.payload import (
     payload_object_path,
     serialize_payload,
 )
+from app.features.crawl.internals.robots import ALLOW_ALL, RobotsRules, effective_crawl_delay_ms
 from app.features.crawl.internals.run_stats import build_run_stats
 from app.features.crawl.internals.sitemap import DiscoverySource, discover_sitemap_urls
 from app.features.crawl.internals.ssrf import SsrfBlockedError
@@ -171,6 +197,9 @@ def _is_retryable(exc: Exception) -> bool:
     * `FetchError` — a redirect loop, or a redirect this crawler refuses to follow. A
       property of the site's configuration, not of this moment.
     * `ByteBudgetExceededError` — the site is bigger than `crawl_max_bytes`. It will still be.
+    * `RobotsDisallowedError` (PER-191) — the site's own `robots.txt` disallows the seed URL.
+      It will still be disallowed in sixty seconds; nothing about waiting changes what an
+      operator's own policy file says.
 
     An exception this function has never heard of is treated as permanent too. That is the
     conservative choice in the direction that matters: an unrecognized exception is far more
@@ -229,6 +258,8 @@ def _safe_error_message(exc: Exception) -> str:
         message = str(exc)
     elif isinstance(exc, StorageUploadError):
         message = "Could not store this run's output."
+    elif isinstance(exc, RobotsDisallowedError):
+        message = "This site's robots.txt disallows crawling this URL."
     elif isinstance(exc, httpx.TimeoutException | TimeoutError):
         # Both spellings, because two different layers time a crawl out and they do not
         # share a base class: httpx raises `httpx.TimeoutException` when one request exceeds
@@ -403,6 +434,14 @@ class CrawlService:
         discovery_source: RunDiscoverySource = "none"
         urls_discovered = 0
         urls_selected = 0
+        # PER-191's own hoisted locals, for the same reason as the three block above: a seed
+        # failure — including one CAUSED by this ticket's own disallowed-seed check — still
+        # needs a shape `build_run_stats` can report. `crawl_delay_ms` defaults to the
+        # operator's own configured floor, which is exactly the answer for a run that never
+        # got as far as reading a `robots.txt` at all.
+        urls_robots_disallowed = 0
+        crawl_delay_ms = self._settings.crawl_politeness_delay_ms
+        robots: RobotsRules = ALLOW_ALL
         # Set by the failure paths below when the attempt should be retried, and raised
         # AFTER the `try` rather than from inside it. Raising `TransientCrawlError` from within the
         # `try` would be caught by this method's own `except Exception` and turned into a
@@ -429,23 +468,49 @@ class CrawlService:
                 },
             )
 
-            # Two network calls, both outside every transaction (ARCHITECTURE.md §5.1).
+            # THREE network calls now, all outside every transaction (ARCHITECTURE.md §5.1).
             # Discovery never fails a run: `discover_sitemap_urls` returns an empty result
             # for a 404, malformed XML, an SSRF refusal, or an exhausted byte share, and logs
             # the reason at WARNING — see that module's own docstring. `budget` is built
-            # BEFORE discovery runs and handed to both calls below, so the two share one
-            # run-wide byte cap rather than each getting its own (`crawl_site`'s `budget`
-            # parameter docstring has the other half of this).
+            # BEFORE discovery runs and handed to both `discover_sitemap_urls` and
+            # `crawl_site`, so the two share one run-wide byte cap rather than each getting its
+            # own (`crawl_site`'s `budget` parameter docstring has the other half of this).
+            # `gate` is the run's one shared `PolitenessGate` (PER-191) — built here, at the
+            # operator-configured floor, handed to discovery first, then WIDENED (never
+            # replaced) to this run's own `Crawl-delay`-aware delay before `crawl_site` gets
+            # it. See the module docstring's PER-191 paragraph for the shape this makes.
             budget = ByteBudget(limits.max_bytes)
+            gate = PolitenessGate(self._settings.crawl_politeness_delay_ms / 1000)
             discovery = await discover_sitemap_urls(
-                self._client, website.origin, budget=budget, settings=self._settings
+                self._client, website.origin, budget=budget, settings=self._settings, gate=gate
             )
+            robots = discovery.robots
+            crawl_delay_ms = effective_crawl_delay_ms(
+                self._settings.crawl_politeness_delay_ms, robots.crawl_delay_s
+            )
+            if crawl_delay_ms != self._settings.crawl_politeness_delay_ms:
+                logger.info(
+                    "crawl: robots.txt requested a longer delay than configured; widening "
+                    "the politeness gate for the crawl phase",
+                    extra={
+                        "configured_delay_ms": self._settings.crawl_politeness_delay_ms,
+                        "crawl_delay_ms": crawl_delay_ms,
+                    },
+                )
+            # Widened once, here — BETWEEN discovery and the crawl loop, never while either is
+            # in flight (`PolitenessGate.widen_to`'s own docstring). `limits` is rebuilt with
+            # the same value so `CrawlLimits.politeness_delay_ms` and the gate actually in
+            # force never disagree about what this run's crawl phase used.
+            gate.widen_to(crawl_delay_ms / 1000)
+            limits = replace(limits, politeness_delay_ms=crawl_delay_ms)
+
             selection = select_urls(
-                discovery.urls, seed_url=website.url, limit=limits.max_pages - 1
+                discovery.urls, seed_url=website.url, limit=limits.max_pages - 1, robots=robots
             )
             discovery_source = discovery.source
             urls_discovered = len(discovery.urls)
             urls_selected = len(selection.selected)
+            urls_robots_disallowed = selection.dropped.get("robots_disallowed", 0)
 
             # THE DEPTH-1 LINK FALLBACK (PER-178), and its one trigger condition.
             #
@@ -469,7 +534,9 @@ class CrawlService:
                 """Rank the seed page's own links into a frontier. Called at most once, by
                 `crawl_site`, and only after the seed fetch has already succeeded."""
                 nonlocal link_selection
-                link_selection = self._select_seed_links(seed_page, limit=limits.max_pages - 1)
+                link_selection = self._select_seed_links(
+                    seed_page, limit=limits.max_pages - 1, robots=robots
+                )
                 return link_selection.selected
 
             result = await crawl_site(
@@ -479,6 +546,8 @@ class CrawlService:
                 extra_urls=selection.selected,
                 frontier_from_seed=None if discovery.urls else frontier_from_seed,
                 budget=budget,
+                gate=gate,
+                is_allowed=robots.is_allowed,
             )
 
             if link_selection is not None and link_selection.discovered_count > 0:
@@ -493,17 +562,26 @@ class CrawlService:
                 discovery_source = "links"
                 urls_discovered = link_selection.discovered_count
                 urls_selected = len(link_selection.selected)
+                urls_robots_disallowed = link_selection.dropped.get("robots_disallowed", 0)
 
             if result.seed_error is not None:
                 # WARNING, not ERROR, and a message of its own: a site that is down is an
                 # ordinary outcome of crawling the internet, not an incident. It goes through
                 # the same `_finish_failed_attempt` as an unexpected exception because the
-                # retry decision is identical — only the log line differs.
-                logger.warning(
-                    "crawl: could not fetch its seed URL (%s)",
-                    _safe_error_message(result.seed_error),
-                    exc_info=result.seed_error,
-                )
+                # retry decision is identical — only the log line differs. A disallowed seed
+                # (PER-191) gets its OWN line, without `exc_info` — there is no traceback
+                # worth a stack, just a site's own policy file saying no.
+                if isinstance(result.seed_error, RobotsDisallowedError):
+                    logger.warning(
+                        "crawl: robots.txt disallows the seed URL; not crawling",
+                        extra={"url": website.url},
+                    )
+                else:
+                    logger.warning(
+                        "crawl: could not fetch its seed URL (%s)",
+                        _safe_error_message(result.seed_error),
+                        exc_info=result.seed_error,
+                    )
                 pending_retry = await self._finish_failed_attempt(
                     run_id,
                     result.seed_error,
@@ -516,6 +594,8 @@ class CrawlService:
                         discovery_source=discovery_source,
                         urls_discovered=urls_discovered,
                         urls_selected=urls_selected,
+                        urls_robots_disallowed=urls_robots_disallowed,
+                        crawl_delay_ms=crawl_delay_ms,
                         pages_enriched=pages_enriched,
                         enrich_failures=enrich_failures,
                         enrich_input_tokens=enrich_input_tokens,
@@ -624,6 +704,8 @@ class CrawlService:
                     discovery_source=discovery_source,
                     urls_discovered=urls_discovered,
                     urls_selected=urls_selected,
+                    urls_robots_disallowed=urls_robots_disallowed,
+                    crawl_delay_ms=crawl_delay_ms,
                     pages_enriched=pages_enriched,
                     enrich_failures=enrich_failures,
                     enrich_input_tokens=enrich_input_tokens,
@@ -674,6 +756,8 @@ class CrawlService:
                     discovery_source=discovery_source,
                     urls_discovered=urls_discovered,
                     urls_selected=urls_selected,
+                    urls_robots_disallowed=urls_robots_disallowed,
+                    crawl_delay_ms=crawl_delay_ms,
                     pages_enriched=pages_enriched,
                     enrich_failures=enrich_failures,
                     enrich_input_tokens=enrich_input_tokens,
@@ -690,7 +774,9 @@ class CrawlService:
             raise pending_retry
         return outcome
 
-    def _select_seed_links(self, seed_page: CrawledPage, *, limit: int) -> SelectionResult:
+    def _select_seed_links(
+        self, seed_page: CrawledPage, *, limit: int, robots: RobotsRules | None = None
+    ) -> SelectionResult:
         """Turn the SEED page's own links into a ranked frontier — the depth-1 fallback for a
         site with no sitemap (PER-178).
 
@@ -730,6 +816,10 @@ class CrawlService:
         with should produce a single-page run, exactly as a site with no sitemap does —
         "hitting a cap is a success, not a failure" (ARCHITECTURE.md §3.4), one layer up.
 
+        `robots` (PER-191) is forwarded straight into `select_urls`, unchanged — this method
+        parses no `robots.txt` itself, and never re-fetches or re-derives the rules
+        `execute_run` already read once from `DiscoveryResult.robots`.
+
         Returns:
             The `SelectionResult` — carried out whole rather than reduced to its `selected`
             list, because `runs.stats` records both how many links were found
@@ -745,6 +835,7 @@ class CrawlService:
                 ],
                 seed_url=seed_page.url,
                 limit=limit,
+                robots=robots,
             )
         except Exception:
             logger.warning(
