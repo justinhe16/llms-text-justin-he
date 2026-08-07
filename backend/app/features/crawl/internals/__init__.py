@@ -14,6 +14,12 @@ private, table-free I/O:
   the seed fetch, the frontier, and the six caps from `Settings`.
 * `llms_txt.py` — `generate_llms_txt`, the stub seam (ARCHITECTURE.md §3.4, CLAUDE.md #9).
 
+Beside those sit this feature's **pure** modules, which do no I/O at all and are listed
+separately for exactly that reason: `payload.py` (the bytes a run's pages are stored as),
+`run_stats.py` (the `dict` `runs.stats` persists), and `extract.py` (`extract_content`, one
+page's HTML parsed into a title, a description, and a markdown body). `extract.py` is called
+by nothing today — wiring it into the crawl loop is PER-177 (ARCHITECTURE.md §3.4).
+
 Like any other feature's `internals/`, this package is private: only
 `app.features.crawl.service` and this feature's own modules import from it. No other
 feature reaches in here, the same rule that applies to every `{feature}/internals/` in this

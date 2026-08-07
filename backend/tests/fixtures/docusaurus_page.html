@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<title>Configuration | Acme Docs</title>
+<meta name="description" content="How to configure the Acme CLI, including every supported field and its default.">
+<meta property="og:title" content="Configuration | Acme Docs">
+<meta property="og:description" content="How to configure the Acme CLI, including every supported field and its default.">
+<style>.navbar{position:sticky;top:0;z-index:200}.footer{padding:2rem 0}.menu__link--active{font-weight:600}</style>
+<script>window.gtag=function(){window.dataLayer.push(arguments)};gtag("config","G-ACME01");</script>
+</head>
+<body class="navigation-with-keyboard">
+<div id="__docusaurus">
+  <nav class="navbar navbar--fixed-top" aria-label="Main">
+    <div class="navbar__inner">
+      <a class="navbar__brand" href="/"><b class="navbar__title">Acme</b></a>
+      <a class="navbar__item navbar__link" href="/docs/intro">Docs</a>
+      <a class="navbar__item navbar__link" href="/blog">Blog</a>
+      <a class="navbar__item navbar__link" href="https://discord.gg/acme">Join our Discord</a>
+      <div class="navbar__search"><input class="navbar__search-input" placeholder="Search"></div>
+    </div>
+  </nav>
+  <div class="main-wrapper docs-wrapper">
+    <aside class="theme-doc-sidebar-container">
+      <nav class="menu thin-scrollbar" aria-label="Docs sidebar">
+        <ul class="menu__list">
+          <li class="menu__list-item"><a class="menu__link" href="/docs/intro">Getting Started</a></li>
+          <li class="menu__list-item"><a class="menu__link menu__link--active" href="/docs/config">Configuration</a></li>
+          <li class="menu__list-item"><a class="menu__link" href="/docs/deploy">Deployment</a></li>
+          <li class="menu__list-item"><a class="menu__link" href="/docs/troubleshooting">Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+    <main class="docMainContainer">
+      <div class="container padding-top--md">
+        <article>
+          <nav class="theme-doc-breadcrumbs" aria-label="Breadcrumbs"><span class="breadcrumbs__item">Docs</span><span class="breadcrumbs__item">Configuration</span></nav>
+          <div class="theme-doc-markdown markdown">
+            <h1>Configuration</h1>
+            <p>The Acme CLI reads its configuration from <code>acme.config.json</code> in the project root. Every field is optional; the defaults listed below are what the CLI uses when a field is absent from the file.</p>
+            <h2>Where the configuration file is found</h2>
+            <p>The CLI walks up from the current working directory until it finds a configuration file, stopping at the first repository boundary it encounters. Passing <code>--config</code> skips the search entirely and loads exactly the file you name.</p>
+            <pre><code class="language-json">{
+  "output": "dist",
+  "concurrency": 4,
+  "retries": 2
+}
+</code></pre>
+            <h2>Supported fields</h2>
+            <table>
+              <thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td>output</td><td>dist</td><td>Directory build artifacts are written to.</td></tr>
+                <tr><td>concurrency</td><td>4</td><td>How many pages are fetched in parallel.</td></tr>
+                <tr><td>retries</td><td>2</td><td>Retry attempts per failed request.</td></tr>
+              </tbody>
+            </table>
+            <h2>Environment overrides</h2>
+            <p>Any field can be overridden by an environment variable named after it, uppercased and prefixed with <code>ACME_</code>. Environment variables always win over the configuration file. See the <a href="/docs/deploy">deployment guide</a> for the variables a production deploy is expected to set.</p>
+            <ul>
+              <li><code>ACME_OUTPUT</code> overrides the <code>output</code> field.</li>
+              <li><code>ACME_CONCURRENCY</code> overrides the <code>concurrency</code> field.</li>
+            </ul>
+          </div>
+          <footer class="theme-doc-footer docusaurus-mt-lg">
+            <a class="theme-edit-this-page" href="https://github.com/acme/docs/edit/main/config.md">Edit this page</a>
+          </footer>
+        </article>
+        <nav class="pagination-nav docusaurus-mt-lg" aria-label="Docs pages">
+          <a class="pagination-nav__link pagination-nav__link--prev" href="/docs/intro">Getting Started</a>
+          <a class="pagination-nav__link pagination-nav__link--next" href="/docs/deploy">Deployment</a>
+        </nav>
+      </div>
+    </main>
+    <div class="col col--3">
+      <div class="theme-doc-toc-desktop">
+        <ul class="table-of-contents table-of-contents__left-border">
+          <li><a href="#where-the-configuration-file-is-found" class="table-of-contents__link">Where the configuration file is found</a></li>
+          <li><a href="#supported-fields" class="table-of-contents__link">Supported fields</a></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <footer class="footer footer--dark">
+    <div class="footer__links"><a class="footer__link-item" href="/privacy">Privacy Policy</a><a class="footer__link-item" href="/terms">Terms of Service</a></div>
+    <div class="footer__copyright">Copyright © 2025 Acme, Inc. Built with Docusaurus.</div>
+  </footer>
+</div>
+<script>document.addEventListener("DOMContentLoaded",function(){window.dataLayer=window.dataLayer||[];});</script>
+</body>
+</html>

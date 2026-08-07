@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr" class="">
+<head>
+<meta charset="utf-8">
+<title>Middleware – Acme Framework</title>
+<meta property="og:title" content="Middleware – Acme Framework">
+<style>.nextra-nav-container{position:sticky;top:0}.nextra-sidebar-container{width:16rem}</style>
+<script>window.__NEXT_DATA__={"props":{"pageProps":{}},"page":"/docs/middleware","buildId":"acme-build"};</script>
+</head>
+<body>
+<div class="nextra-container main-container">
+  <nav class="nextra-nav-container sticky top-0">
+    <div class="nextra-nav-container-blur"></div>
+    <a class="flex items-center" href="/"><span>Acme Framework</span></a>
+    <a href="/docs" class="nextra-nav-link">Documentation</a>
+    <a href="/showcase" class="nextra-nav-link">Showcase</a>
+    <a href="https://github.com/acme/framework" class="nextra-nav-link">GitHub</a>
+    <div class="nextra-search relative"><input placeholder="Search documentation..." class="block w-full"></div>
+  </nav>
+  <div class="mx-auto flex">
+    <aside class="nextra-sidebar-container">
+      <div class="nextra-scrollbar">
+        <ul>
+          <li class="open"><a href="/docs/routing">Routing</a></li>
+          <li class="active"><a href="/docs/middleware">Middleware</a></li>
+          <li><a href="/docs/data-fetching">Data fetching</a></li>
+          <li><a href="/docs/deployment">Deployment</a></li>
+        </ul>
+      </div>
+      <div class="sticky bottom-0"><a href="/docs/changelog">Changelog</a></div>
+    </aside>
+    <article class="nextra-content flex min-h-screen w-full">
+      <main class="w-full min-w-0 max-w-6xl px-6 pt-4">
+        <h1 class="tracking-tight">Middleware</h1>
+        <p>Middleware runs before a request reaches your route handler, on every request that matches its matcher. It is the right place for redirects, rewrites, and header manipulation, and the wrong place for anything that needs a database — the middleware runtime has no filesystem and no persistent connections.</p>
+        <h2>Defining middleware</h2>
+        <p>Export a function named <code>middleware</code> from <code>middleware.ts</code> at the root of your project. The file is discovered by convention; there is no configuration entry that points at it, and a file in any other location is ignored silently.</p>
+        <pre><code class="language-ts">export function middleware(request: Request) {
+  const url = new URL(request.url);
+  if (url.pathname === "/old") {
+    return Response.redirect(new URL("/new", url));
+  }
+}
+</code></pre>
+        <h2>Matchers</h2>
+        <p>A matcher limits which paths the middleware runs on. Narrowing the matcher is the single most effective way to reduce middleware overhead, because a request that does not match never invokes the function at all.</p>
+        <ul>
+          <li><code>/docs/:path*</code> matches every path under <code>/docs</code>.</li>
+          <li><code>/((?!api|_next).*)</code> matches everything except API routes and build assets.</li>
+        </ul>
+        <h2>Execution order</h2>
+        <p>Middleware runs after redirects declared in configuration and before route handlers. When several matchers overlap, the middleware still runs exactly once per request; matchers select requests, they do not stack. See <a href="/docs/deployment">deployment</a> for how middleware behaves on each supported runtime.</p>
+        <div class="mt-16 flex items-center border-t pt-8">
+          <a href="/docs/routing" class="flex">Routing</a>
+          <a href="/docs/data-fetching" class="flex">Data fetching</a>
+        </div>
+        <footer class="nextra-footer mt-16"><a href="https://github.com/acme/framework/edit/main/middleware.mdx">Edit this page on GitHub</a><span>Last updated on April 2, 2025</span></footer>
+      </main>
+      <nav class="nextra-toc order-last hidden w-64 shrink-0 xl:block">
+        <p class="mb-4 font-semibold">On This Page</p>
+        <ul>
+          <li><a href="#defining-middleware">Defining middleware</a></li>
+          <li><a href="#matchers">Matchers</a></li>
+          <li><a href="#execution-order">Execution order</a></li>
+        </ul>
+        <div class="mt-8 border-t pt-8"><a href="https://acme.com/questions">Question? Give us feedback</a></div>
+      </nav>
+    </article>
+  </div>
+  <footer class="bg-gray-100 pb-[env(safe-area-inset-bottom)]"><div class="mx-auto max-w-[90rem] py-12">MIT 2025 © Acme.</div></footer>
+</div>
+<script>window.__NEXTRA_INTERNAL__={"route":"/docs/middleware"};</script>
+</body>
+</html>
