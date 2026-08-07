@@ -393,6 +393,59 @@ _COUNT_AND_OLDEST_SINCE_FOR_USER: Final = """
     WHERE websites.user_id = $1 AND runs.started_at > $2
 """
 
+# The worker's own read, from `RunService.get_previous_completed_index`
+# (`CrawlService._build_index_diff`, PER-193): "what was the previous COMPLETED run's index,
+# and did the run immediately before this one actually complete?"
+#
+# **Two `LIMIT 1` lookups, not one scan of everything older than this run.** A site on an
+# hourly schedule accumulates ~87,600 rows in ten years; this only ever needs the single
+# newest row on each side of two different filters, and a `LIMIT 1` keyset lookup answers
+# that in a handful of buffers regardless of how deep the site's history goes, where scanning
+# "every run before this one" and picking the first `completed` row off the front would cost
+# more the longer a site has been crawled — worst case, right after a long losing streak of
+# failures.
+#
+# **`(started_at, id) < ($2, $3)` is the row-value keyset form, not the OR-expanded
+# equivalent, for the identical reason the module docstring's "keyset query" section gives
+# for `_LIST_BY_WEBSITE_AFTER_CURSOR`** — read that section before changing either WHERE
+# clause below. `$2`/`$3` are the CURRENT run's own `started_at`/`id`, so "previous" here
+# means "started strictly before this run, breaking a tie on id" — the same ordering
+# `list_by_website`'s pagination already depends on, applied to one row instead of a page.
+#
+# **Always returns exactly one row, every column `NULL` when there is nothing to report** —
+# `LEFT JOIN ... ON TRUE` against a one-row anchor, the same "an aggregate always produces a
+# row even over zero input" reasoning `_COUNT_AND_OLDEST_SINCE_FOR_USER` above relies on, so
+# the caller never has to distinguish "no row came back" from "the row's columns are all
+# null." `RunService.get_previous_completed_index` reads `run_id IS NULL` as "no previous
+# completed run of any kind."
+#
+# **`previous_status` is the whole reason there are two CTEs instead of one.** `previous`
+# looks at the immediately preceding run regardless of its status; `previous_completed`
+# looks at the nearest one that is actually `completed`. The two can name different rows — a
+# completed run, then a failed one, then this one — and `previous_status` is what lets the
+# service answer "did the run right before this one complete?" without a second round trip,
+# which is exactly the `previous_run_completed` tri-state `PreviousCompletedIndex` carries.
+_PREVIOUS_COMPLETED_INDEX: Final = """
+    WITH previous AS (
+        SELECT status
+        FROM runs
+        WHERE website_id = $1::uuid AND (started_at, id) < ($2, $3)
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+    ),
+    previous_completed AS (
+        SELECT id, completed_at, llms_txt, stats
+        FROM runs
+        WHERE website_id = $1::uuid AND (started_at, id) < ($2, $3) AND status = 'completed'
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+    )
+    SELECT pc.id AS run_id, pc.completed_at, pc.llms_txt, pc.stats, p.status AS previous_status
+    FROM (SELECT 1) AS anchor
+    LEFT JOIN previous_completed pc ON TRUE
+    LEFT JOIN previous p ON TRUE
+"""
+
 # `GET /websites/{id}/stats` — one aggregate query, no per-bucket queries. See
 # `internals/stats_window.py` for how the five parameters below are derived from `?window=`.
 #
@@ -428,6 +481,36 @@ _COUNT_AND_OLDEST_SINCE_FOR_USER: Final = """
 #   make a bare `::numeric` cast raise. The guard makes the query total over any real data.
 # * `date_trunc($5, ..., 'UTC')` — the three-argument form pins bucketing to UTC instead of
 #   inheriting the session `TimeZone`.
+#
+# **PER-193 additions, below the original six bullets rather than folded into them, since
+# they are a genuinely different shape of aggregate:**
+#
+# * `index_pages`/`index_bytes`/`pages_added`/`pages_removed` in `scoped` are all `NULL`,
+#   never `0`, when absent — including for a `first_run` `index_diff` block, whose `->
+#   'pages_added'` on a missing key is SQL `NULL` by construction, and for a JSON `index_diff:
+#   null`, whose `->` into it is also `NULL`. Both conditions therefore fall out of the same
+#   `jsonb_typeof(...) = 'number'` guard the original six columns already use, with no extra
+#   branching. `AND r.status = 'completed'` is part of every one of the four guards: a
+#   `failed` row can carry a fully-populated `index_diff` describing an index that was never
+#   persisted (`internals/run_stats.py`'s `build_run_stats` docstring explains why), and this
+#   is the filter that keeps such a row out of every PER-193 aggregate.
+# * `(array_agg(index_pages ORDER BY started_at DESC, id DESC) FILTER (WHERE index_pages IS
+#   NOT NULL))[1]` is "the last completed run in this bucket that recorded an index size" —
+#   deliberately not `max()`, which would report the LARGEST index in the bucket rather than
+#   the most RECENT one, and the two disagree the moment a site's index shrinks
+#   (`tests/test_stats_api.py::test_index_size_is_the_last_completed_run_in_the_bucket_not_the_max`).
+#   `array_agg ... FILTER` returns `NULL` (never an empty array) when nothing in the bucket
+#   matches, so `[1]` on that is `NULL` too — array indexing a `NULL` array is `NULL` in
+#   Postgres, not an error, which is exactly the "unknown, not zero" value this column needs
+#   when a bucket has no completed run to ask.
+# * **The zero-fill asymmetry is deliberate, and it is the subtlest thing PER-193 added.** The
+#   final `SELECT` wraps `runs_compared`/`pages_added`/`pages_removed` in `COALESCE(..., 0)`
+#   — real MEASUREMENTS, and an empty bucket measured zero of each — but wraps
+#   `index_pages`/`index_bytes` in nothing at all, leaving a `NULL` `NULL`. An empty bucket
+#   added zero pages; it does not have an index of size zero, it has no evidence of an index
+#   at all. A reviewer "tidying" the second pair to match the first's `COALESCE` breaks the
+#   null-vs-zero contract `RunStatsPoint.index_pages` documents, which is what
+#   `test_a_bucket_with_no_completed_run_reports_null_index_size_not_zero` exists to catch.
 _WEBSITE_STATS: Final = """
     WITH buckets AS (
         SELECT generate_series($2::timestamptz, $3::timestamptz - $4::interval, $4::interval)
@@ -435,6 +518,7 @@ _WEBSITE_STATS: Final = """
     ),
     scoped AS MATERIALIZED (
         SELECT
+            r.id,
             date_trunc($5::text, r.started_at, 'UTC') AS bucket_start,
             r.status,
             r.started_at,
@@ -445,7 +529,27 @@ _WEBSITE_STATS: Final = """
             CASE WHEN r.status = 'completed' AND r.completed_at IS NOT NULL
                  THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                  ELSE NULL
-            END AS duration_ms
+            END AS duration_ms,
+            CASE WHEN r.status = 'completed'
+                      AND jsonb_typeof(r.stats -> 'links_emitted') = 'number'
+                 THEN (r.stats ->> 'links_emitted')::bigint
+                 ELSE NULL
+            END AS index_pages,
+            CASE WHEN r.status = 'completed'
+                      AND jsonb_typeof(r.stats -> 'llms_txt_bytes') = 'number'
+                 THEN (r.stats ->> 'llms_txt_bytes')::bigint
+                 ELSE NULL
+            END AS index_bytes,
+            CASE WHEN r.status = 'completed'
+                      AND jsonb_typeof(r.stats -> 'index_diff' -> 'pages_added') = 'number'
+                 THEN (r.stats -> 'index_diff' ->> 'pages_added')::bigint
+                 ELSE NULL
+            END AS pages_added,
+            CASE WHEN r.status = 'completed'
+                      AND jsonb_typeof(r.stats -> 'index_diff' -> 'pages_removed') = 'number'
+                 THEN (r.stats -> 'index_diff' ->> 'pages_removed')::bigint
+                 ELSE NULL
+            END AS pages_removed
         FROM runs r
         WHERE r.website_id = $1::uuid
           AND r.started_at >= $2::timestamptz
@@ -458,7 +562,14 @@ _WEBSITE_STATS: Final = """
             count(*) FILTER (WHERE status = 'completed') AS completed,
             count(*) FILTER (WHERE status = 'failed') AS failed,
             avg(pages_crawled) AS avg_pages,
-            avg(duration_ms) AS avg_duration_ms
+            avg(duration_ms) AS avg_duration_ms,
+            count(*) FILTER (WHERE pages_added IS NOT NULL) AS runs_compared,
+            sum(pages_added) AS pages_added,
+            sum(pages_removed) AS pages_removed,
+            (array_agg(index_pages ORDER BY started_at DESC, id DESC)
+                FILTER (WHERE index_pages IS NOT NULL))[1] AS index_pages,
+            (array_agg(index_bytes ORDER BY started_at DESC, id DESC)
+                FILTER (WHERE index_bytes IS NOT NULL))[1] AS index_bytes
         FROM scoped
         GROUP BY bucket_start
     ),
@@ -469,7 +580,10 @@ _WEBSITE_STATS: Final = """
             count(*) FILTER (WHERE status = 'failed') AS total_failed,
             avg(pages_crawled) AS total_avg_pages,
             avg(duration_ms) AS total_avg_duration_ms,
-            max(started_at) AS last_run_at
+            max(started_at) AS last_run_at,
+            count(*) FILTER (WHERE pages_added IS NOT NULL) AS total_runs_compared,
+            sum(pages_added) AS total_pages_added,
+            sum(pages_removed) AS total_pages_removed
         FROM scoped
     )
     SELECT
@@ -479,16 +593,44 @@ _WEBSITE_STATS: Final = """
         COALESCE(p.failed, 0)::bigint AS failed,
         COALESCE(p.avg_pages, 0)::double precision AS avg_pages,
         COALESCE(p.avg_duration_ms, 0)::double precision AS avg_duration_ms,
+        COALESCE(p.runs_compared, 0)::bigint AS runs_compared,
+        COALESCE(p.pages_added, 0)::bigint AS pages_added,
+        COALESCE(p.pages_removed, 0)::bigint AS pages_removed,
+        p.index_pages,
+        p.index_bytes,
         t.total_runs,
         t.total_completed,
         t.total_failed,
         COALESCE(t.total_avg_pages, 0)::double precision AS total_avg_pages,
         COALESCE(t.total_avg_duration_ms, 0)::double precision AS total_avg_duration_ms,
-        t.last_run_at
+        t.last_run_at,
+        COALESCE(t.total_runs_compared, 0)::bigint AS total_runs_compared,
+        COALESCE(t.total_pages_added, 0)::bigint AS total_pages_added,
+        COALESCE(t.total_pages_removed, 0)::bigint AS total_pages_removed
     FROM buckets b
     LEFT JOIN per_bucket p ON p.bucket_start = b.bucket_start
     CROSS JOIN totals t
     ORDER BY b.bucket_start
+"""
+
+# `GET /websites/{id}/stats`'s `latest` field — the newest COMPLETED run inside the
+# requested window, with its whole `stats` jsonb (samples included). A SEPARATE query rather
+# than a fifth CTE folded into `_WEBSITE_STATS`: doing so would require selecting `r.stats` —
+# the whole jsonb, `index_diff` samples and all — into `scoped` for every run in the window,
+# just to keep the one row this needs. That would cost real bytes on every row of a 168-bucket
+# window to answer a question only the single newest row can answer. `_WEBSITE_STATS` keeps
+# its "touches `runs` exactly once" property (the EXPLAIN test's whole point); this is
+# deliberately a second, `LIMIT 1` index lookup instead, at the modest cost of a second round
+# trip. `RunService.get_website_stats` therefore makes three reads: `website_service.
+# get_website` (the 404 check), `website_stats`, and this one — see that method's own
+# docstring.
+_LATEST_COMPLETED_INDEX: Final = """
+    SELECT id, completed_at, stats
+    FROM runs
+    WHERE website_id = $1::uuid AND status = 'completed'
+      AND started_at >= $2::timestamptz AND started_at < $3::timestamptz
+    ORDER BY started_at DESC, id DESC
+    LIMIT 1
 """
 
 
@@ -670,6 +812,41 @@ class RunsReader(Reader):
             raise RuntimeError("count(*)/min(...) aggregate query produced no row")
         return row
 
+    async def previous_completed_index(
+        self, website_id: UUID, *, before_started_at: datetime, before_run_id: UUID
+    ) -> dict[str, Any]:
+        """The nearest COMPLETED run before `(before_started_at, before_run_id)`, and whether
+        the run immediately preceding it (of any status) actually completed.
+
+        Feeds `RunService.get_previous_completed_index`, called only from
+        `CrawlService._build_index_diff` (`crawl/service.py`) — the worker's own read, not an
+        HTTP path. Unscoped by caller for the same reason every other read in this file is
+        (ARCHITECTURE.md §4.1): a background job acting on a website has no caller identity to
+        scope by in the first place.
+
+        Args:
+            website_id: The run's own website.
+            before_started_at: The CURRENT run's `started_at` — "previous" means started
+                strictly before this instant, tie-broken by id. Always the run this method is
+                being asked about on behalf of, never `datetime.now(UTC)`.
+            before_run_id: The CURRENT run's own id, the tie-break half of the same keyset
+                pair `before_started_at` is the other half of.
+
+        Returns:
+            Exactly one row, always — see `_PREVIOUS_COMPLETED_INDEX`'s own comment for why a
+            `LEFT JOIN ... ON TRUE` guarantees that. `row["run_id"]` is `None` when there is
+            no completed run before this one at all, in which case every other column is also
+            `None` and `row["previous_status"]` says whether an INCOMPLETE run exists
+            (`"pending"`/`"processing"`/`"failed"`) or there is no earlier run whatsoever
+            (`None`).
+        """
+        row = await self.fetch_one(
+            _PREVIOUS_COMPLETED_INDEX, website_id, before_started_at, before_run_id
+        )
+        if row is None:
+            raise RuntimeError("previous_completed_index's LEFT JOIN ... ON TRUE produced no row")
+        return row
+
     async def website_stats(self, website_id: UUID, *, window: StatsWindow) -> list[dict[str, Any]]:
         """Return one row per bucket in `window`, zero-filled, with the website's totals
         cross-joined onto every row. See `_WEBSITE_STATS` above for the query, and
@@ -681,3 +858,20 @@ class RunsReader(Reader):
         return await self.fetch_all(
             _WEBSITE_STATS, website_id, window.start, window.end, window.step, window.bucket
         )
+
+    async def latest_completed_index(
+        self, website_id: UUID, *, start: datetime, end: datetime
+    ) -> dict[str, Any] | None:
+        """The newest COMPLETED run inside `[start, end)`, whole `stats` jsonb included — or
+        `None` if there is none. Feeds `WebsiteStatsResponse.latest`; see `_LATEST_COMPLETED_
+        INDEX`'s own comment for why this is a separate query from `website_stats` above
+        rather than a fifth CTE inside it.
+
+        Args:
+            website_id: The website to look up.
+            start: Inclusive lower bound — always `window.start` from the SAME `StatsWindow`
+                `website_stats` was called with, so `latest` and `series` describe the same
+                window.
+            end: Exclusive upper bound — `window.end`.
+        """
+        return await self.fetch_one(_LATEST_COMPLETED_INDEX, website_id, start, end)

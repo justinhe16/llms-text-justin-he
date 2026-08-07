@@ -41,7 +41,7 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
-RUN_STATS_VERSION: Final = 6
+RUN_STATS_VERSION: Final = 7
 """Which definition of this whole dict's shape a stored row was written under — not just
 `links_emitted`'s meaning, but which KEYS a row of this version even has.
 
@@ -178,7 +178,40 @@ still leave this key exactly at the operator's own configured floor, because
 its own tells you the pace this run's crawl phase actually used; it does not, alone, tell you
 whether that pace came from `Settings` or from the site itself — `robots.txt`'s own
 `Crawl-delay`, when the run needs that answered, is not itself a stored field (this key is
-the derived NUMBER a run used, not the site's raw declaration)."""
+the derived NUMBER a run used, not the site's raw declaration).
+
+**Version 7** rows add two more keys and redefine nothing (PER-193): `llms_txt_bytes` and
+`index_diff` are what the Trends tab's "what changed in the latest run" panel and its
+output-focused tiles read (`app.features.runs.service._to_latest`). Neither is derivable
+from an existing key, which is why both are new columns of the dict rather than a
+`RUN_STATS_VERSION` bump for nothing. PER-191 and PER-193 deploy separately, so this is a
+second bump in short order for the same reason PER-179/PER-176 and PER-179's own version-3
+paragraph give for theirs: version 6 was already live and writing rows by the time this
+ticket's diff computation landed, and folding these two keys into 6 would have left two
+different shapes both stamped `version: 6`.
+
+`llms_txt_bytes` is `len(llms_txt.encode())` — the size of the generated index in UTF-8
+bytes. `0` on every failure path, and that `0` is a real recorded measurement in exactly the
+sense every other zero in this dict is: a run that never produced an index has an index of
+zero bytes, the same way `links_emitted` is `0` on a seed failure rather than absent.
+
+`index_diff` is `dict | None` — see `internals/index_diff.py`'s `build_index_diff` for its
+two shapes (`{"state": "first_run", ...}` and `{"state": "compared", ...}`) and everything
+each key inside them means. `None` is not "not yet computed"; it is a recorded fact that this
+run produced no index to compare (every failure path before `generate_llms_txt` ran) or that
+computing the comparison itself failed and was swallowed (`CrawlService._build_index_diff`'s
+own docstring explains why that failure must not fail the run). Either way, `None` here means
+exactly what `runs.error` being `None` means elsewhere in this dict's sibling fields:
+there is nothing to report, not that reporting was skipped.
+
+**A version-6 row's silence on both keys is different in kind from a version-7 row's `0`/
+`None`.** A version-6 reader has no `llms_txt_bytes` or `index_diff` key to read at all; a
+version-7 reader always has both, and their values — `0` and `None` included — are exactly as
+trustworthy as every other key in this dict. `RunsReader._WEBSITE_STATS`'s
+`jsonb_typeof(...) = 'number'`/`'object'` guards are what let a query written against
+version-7 rows run harmlessly over the version-1-through-6 rows already in the table, the
+same defensive pattern every earlier version bump in this file already established for its
+own new keys."""
 
 
 def build_run_stats(
@@ -195,10 +228,27 @@ def build_run_stats(
     enrich_failures: int,
     enrich_input_tokens: int,
     enrich_output_tokens: int,
+    llms_txt_bytes: int,
+    index_diff: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Combine `crawl_stats` (from `CrawlResult.stats`) with the two numbers only the
-    artifacts know, the three only the discovery step knows, the four only the enrichment
-    pass knows, and `version`, into the exact `dict` `runs.stats` stores.
+    artifacts know, the three only the discovery step knows, the two only `robots.txt`
+    handling knows, the four only the enrichment pass knows, the two only the diff step
+    knows, and `version`, into the exact `dict` `runs.stats` stores.
+
+    **A row's `status` and its `index_diff` can disagree about whether an index was ever
+    persisted, and that is expected rather than a bug.** `CrawlService.execute_run` computes
+    `llms_txt_bytes`/`index_diff` right after generating this run's `llms_txt`, well before
+    the Storage upload — so a run whose upload (or the write in `record_success`) fails AFTER
+    that point calls this function again, on the failure path, with a fully-populated
+    `index_diff` describing an index that was never actually written to `runs.llms_txt`. That
+    is harmless, and deliberately so: every reader of this column filters on
+    `status = 'completed'` first (`RunsReader._WEBSITE_STATS`'s `r.status = 'completed'`
+    guards, `RunService._to_latest`'s callers) — a `failed` row's `stats` is never read as if
+    it described a persisted artifact, regardless of what its `index_diff` happens to say.
+    That filter is therefore not a defensive nicety; it is the thing that makes this
+    non-atomicity safe to leave alone rather than a case this function needs to guard against
+    itself.
 
     Args:
         crawl_stats: `CrawlResult.stats` — `pages_crawled`, `pages_failed`, `bytes_fetched`,
@@ -279,14 +329,26 @@ def build_run_stats(
         enrich_output_tokens: Summed `response.usage.output_tokens` across every enrichment
             request this run made — `EnrichmentResult.output_tokens`. `0` when enrichment
             never ran.
+        llms_txt_bytes: `len(llms_txt.encode())` — the generated index's size in UTF-8 bytes.
+            `0` on every path that never generated one (a seed failure, or any failure before
+            `generate_llms_txt` ran), which is a real recorded zero and not an absent key —
+            see `RUN_STATS_VERSION`'s version-7 paragraph.
+        index_diff: The block `internals/index_diff.py`'s `build_index_diff` returns, or
+            `None` when this run produced no index to compare (every path above that left
+            `llms_txt_bytes` at `0`) or when computing the comparison itself failed and was
+            swallowed by the caller (`CrawlService._build_index_diff`). Passed through
+            unchanged — this module does not itself call `build_index_diff` or import
+            anything from `internals/index_diff.py`, keeping the same one-way "the caller
+            already did the work, this module only assembles the dict" relationship it has
+            with every other keyword argument here.
 
     Returns:
         `crawl_stats` spread first, followed by `links_emitted`, `full_txt_truncated`,
         `discovery_source`, `urls_discovered`, `urls_selected`, `urls_robots_disallowed`,
         `crawl_delay_ms`, `pages_enriched`, `enrich_failures`, `enrich_input_tokens`,
-        `enrich_output_tokens`, and `version`. `crawl_stats`'s own keys come first and are
-        never overwritten by the twelve added here, because none of those twelve names is a
-        key `CrawlResult.stats` has ever produced.
+        `enrich_output_tokens`, `llms_txt_bytes`, `index_diff`, and `version`. `crawl_stats`'s
+        own keys come first and are never overwritten by the fourteen added here, because none
+        of those fourteen names is a key `CrawlResult.stats` has ever produced.
     """
     stats = {
         **crawl_stats,
@@ -301,6 +363,8 @@ def build_run_stats(
         "enrich_failures": enrich_failures,
         "enrich_input_tokens": enrich_input_tokens,
         "enrich_output_tokens": enrich_output_tokens,
+        "llms_txt_bytes": llms_txt_bytes,
+        "index_diff": index_diff,
         "version": RUN_STATS_VERSION,
     }
     # "Generation complete, with stats" — passed as `extra=stats` rather than folded into the

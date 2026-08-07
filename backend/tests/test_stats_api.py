@@ -32,7 +32,7 @@ from asyncpg import Pool
 from conftest import TEST_USER_A_ID, explain_plan, parse, plan_nodes, seed_run, seed_website
 from httpx import AsyncClient
 
-from app.features.runs.internals.runs_reader import _WEBSITE_STATS
+from app.features.runs.internals.runs_reader import _LATEST_COMPLETED_INDEX, _WEBSITE_STATS
 from app.features.runs.internals.stats_window import resolve_window
 
 
@@ -51,6 +51,52 @@ def _series_bucket(series: list[dict[str, Any]], t: datetime) -> dict[str, Any]:
     matches = [point for point in series if parse(point["t"]) == t]
     assert len(matches) == 1, (t, [point["t"] for point in series])
     return matches[0]
+
+
+def _compared_diff(
+    *,
+    pages_added: int = 0,
+    pages_removed: int = 0,
+    pages_changed: int = 0,
+    compared_to_run_id: str = "11111111-1111-1111-1111-111111111111",
+) -> dict[str, Any]:
+    """A `"compared"`-shaped `index_diff` block, valid enough to pass `RunIndexDiff.
+    model_validate` — the PER-193 counterpart to this file's other seeded-`stats` helpers."""
+    return {
+        "state": "compared",
+        "previous_run_completed": True,
+        "compared_to_run_id": compared_to_run_id,
+        "compared_to_completed_at": "2026-01-01T00:00:00+00:00",
+        "pages_added": pages_added,
+        "pages_removed": pages_removed,
+        "pages_changed": pages_changed,
+        "added_sample": [],
+        "removed_sample": [],
+        "changed_sample": [],
+        "urls_discovered_delta": None,
+        "sections_delta": {},
+        "selection_churn": pages_added + pages_removed,
+        "selection_churn_ratio": None,
+        "llms_txt_bytes_delta": 0,
+    }
+
+
+def _stats_with_diff(
+    *,
+    pages_crawled: int = 1,
+    links_emitted: int = 1,
+    llms_txt_bytes: int = 100,
+    index_diff: Any = None,
+) -> dict[str, Any]:
+    """A `RUN_STATS_VERSION` 6-shaped `stats` dict, carrying only the keys the queries and
+    `_to_latest` under test actually read."""
+    return {
+        "pages_crawled": pages_crawled,
+        "links_emitted": links_emitted,
+        "llms_txt_bytes": llms_txt_bytes,
+        "index_diff": index_diff,
+        "version": 6,
+    }
 
 
 # -----------------------------------------------------------------------------------------
@@ -448,6 +494,331 @@ async def test_runs_belonging_to_a_different_website_are_not_counted(
 
 
 # -----------------------------------------------------------------------------------------
+# PER-193: the index diff, folded into `series`/`totals`, and `latest` — the newest
+# completed run's own diff, window-scoped.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_series_reports_pages_added_and_removed_from_the_diff_block(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-diff-series.example"
+    )
+    window = resolve_window("14d", _NOW)
+    target_bucket = window.start + timedelta(days=3)
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=1),
+        completed_at=target_bucket + timedelta(hours=1, seconds=1),
+        status="completed",
+        stats=_stats_with_diff(index_diff=_compared_diff(pages_added=3, pages_removed=1)),
+    )
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=2),
+        completed_at=target_bucket + timedelta(hours=2, seconds=1),
+        status="completed",
+        stats=_stats_with_diff(index_diff=_compared_diff(pages_added=2, pages_removed=4)),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
+
+    assert response.status_code == 200
+    body = response.json()
+    bucket = _series_bucket(body["series"], target_bucket)
+    assert bucket["runs_compared"] == 2
+    assert bucket["pages_added"] == 5
+    assert bucket["pages_removed"] == 5
+    assert body["totals"]["runs_compared"] == 2
+    assert body["totals"]["pages_added"] == 5
+    assert body["totals"]["pages_removed"] == 5
+
+
+async def test_index_size_is_the_last_completed_run_in_the_bucket_not_the_max(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    """A `max()` implementation would report the LARGER of the two — 5000 bytes / 50 pages —
+    which is exactly wrong the moment a site's index shrinks between two runs in one bucket."""
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-index-size.example")
+    window = resolve_window("14d", _NOW)
+    target_bucket = window.start + timedelta(days=3)
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=1),
+        completed_at=target_bucket + timedelta(hours=1, seconds=1),
+        status="completed",
+        stats=_stats_with_diff(links_emitted=50, llms_txt_bytes=5_000, index_diff=None),
+    )
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=2),
+        completed_at=target_bucket + timedelta(hours=2, seconds=1),
+        status="completed",
+        stats=_stats_with_diff(links_emitted=10, llms_txt_bytes=900, index_diff=None),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
+
+    assert response.status_code == 200
+    bucket = _series_bucket(response.json()["series"], target_bucket)
+    assert bucket["index_pages"] == 10
+    assert bucket["index_bytes"] == 900
+
+
+async def test_a_bucket_with_no_completed_run_reports_null_index_size_not_zero(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    """The headline null-vs-zero assertion: a bucket with a run that never completed has no
+    known index size, and that must render as `null`, never `0`."""
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-null-index.example")
+    window = resolve_window("14d", _NOW)
+    target_bucket = window.start + timedelta(days=3)
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=1),
+        status="failed",
+        completed_at=None,
+        stats=None,
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
+
+    assert response.status_code == 200
+    bucket = _series_bucket(response.json()["series"], target_bucket)
+    assert bucket["index_pages"] is None
+    assert bucket["index_bytes"] is None
+    # The three PLAIN counts stay real zeroes -- nothing was measured, which IS the answer.
+    assert bucket["runs_compared"] == 0
+    assert bucket["pages_added"] == 0
+    assert bucket["pages_removed"] == 0
+
+
+async def test_a_run_without_a_diff_block_contributes_zero_added_and_is_not_counted_as_compared(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-v5-row.example")
+    window = resolve_window("14d", _NOW)
+    target_bucket = window.start + timedelta(days=3)
+
+    version_5_stats = {"pages_crawled": 1, "links_emitted": 1, "version": 5}
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=1),
+        completed_at=target_bucket + timedelta(hours=1, seconds=1),
+        status="completed",
+        stats=version_5_stats,
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
+
+    assert response.status_code == 200
+    bucket = _series_bucket(response.json()["series"], target_bucket)
+    assert bucket["runs_compared"] == 0
+    assert bucket["pages_added"] == 0
+    assert bucket["pages_removed"] == 0
+    # No `llms_txt_bytes`/`links_emitted`-as-index-size on a version-5 row either -- still
+    # unknown, not zero.
+    assert bucket["index_bytes"] is None
+
+
+async def test_a_failed_run_carrying_a_diff_block_is_excluded_from_the_series(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    """A `failed` row CAN carry a fully-populated `index_diff` — `run_stats.py`'s own
+    docstring explains why (the diff is computed before the failure that ends the attempt) —
+    and the `status = 'completed'` filter is what keeps it out of every PER-193 aggregate."""
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-failed-diff.example"
+    )
+    window = resolve_window("14d", _NOW)
+    target_bucket = window.start + timedelta(days=3)
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=target_bucket + timedelta(hours=1),
+        completed_at=target_bucket + timedelta(hours=1, seconds=1),
+        status="failed",
+        stats=_stats_with_diff(index_diff=_compared_diff(pages_added=100, pages_removed=100)),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats", params={"window": "14d"})
+
+    assert response.status_code == 200
+    bucket = _series_bucket(response.json()["series"], target_bucket)
+    assert bucket["runs_compared"] == 0
+    assert bucket["pages_added"] == 0
+    assert bucket["pages_removed"] == 0
+    assert bucket["index_pages"] is None
+    assert bucket["index_bytes"] is None
+
+
+async def test_latest_reports_the_newest_completed_run_in_the_window(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-latest.example")
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW - timedelta(hours=2),
+        completed_at=_NOW - timedelta(hours=2),
+        status="completed",
+        stats=_stats_with_diff(index_diff=None),
+    )
+    newer_id = await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW - timedelta(hours=1),
+        completed_at=_NOW - timedelta(hours=1),
+        status="completed",
+        stats=_stats_with_diff(links_emitted=7, llms_txt_bytes=777, index_diff=None),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["run_id"] == str(newer_id)
+    assert latest["index_pages"] == 7
+    assert latest["index_bytes"] == 777
+
+
+async def test_latest_is_null_when_the_window_has_no_completed_run(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-latest-null.example"
+    )
+    await seed_run(websites_db, website_id, started_at=_NOW, status="failed", completed_at=None)
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    assert response.json()["latest"] is None
+
+
+async def test_latest_diff_state_is_not_recorded_for_a_pre_feature_row(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-latest-v5.example")
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        completed_at=_NOW,
+        status="completed",
+        stats={"pages_crawled": 1, "links_emitted": 1, "version": 5},
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["diff_state"] == "not_recorded"
+    assert latest["diff"] is None
+
+
+async def test_latest_diff_state_is_first_run_for_a_first_run_block(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-latest-first.example"
+    )
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        completed_at=_NOW,
+        status="completed",
+        stats=_stats_with_diff(index_diff={"state": "first_run", "previous_run_completed": None}),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["diff_state"] == "first_run"
+    assert latest["previous_run_completed"] is None
+    assert latest["diff"] is None
+
+
+async def test_latest_diff_state_is_compared_and_carries_the_samples(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-latest-compared.example"
+    )
+    diff = _compared_diff(pages_added=1, pages_removed=0)
+    diff["added_sample"] = [{"url": "https://example.test/new", "title": "New Page"}]
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        completed_at=_NOW,
+        status="completed",
+        stats=_stats_with_diff(index_diff=diff),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["diff_state"] == "compared"
+    assert latest["previous_run_completed"] is True
+    assert latest["diff"]["pages_added"] == 1
+    assert latest["diff"]["added_sample"] == [
+        {"url": "https://example.test/new", "title": "New Page"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("index_diff", "case_id"),
+    [
+        pytest.param("nonsense", "not-an-object", id="not-an-object"),
+        pytest.param({"state": "compared"}, "missing-fields", id="missing-required-fields"),
+    ],
+)
+async def test_a_malformed_index_diff_does_not_500_and_reports_not_recorded(
+    user_client: AsyncClient, websites_db: Pool, index_diff: Any, case_id: str
+) -> None:
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, f"https://stats-malformed-diff-{case_id}.example"
+    )
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        completed_at=_NOW,
+        status="completed",
+        stats=_stats_with_diff(index_diff=index_diff),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["diff_state"] == "not_recorded"
+    assert latest["diff"] is None
+
+
+# -----------------------------------------------------------------------------------------
 # The EXPLAIN test — this ticket's explicit acceptance criterion for the aggregate query.
 #
 # Deliberately a LONG, SPARSE history (~20k rows spread over roughly a decade) rather than
@@ -541,3 +912,21 @@ async def test_stats_query_plan_avoids_a_seq_scan_and_touches_runs_exactly_once(
     )
 
     _assert_no_seq_scan_and_touches_runs_exactly_once(plan)
+
+
+async def test_latest_completed_index_query_plan_avoids_a_seq_scan(websites_db: Pool) -> None:
+    """`_LATEST_COMPLETED_INDEX`'s own EXPLAIN test, mirroring the one above — a `LIMIT 1`
+    keyset lookup against the same sparse fixture, over the same 14-day window, must not fall
+    back to a sequential scan of the table."""
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-latest-explain.example"
+    )
+    await _seed_long_sparse_history_for_explain(websites_db, website_id)
+    window = resolve_window("14d", _NOW)
+
+    plan = await explain_plan(
+        websites_db, _LATEST_COMPLETED_INDEX, website_id, window.start, window.end
+    )
+
+    node_types = [node["Node Type"] for node in plan_nodes(plan)]
+    assert "Seq Scan" not in node_types, node_types

@@ -71,6 +71,117 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "IndexPageRef": {
+        "description": "One page in a sample list (`RunIndexDiff.added_sample` and its two siblings) — just\nenough to link to it and label it, never the full `IndexEntry` `internals/index_diff.py`\nbuilds for itself.",
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "title"
+        ],
+        "title": "IndexPageRef",
+        "type": "object"
+      },
+      "LatestRunSnapshot": {
+        "description": "The newest completed run inside the requested `window`, and what changed in its index\n— the Output tab's \"what changed in the latest run\" panel reads this, not `series`, which\nis why it is not itself a `RunStatsPoint`.\n\n**Window-scoped, like `RunStatsTotals.last_run_at`.** A completed run older than the\nwindow does not surface here even if it is the website's most recent run overall — the\nsame rule `last_run_at` already follows, stated explicitly here because a client reading\nonly this field (and not also checking the window) could otherwise mistake \"no completed\nrun in the last 24 hours\" for \"this website has never completed a run.\"",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "diff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunIndexDiff"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diff_state": {
+            "enum": [
+              "compared",
+              "first_run",
+              "not_recorded"
+            ],
+            "title": "Diff State",
+            "type": "string"
+          },
+          "index_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index Bytes"
+          },
+          "index_pages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index Pages"
+          },
+          "previous_run_completed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Run Completed"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "completed_at",
+          "index_pages",
+          "index_bytes",
+          "diff_state",
+          "previous_run_completed",
+          "diff"
+        ],
+        "title": "LatestRunSnapshot",
+        "type": "object"
+      },
       "LatestRunSummary": {
         "description": "The compact view of a website's most recent run, folded into the list response.\n\nA fragment of `WebsiteListItemResponse`, never an endpoint's response on its own — the\nruns feature owns the full run representation. Only the fields the websites table in the\nUI actually renders are here; anything more would make this a second, competing run DTO.",
         "properties": {
@@ -326,6 +437,115 @@
         "title": "RunDetailResponse",
         "type": "object"
       },
+      "RunIndexDiff": {
+        "description": "What changed in the latest run's index, compared with the previous completed run's —\nthe API shape of `internals/index_diff.py`'s `build_index_diff`'s `\"compared\"` dict.\nPresent on `LatestRunSnapshot.diff` if and only if `diff_state == \"compared\"`; see that\nfield's own docstring for why every other state carries `diff: None` instead of this\nmodel with its numeric fields zeroed out.",
+        "properties": {
+          "added_sample": {
+            "items": {
+              "$ref": "#/components/schemas/IndexPageRef"
+            },
+            "title": "Added Sample",
+            "type": "array"
+          },
+          "changed_sample": {
+            "items": {
+              "$ref": "#/components/schemas/IndexPageRef"
+            },
+            "title": "Changed Sample",
+            "type": "array"
+          },
+          "compared_to_completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compared To Completed At"
+          },
+          "compared_to_run_id": {
+            "format": "uuid",
+            "title": "Compared To Run Id",
+            "type": "string"
+          },
+          "llms_txt_bytes_delta": {
+            "title": "Llms Txt Bytes Delta",
+            "type": "integer"
+          },
+          "pages_added": {
+            "title": "Pages Added",
+            "type": "integer"
+          },
+          "pages_changed": {
+            "title": "Pages Changed",
+            "type": "integer"
+          },
+          "pages_removed": {
+            "title": "Pages Removed",
+            "type": "integer"
+          },
+          "removed_sample": {
+            "items": {
+              "$ref": "#/components/schemas/IndexPageRef"
+            },
+            "title": "Removed Sample",
+            "type": "array"
+          },
+          "sections_delta": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Sections Delta",
+            "type": "object"
+          },
+          "selection_churn": {
+            "title": "Selection Churn",
+            "type": "integer"
+          },
+          "selection_churn_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Churn Ratio"
+          },
+          "urls_discovered_delta": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Urls Discovered Delta"
+          }
+        },
+        "required": [
+          "compared_to_run_id",
+          "compared_to_completed_at",
+          "pages_added",
+          "pages_removed",
+          "pages_changed",
+          "added_sample",
+          "removed_sample",
+          "changed_sample",
+          "urls_discovered_delta",
+          "sections_delta",
+          "selection_churn",
+          "selection_churn_ratio",
+          "llms_txt_bytes_delta"
+        ],
+        "title": "RunIndexDiff",
+        "type": "object"
+      },
       "RunLimitExceededDetail": {
         "description": "The `detail` of the `429` from `POST /websites/{id}/runs` — either abuse cap.\n\n`scope` is the discriminator a client branches on; `message` is prose for a human and is\nfree to be reworded without breaking a client that reads `scope` and `limit` instead.",
         "properties": {
@@ -502,8 +722,42 @@
             "title": "Failed",
             "type": "integer"
           },
+          "index_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index Bytes"
+          },
+          "index_pages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index Pages"
+          },
+          "pages_added": {
+            "title": "Pages Added",
+            "type": "integer"
+          },
+          "pages_removed": {
+            "title": "Pages Removed",
+            "type": "integer"
+          },
           "runs": {
             "title": "Runs",
+            "type": "integer"
+          },
+          "runs_compared": {
+            "title": "Runs Compared",
             "type": "integer"
           },
           "t": {
@@ -518,7 +772,12 @@
           "completed",
           "failed",
           "avg_pages",
-          "avg_duration_ms"
+          "avg_duration_ms",
+          "runs_compared",
+          "pages_added",
+          "pages_removed",
+          "index_pages",
+          "index_bytes"
         ],
         "title": "RunStatsPoint",
         "type": "object"
@@ -554,6 +813,18 @@
             ],
             "title": "Last Run At"
           },
+          "pages_added": {
+            "title": "Pages Added",
+            "type": "integer"
+          },
+          "pages_removed": {
+            "title": "Pages Removed",
+            "type": "integer"
+          },
+          "runs_compared": {
+            "title": "Runs Compared",
+            "type": "integer"
+          },
           "success_rate": {
             "anyOf": [
               {
@@ -577,7 +848,10 @@
           "success_rate",
           "avg_duration_ms",
           "avg_pages",
-          "last_run_at"
+          "last_run_at",
+          "runs_compared",
+          "pages_added",
+          "pages_removed"
         ],
         "title": "RunStatsTotals",
         "type": "object"
@@ -943,6 +1217,16 @@
             "title": "Bucket",
             "type": "string"
           },
+          "latest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LatestRunSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "series": {
             "items": {
               "$ref": "#/components/schemas/RunStatsPoint"
@@ -967,7 +1251,8 @@
           "window",
           "bucket",
           "series",
-          "totals"
+          "totals",
+          "latest"
         ],
         "title": "WebsiteStatsResponse",
         "type": "object"

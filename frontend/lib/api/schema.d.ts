@@ -367,6 +367,51 @@ export interface components {
             status: "ok" | "degraded";
         };
         /**
+         * IndexPageRef
+         * @description One page in a sample list (`RunIndexDiff.added_sample` and its two siblings) — just
+         *     enough to link to it and label it, never the full `IndexEntry` `internals/index_diff.py`
+         *     builds for itself.
+         */
+        IndexPageRef: {
+            /** Title */
+            title: string | null;
+            /** Url */
+            url: string;
+        };
+        /**
+         * LatestRunSnapshot
+         * @description The newest completed run inside the requested `window`, and what changed in its index
+         *     — the Output tab's "what changed in the latest run" panel reads this, not `series`, which
+         *     is why it is not itself a `RunStatsPoint`.
+         *
+         *     **Window-scoped, like `RunStatsTotals.last_run_at`.** A completed run older than the
+         *     window does not surface here even if it is the website's most recent run overall — the
+         *     same rule `last_run_at` already follows, stated explicitly here because a client reading
+         *     only this field (and not also checking the window) could otherwise mistake "no completed
+         *     run in the last 24 hours" for "this website has never completed a run."
+         */
+        LatestRunSnapshot: {
+            /** Completed At */
+            completed_at: string | null;
+            diff: components["schemas"]["RunIndexDiff"] | null;
+            /**
+             * Diff State
+             * @enum {string}
+             */
+            diff_state: "compared" | "first_run" | "not_recorded";
+            /** Index Bytes */
+            index_bytes: number | null;
+            /** Index Pages */
+            index_pages: number | null;
+            /** Previous Run Completed */
+            previous_run_completed: boolean | null;
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+        };
+        /**
          * LatestRunSummary
          * @description The compact view of a website's most recent run, folded into the list response.
          *
@@ -493,6 +538,47 @@ export interface components {
             website_id: string;
         };
         /**
+         * RunIndexDiff
+         * @description What changed in the latest run's index, compared with the previous completed run's —
+         *     the API shape of `internals/index_diff.py`'s `build_index_diff`'s `"compared"` dict.
+         *     Present on `LatestRunSnapshot.diff` if and only if `diff_state == "compared"`; see that
+         *     field's own docstring for why every other state carries `diff: None` instead of this
+         *     model with its numeric fields zeroed out.
+         */
+        RunIndexDiff: {
+            /** Added Sample */
+            added_sample: components["schemas"]["IndexPageRef"][];
+            /** Changed Sample */
+            changed_sample: components["schemas"]["IndexPageRef"][];
+            /** Compared To Completed At */
+            compared_to_completed_at: string | null;
+            /**
+             * Compared To Run Id
+             * Format: uuid
+             */
+            compared_to_run_id: string;
+            /** Llms Txt Bytes Delta */
+            llms_txt_bytes_delta: number;
+            /** Pages Added */
+            pages_added: number;
+            /** Pages Changed */
+            pages_changed: number;
+            /** Pages Removed */
+            pages_removed: number;
+            /** Removed Sample */
+            removed_sample: components["schemas"]["IndexPageRef"][];
+            /** Sections Delta */
+            sections_delta: {
+                [key: string]: number;
+            };
+            /** Selection Churn */
+            selection_churn: number;
+            /** Selection Churn Ratio */
+            selection_churn_ratio: number | null;
+            /** Urls Discovered Delta */
+            urls_discovered_delta: number | null;
+        };
+        /**
          * RunLimitExceededDetail
          * @description The `detail` of the `429` from `POST /websites/{id}/runs` — either abuse cap.
          *
@@ -589,8 +675,18 @@ export interface components {
             completed: number;
             /** Failed */
             failed: number;
+            /** Index Bytes */
+            index_bytes: number | null;
+            /** Index Pages */
+            index_pages: number | null;
+            /** Pages Added */
+            pages_added: number;
+            /** Pages Removed */
+            pages_removed: number;
             /** Runs */
             runs: number;
+            /** Runs Compared */
+            runs_compared: number;
             /**
              * T
              * Format: date-time
@@ -616,6 +712,12 @@ export interface components {
             failed: number;
             /** Last Run At */
             last_run_at: string | null;
+            /** Pages Added */
+            pages_added: number;
+            /** Pages Removed */
+            pages_removed: number;
+            /** Runs Compared */
+            runs_compared: number;
             /** Success Rate */
             success_rate: number | null;
             /** Total Runs */
@@ -877,6 +979,7 @@ export interface components {
              * @enum {string}
              */
             bucket: "hour" | "day";
+            latest: components["schemas"]["LatestRunSnapshot"] | null;
             /** Series */
             series: components["schemas"]["RunStatsPoint"][];
             totals: components["schemas"]["RunStatsTotals"];
