@@ -118,9 +118,17 @@ export const AnimatedBeam: React.FC<AnimatedBeamProps> = ({
     const rectA = fromRef.current.getBoundingClientRect()
     const rectB = toRef.current.getBoundingClientRect()
 
+    // LOCAL EDIT: upstream calls `setSvgDimensions` with a fresh object on every
+    // measurement, which is never `===` the previous one and so re-renders the beam on every
+    // scroll-adjacent resize event even when nothing moved. Bailing out when the numbers are
+    // unchanged keeps a burst of resize events to one render.
     const svgWidth = containerRect.width
     const svgHeight = containerRect.height
-    setSvgDimensions({ width: svgWidth, height: svgHeight })
+    setSvgDimensions((current) =>
+      current.width === svgWidth && current.height === svgHeight
+        ? current
+        : { width: svgWidth, height: svgHeight }
+    )
 
     const startX = rectA.left - containerRect.left + rectA.width / 2 + startXOffset
     const startY = rectA.top - containerRect.top + rectA.height / 2 + startYOffset
@@ -141,8 +149,14 @@ export const AnimatedBeam: React.FC<AnimatedBeamProps> = ({
     endYOffset,
   ])
 
+  // The latest measurement, reachable from observer callbacks that are set up once. Assigned
+  // in an effect rather than during render: writing a ref while rendering is a side effect,
+  // and a render React discards (StrictMode's double pass, a suspended tree) would leave the
+  // ref holding a callback built from props that never committed.
   const updatePathRef = useRef(updatePath)
-  updatePathRef.current = updatePath
+  useEffect(() => {
+    updatePathRef.current = updatePath
+  }, [updatePath])
 
   useEffect(() => {
     const measure = () => updatePathRef.current()
@@ -154,13 +168,12 @@ export const AnimatedBeam: React.FC<AnimatedBeamProps> = ({
       if (element) resizeObserver.observe(element)
     }
 
-    // A node can also move because something *else* on the page changed height — an image
-    // loading above it, a section expanding. Neither resizes the three boxes above.
-    const mutationObserver = new MutationObserver(measure)
-    if (containerRef.current) {
-      mutationObserver.observe(containerRef.current, { childList: true, subtree: true })
-    }
-
+    // A node can also move because something *outside* this container changed height. That
+    // is what the window `resize` listener and the font hook below are for. A
+    // `MutationObserver` on the container is *not*: a change above the container is not a
+    // mutation inside it, so it would not fire for the case it looks like it covers — while
+    // six beams each watching the same subtree, each calling `setState`, is a feedback path
+    // waiting for the first consumer whose children are not static.
     window.addEventListener("resize", measure)
 
     // The font swap moves every label. `document.fonts.ready` resolves once it has landed.
@@ -174,7 +187,6 @@ export const AnimatedBeam: React.FC<AnimatedBeamProps> = ({
     return () => {
       cancelled = true
       resizeObserver.disconnect()
-      mutationObserver.disconnect()
       window.removeEventListener("resize", measure)
     }
   }, [containerRef, fromRef, toRef])
