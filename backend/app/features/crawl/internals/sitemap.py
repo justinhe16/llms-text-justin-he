@@ -57,6 +57,14 @@ the one object that decides `cap_hit == "bytes"`, so the two must never disagree
 real consequence: `bytes_fetched / pages_crawled` is no longer a page's average size once a
 run did any discovery at all.
 
+That invariant holds in BOTH directions, which is what makes `_DiscoveryBudget`'s charge
+order (below) safe rather than merely convenient. A chunk refused by discovery's own share is
+never charged to the run, so `bytes_fetched` can under-count what physically arrived — by at
+most one chunk, on the one fetch that trips the share. That is the harmless direction: it
+under-counts bytes the run never got to keep (`fetch_page` discards the whole partial body on
+a `ByteBudgetExceededError`), and it can never produce the unexplainable row above, because
+nothing is charged to the run's counter that `cap_hit == "bytes"` did not also see.
+
 **XML hardening: stdlib `ElementTree` plus a DOCTYPE refusal, not `defusedxml` or `lxml`.**
 Measured in this repository's own pinned interpreter (CPython 3.12.13, expat 2.8.1): a
 3-level internal-entity bomb parses cleanly with `xml.etree.ElementTree.fromstring` and
