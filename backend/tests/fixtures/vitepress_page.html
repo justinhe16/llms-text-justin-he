@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en-US" dir="ltr">
+<head>
+<meta charset="utf-8">
+<title>Deployment | Acme Guide</title>
+<meta name="description" content="Deploy the Acme server behind a reverse proxy, with health checks and zero-downtime restarts.">
+<meta property="og:title" content="Deployment | Acme Guide">
+<meta property="og:description" content="Deploy the Acme server behind a reverse proxy, with health checks and zero-downtime restarts.">
+<style>:root{--vp-c-brand-1:#3451b2}.VPNav{position:fixed;top:0}.VPSidebar{width:272px}</style>
+<script>__VP_HASH_MAP__=JSON.parse("{\"guide_deploy.md\":\"a1b2c3\"}");</script>
+</head>
+<body>
+<div id="app">
+  <header class="VPNav">
+    <div class="VPNavBar">
+      <a class="title" href="/">Acme Guide</a>
+      <nav class="VPNavBarMenu">
+        <a class="VPNavBarMenuLink" href="/guide/">Guide</a>
+        <a class="VPNavBarMenuLink" href="/reference/">Reference</a>
+        <a class="VPNavBarMenuLink" href="/changelog">Changelog</a>
+      </nav>
+      <div class="VPNavBarSearch"><button class="DocSearch-Button">Search</button></div>
+    </div>
+  </header>
+  <aside class="VPSidebar">
+    <nav class="nav" aria-labelledby="sidebar-nav">
+      <div class="group">
+        <section class="VPSidebarItem level-0">
+          <h2 class="title">Guide</h2>
+          <div class="items">
+            <a class="link" href="/guide/introduction">Introduction</a>
+            <a class="link" href="/guide/installation">Installation</a>
+            <a class="link active" href="/guide/deploy">Deployment</a>
+            <a class="link" href="/guide/monitoring">Monitoring</a>
+          </div>
+        </section>
+      </div>
+    </nav>
+  </aside>
+  <div class="VPContent has-sidebar">
+    <div class="VPDoc has-aside">
+      <div class="container">
+        <div class="aside">
+          <div class="aside-container">
+            <div class="VPDocAsideOutline">
+              <div class="outline-title">On this page</div>
+              <nav aria-labelledby="doc-outline-aria-label">
+                <ul class="root">
+                  <li><a class="outline-link" href="#behind-a-reverse-proxy">Behind a reverse proxy</a></li>
+                  <li><a class="outline-link" href="#zero-downtime-restarts">Zero-downtime restarts</a></li>
+                </ul>
+              </nav>
+            </div>
+          </div>
+        </div>
+        <div class="content">
+          <main class="main">
+            <div class="vp-doc">
+              <div>
+                <h1 id="deployment">Deployment</h1>
+                <p>The Acme server is a single static binary that listens on one port and writes structured logs to standard output. It expects to run behind a reverse proxy that terminates TLS, and it expects to be restarted rather than reconfigured when its settings change.</p>
+                <h2 id="behind-a-reverse-proxy">Behind a reverse proxy</h2>
+                <p>Forward the original client address in the <code>X-Forwarded-For</code> header and the original scheme in <code>X-Forwarded-Proto</code>. Without those two headers the server logs the proxy's address for every request and generates absolute URLs with the wrong scheme.</p>
+                <pre><code class="language-nginx">location / {
+  proxy_pass http://127.0.0.1:8080;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+</code></pre>
+                <h2 id="zero-downtime-restarts">Zero-downtime restarts</h2>
+                <p>On <code>SIGTERM</code> the server stops accepting new connections, finishes the requests already in flight, and exits once the last one completes or after the shutdown grace period elapses, whichever comes first. Set the proxy's own timeout above that grace period so a draining request is never cut off by the layer in front of it.</p>
+                <table>
+                  <thead><tr><th>Signal</th><th>Effect</th></tr></thead>
+                  <tbody>
+                    <tr><td>SIGTERM</td><td>Graceful drain, then exit.</td></tr>
+                    <tr><td>SIGINT</td><td>Identical to SIGTERM.</td></tr>
+                    <tr><td>SIGKILL</td><td>Immediate termination; in-flight requests are lost.</td></tr>
+                  </tbody>
+                </table>
+                <p>The <a href="/guide/monitoring">monitoring guide</a> describes the health endpoint a proxy should poll to decide when a freshly started instance is ready to receive traffic.</p>
+              </div>
+            </div>
+            <footer class="VPDocFooter">
+              <div class="edit-info"><a class="edit-link-button" href="https://github.com/acme/guide/edit/main/deploy.md">Edit this page on GitHub</a></div>
+              <div class="prev-next">
+                <a class="pager-link prev" href="/guide/installation">Installation</a>
+                <a class="pager-link next" href="/guide/monitoring">Monitoring</a>
+              </div>
+            </footer>
+          </main>
+        </div>
+      </div>
+    </div>
+  </div>
+  <footer class="VPFooter"><div class="container"><p class="message">Released under the MIT License.</p><p class="copyright">Copyright © 2020-2025 Acme Contributors</p></div></footer>
+</div>
+<script>window.__VP_SITE_DATA__={"base":"/","lang":"en-US"};</script>
+</body>
+</html>

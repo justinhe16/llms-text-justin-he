@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Authentication - Acme API</title>
+<meta name="description" content="Authenticate requests to the Acme API with a bearer token or a signed request.">
+<meta property="og:title" content="Authentication - Acme API">
+<meta property="og:description" content="Authenticate requests to the Acme API with a bearer token or a signed request.">
+<style>#sidebar{position:fixed;width:16rem}#navbar{backdrop-filter:blur(8px)}</style>
+<script>window.__MINTLIFY_ANALYTICS__={"posthog":{"apiKey":"phc_placeholder"}};</script>
+</head>
+<body>
+<div id="__next">
+  <header id="header" class="sticky top-0 z-30">
+    <div id="navbar" class="flex items-center">
+      <a href="/" class="flex"><span>Acme API</span></a>
+      <a href="/docs" class="px-3">Documentation</a>
+      <a href="/api-reference" class="px-3">API Reference</a>
+      <button id="search-bar-entry">Search or ask...</button>
+      <a href="https://dashboard.acme.com" class="px-3">Open Dashboard</a>
+    </div>
+  </header>
+  <div class="flex">
+    <div id="sidebar" class="hidden lg:block">
+      <div id="sidebar-content">
+        <div class="mt-6">
+          <h5 class="uppercase">Get Started</h5>
+          <ul>
+            <li><a href="/quickstart">Quickstart</a></li>
+            <li><a href="/authentication" class="font-semibold">Authentication</a></li>
+            <li><a href="/errors">Errors and retries</a></li>
+            <li><a href="/webhooks">Webhooks</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div id="content-area" class="flex-1">
+      <article>
+        <div class="mdx-content prose">
+          <h1>Authentication</h1>
+          <p>Every request to the Acme API must be authenticated. The API accepts two credential types: a bearer token for server-side calls, and a signed request for calls made from an untrusted client where a long-lived secret cannot be stored.</p>
+          <h2>Bearer tokens</h2>
+          <p>Send your secret key in the <code>Authorization</code> header. Secret keys are scoped to a single project and never expire, so treat one exactly as you would a password: keep it out of version control and rotate it if it is ever exposed.</p>
+          <pre><code class="language-bash">curl https://api.acme.com/v1/websites \
+  -H "Authorization: Bearer $ACME_SECRET_KEY"
+</code></pre>
+          <h2>Signed requests</h2>
+          <p>When a request originates from a browser or a mobile client, sign it on your own server instead of shipping a secret key to the device. A signature is valid for five minutes from the timestamp it carries, which bounds how long a captured request can be replayed.</p>
+          <ol>
+            <li>Build the canonical string from the method, the path, and the request body.</li>
+            <li>Sign it with your project secret using HMAC-SHA256.</li>
+            <li>Send the result in the <code>X-Acme-Signature</code> header alongside the timestamp.</li>
+          </ol>
+          <p>Requests that fail verification return <code>401</code>. See <a href="/errors">errors and retries</a> for the full list of authentication failure codes and whether each one is safe to retry.</p>
+        </div>
+      </article>
+      <footer class="mt-12 flex justify-between">
+        <a href="/quickstart">Previous: Quickstart</a>
+        <a href="/errors">Next: Errors and retries</a>
+      </footer>
+      <div class="mt-8"><a href="https://mintlify.com">Powered by Mintlify</a></div>
+    </div>
+    <div id="table-of-contents" class="hidden xl:block">
+      <div class="text-sm">On this page</div>
+      <ul>
+        <li><a href="#bearer-tokens">Bearer tokens</a></li>
+        <li><a href="#signed-requests">Signed requests</a></li>
+      </ul>
+    </div>
+  </div>
+</div>
+<script>window.addEventListener("load",function(){document.getElementById("search-bar-entry").removeAttribute("disabled");});</script>
+</body>
+</html>

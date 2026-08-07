@@ -34,3 +34,38 @@ httpx==0.28.1   # RUNTIME, not dev: app/core/auth/jwks.py fetches the JWKS docum
                 # build-check installs this file alone, so an httpx that lived only in
                 # requirements-dev.txt would pass lint and test and fail there — and only
                 # there. The test suite's ASGITransport client inherits it from here.
+
+# Content extraction
+trafilatura==2.2.0   # RUNTIME for the WORKER process only — the one entry here that is. The
+                     # API never parses HTML; only the crawl task reaches
+                     # app/features/crawl/internals/extract.py. Compare arq and httpx above,
+                     # whose comments explain why they are runtime for BOTH processes: this
+                     # one is in this file because the worker and the API are one image
+                     # (CLAUDE.md "Stack"), not because the API imports it.
+                     #
+                     # It arrives with a dependency tree of its own — lxml, jusText, courlan,
+                     # htmldate, and those packages' own dependencies (babel, dateparser, tld,
+                     # regex, ...). The four that decide what text comes out of a page are
+                     # pinned below; the rest are left to resolve, because pinning a
+                     # dependency-of-a-dependency this file never names would freeze a graph
+                     # nobody here is reading, and fastapi and uvicorn above do not do that
+                     # either.
+lxml==6.1.1          # pinned on its own line even though trafilatura requires `lxml>=6.1.1`:
+                     # a floor with no ceiling would let a `pip install` months apart resolve
+                     # two different parsers from one commit. Same argument as redis above,
+                     # with a sharper point — a floated redis changes a version string, a
+                     # floated lxml can change the extracted body itself, which is what the
+                     # fixtures under tests/fixtures/ assert against.
+lxml_html_clean==0.4.5  # pinned for exactly the reason cryptography and hiredis are: it is
+                        # reachable only through jusText's `lxml[html_clean]` extra, and an
+                        # extra alone floats the transitive pin.
+jusText==3.0.2       # one of the fallbacks trafilatura's cascade drops to when its own XPath
+                     # pass finds nothing, so it is load-bearing for exactly the pages that
+                     # are hardest to extract. `justext>=3.0.2` upstream — floor only, same
+                     # risk as lxml. Spelled as PyPI spells it; pip normalizes the case.
+courlan==1.4.0       # trafilatura's URL cleaning, imported at its import time. `>=1.4.0`
+                     # upstream, floor only.
+htmldate==1.10.0     # trafilatura's date extraction, imported at its import time. `>=1.10.0`
+                     # upstream, floor only. extract.py discards the date and passes
+                     # `extensive=False` to stop it hunting for one, but the import still has
+                     # to resolve, so the version still has to be fixed.

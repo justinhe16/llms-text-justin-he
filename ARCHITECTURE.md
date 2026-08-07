@@ -287,6 +287,30 @@ Build against that signature. Do not scatter crawling, parsing, or LLM-calling l
 through the services in anticipation of a design that does not exist yet, and do not widen
 the signature without a ticket that redesigns this seam.
 
+**One exception now exists, and it is deliberately not wired to anything.**
+`internals/extract.py` parses a page's HTML into a title, a description, and a markdown body
+(`extract_content(html, *, url) -> ExtractedContent`, built on trafilatura). It is a pure
+function in the same category as `internals/payload.py` and `internals/run_stats.py` — no
+I/O, no clock, no network — and **nothing calls it**: `CrawledPage.title` is still always
+`None`, `CrawledPage.content` is still the undecoded-beyond-transport response body, and
+`generate_llms_txt` is still the stub described above. Wiring extraction into the crawl loop
+is a separate ticket (PER-177).
+
+That ordering is the point rather than an accident of scheduling. Extraction is the one part
+of the undesigned pipeline whose quality can be judged on its own — against fixtures from
+the documentation generators this crawler actually meets (Docusaurus, Mintlify, VitePress,
+Nextra), asserting that a page's prose survives and its navbar, sidebar, table of contents,
+pagination and footer do not. Landing it as an unwired module keeps that judgement reviewable
+in isolation instead of buried inside a behaviour change to the fetch path, and it leaves the
+seam above exactly as narrow as it was. Ranking, summarization, and anything that calls a
+model remain undesigned and out of scope.
+
+`ExtractedContent.is_empty` is instrumentation, not a branch. It is set when a page yields
+less than `MIN_BODY_CHARS` of body — the signature of a JavaScript-rendered shell that
+returned a mount div and a bundle. Whether to pay for headless rendering is an open question
+with a real cost attached, and this flag exists to measure how often it would matter (counted
+by PER-176), not to decide it. Nothing branches on it.
+
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
 table-free I/O to do may keep it in `internals/` anyway, as this one keeps `ssrf.py`,
@@ -1174,7 +1198,10 @@ PUT    /websites/{id}/schedule
 Deliberately not decided here, and not to be decided by accident in an implementation PR:
 
 - **The crawler pipeline design.** That milestone has not been designed. Until it is,
-  everything sits behind `generate_llms_txt(pages) -> str` (§3.4).
+  everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Content extraction is the
+  one piece that has landed — `internals/extract.py`, pure and called by nothing (§3.4) —
+  and it does not constitute a design for the rest: how pages are ranked, what a generated
+  artifact selects, and whether a model is involved at all are all still open.
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**
