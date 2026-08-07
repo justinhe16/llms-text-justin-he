@@ -156,6 +156,10 @@ export const AnimatedBeam: React.FC<AnimatedBeamProps> = ({
   const updatePathRef = useRef(updatePath)
   useEffect(() => {
     updatePathRef.current = updatePath
+    // ...and re-measure with it. The observers below are wired up once and would otherwise
+    // not notice a changed `curvature` or offset until something unrelated resized, leaving
+    // the beam drawn to the previous geometry.
+    updatePath()
   }, [updatePath])
 
   useEffect(() => {

@@ -333,7 +333,9 @@ async function checkDocs(page) {
   );
 
   check(
-    docs.nodes.every((node) => (node.name ?? "").length > 0),
+    // `.length > 0` is not redundant: `.every()` on an empty array is vacuously true, so a
+    // diagram that rendered no nodes at all would pass this assertion on its way past.
+    docs.nodes.length > 0 && docs.nodes.every((node) => (node.name ?? "").length > 0),
     "every diagram node has an accessible name",
     docs.nodes
       .filter((node) => !(node.name ?? "").length)
@@ -366,7 +368,14 @@ async function checkDocs(page) {
 
   // Click → scroll, all seven. Reduced motion is emulated so the scroll is instant and the
   // step needs no sleeping; it also proves the beams go static, which is assertion 13.
-  await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
+  // Both features in one call, deliberately. `Emulation.setEmulatedMedia` *replaces* the
+  // override list rather than merging into it, so naming only reduced-motion here would
+  // silently drop the `prefers-color-scheme: light` override set earlier and hand the rest
+  // of the run whatever the CI runner's real OS preference is.
+  await page.emulateMediaFeatures([
+    { name: "prefers-color-scheme", value: "light" },
+    { name: "prefers-reduced-motion", value: "reduce" },
+  ]);
   await page.reload({ waitUntil: "load" });
   await page.evaluate(() => document.fonts.ready);
 
@@ -393,13 +402,36 @@ async function checkDocs(page) {
     notScrolled.join(", "),
   );
 
+  // Scroll → highlight. The click loop above proves the anchors resolve; this proves the
+  // observer in lib/docs/use-active-section.ts actually engages. Without it, a hook that
+  // silently never sets an active section (its headings missing at effect time, say) would
+  // leave every assertion here green and the diagram permanently unlit.
+  const unlit = [];
+  for (const node of docs.nodes) {
+    const active = await page.evaluate(async (id) => {
+      document.getElementById(id)?.scrollIntoView({ behavior: "auto", block: "start" });
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      return document.querySelector("[data-docs-node][data-active]")?.dataset.docsNode ?? null;
+    }, node.id);
+    if (active !== node.id) unlit.push(`${node.id} lit ${active}`);
+  }
+  check(
+    unlit.length === 0,
+    "scrolling to a section highlights its node",
+    unlit.join(", "),
+  );
+
   const reduced = await page.evaluate(probeDocs);
   check(
     reduced.beams.length === 6 && reduced.beams.every((beam) => beam.gradients === 0),
     "beams are static under prefers-reduced-motion: reduce",
     JSON.stringify(reduced.beams.map((beam) => beam.gradients)),
   );
-  await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "no-preference" }]);
+  await page.emulateMediaFeatures([
+    { name: "prefers-color-scheme", value: "light" },
+    { name: "prefers-reduced-motion", value: "no-preference" },
+  ]);
 }
 
 async function main() {

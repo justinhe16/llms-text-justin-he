@@ -43,6 +43,17 @@ export function DocsDiagram() {
     [],
   );
 
+  // One stable ref-setter per node. An inline `ref={(el) => ...}` is a new function on every
+  // render, which makes React detach (`ref(null)`) and reattach all seven refs every time
+  // the active section changes — i.e. on every scroll past a heading, for nothing.
+  const setNodeRef = useMemo(
+    () =>
+      nodeRefs.map((ref) => (element: HTMLButtonElement | null) => {
+        ref.current = element;
+      }),
+    [nodeRefs],
+  );
+
   const sectionIds = useMemo(() => DOCS_SECTIONS.map((section) => section.id), []);
   const activeId = useActiveSection(sectionIds);
 
@@ -69,9 +80,7 @@ export function DocsDiagram() {
             <button
               key={section.id}
               type="button"
-              ref={(element) => {
-                nodeRefs[index].current = element;
-              }}
+              ref={setNodeRef[index]}
               data-docs-node={section.id}
               data-active={isActive ? "" : undefined}
               aria-current={isActive ? "location" : undefined}
