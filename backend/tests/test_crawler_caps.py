@@ -16,8 +16,10 @@ import httpx
 from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, crawl_site
 from app.features.crawl.internals.fetcher import ByteBudget
+from app.features.crawl.internals.links import extract_links
 from app.features.crawl.internals.sitemap import SITEMAP_BYTE_SHARE, discover_sitemap_urls
 from app.features.crawl.internals.ssrf import Resolver
+from app.features.crawl.schemas import CrawledPage
 
 
 _SyncHandler = Callable[[httpx.Request], httpx.Response]
@@ -435,3 +437,242 @@ async def test_a_huge_sitemap_does_not_starve_the_page_crawl() -> None:
     assert len(result.pages) == 1
     assert result.pages[0].url == "http://seed.test/"
     assert result.pages[0].content_bytes == len(seed_body)
+
+
+# -----------------------------------------------------------------------------------------
+# PER-178: `frontier_from_seed`, the depth-1 link-extraction fallback's half of `crawl_site`.
+# `tests/test_crawl_links.py` pins the parser these tests feed in; `tests/test_run_persistence
+# .py` pins the end-to-end wiring in `CrawlService`. What is pinned HERE is the contract
+# between the two: when the callback is called, how many times, with what, and what the loop
+# does with what it returns.
+# -----------------------------------------------------------------------------------------
+
+
+def _seed_links(page: CrawledPage) -> list[str]:
+    """The real production callback, minus the ranking step `service.py` adds around it —
+    `internals/links.py`'s `extract_links` over the page `crawl_site` just fetched. Used
+    rather than a stub list so that "the second level is never reached" is a fact about the
+    real parser, not about a fixture that declined to return anything."""
+    return extract_links(page.content, base_url=page.url)
+
+
+def _page(*hrefs: str) -> str:
+    """An HTML page linking to each of `hrefs` — the shape a documentation site's navigation
+    has, reduced to the one element this fallback reads."""
+    links = "".join(f'<a href="{href}">{href}</a>' for href in hrefs)
+    return f"<html><body>{links}</body></html>"
+
+
+async def test_frontier_from_seed_fills_the_frontier_when_no_extra_urls_were_supplied() -> None:
+    """The fallback's happy path at the loop level: nothing was known up front, the seed's
+    own links become the frontier, and those pages are fetched like any other."""
+    seed_html = _page("/docs/intro", "/docs/config", "https://elsewhere.test/off-origin")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(200, html=seed_html)
+        return httpx.Response(200, html=_page())
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            frontier_from_seed=_seed_links,
+            resolver=_fake_resolver(),
+        )
+
+    assert result.seed_error is None
+    assert sorted(page.url for page in result.pages) == [
+        "https://seed.test/",
+        "https://seed.test/docs/config",
+        "https://seed.test/docs/intro",
+    ]
+
+
+async def test_a_link_found_on_a_frontier_page_is_never_extracted_or_followed() -> None:
+    """**The [Depth] criterion.** Depth 1 means the SEED page's links, and nothing else.
+
+    Every page this crawl serves — the seed and both frontier pages — links to a distinct
+    second-level URL. If anything ever handed a fetched frontier page back to the extractor,
+    `/level-2-from-*` would be requested and would appear in `pages`; the assertions below go
+    red on the first such request rather than on a downstream symptom of it.
+
+    The callback is also counted: depth 1 is not "the second level is filtered out later", it
+    is "the second level is never looked for", which is only true if `frontier_from_seed` is
+    invoked exactly once per run, on the seed alone.
+    """
+    seen_by_callback: list[str] = []
+    requested: list[str] = []
+
+    def counting_callback(page: CrawledPage) -> list[str]:
+        seen_by_callback.append(page.url)
+        return _seed_links(page)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        requested.append(path)
+        if path == "/":
+            return httpx.Response(200, html=_page("/first", "/second"))
+        if path == "/first":
+            return httpx.Response(200, html=_page("/level-2-from-first"))
+        if path == "/second":
+            return httpx.Response(200, html=_page("/level-2-from-second"))
+        raise AssertionError(f"a second-level URL was fetched: {path}")
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            frontier_from_seed=counting_callback,
+            resolver=_fake_resolver(),
+        )
+
+    assert seen_by_callback == ["https://seed.test/"], "the callback ran once, on the seed only"
+    assert sorted(requested) == ["/", "/first", "/second"]
+    assert sorted(page.url for page in result.pages) == [
+        "https://seed.test/",
+        "https://seed.test/first",
+        "https://seed.test/second",
+    ]
+    assert result.stats["pages_crawled"] == 3
+    assert result.stats["pages_failed"] == 0
+
+
+async def test_the_seed_is_fetched_exactly_once_when_the_link_fallback_runs() -> None:
+    """**The [Cost] criterion.** The seed page's HTML is already in hand — `crawl_site`
+    fetched it, and `CrawledPage.content` holds the body — so filling the frontier from it
+    must cost zero additional requests.
+
+    Counted per path against the mock transport, which is the only way to actually prove it:
+    a run that re-fetched the seed to read its links would still produce exactly the same
+    `pages`, the same `stats["pages_crawled"]`, and the same artifact, and would differ ONLY
+    in the request count. `bytes_fetched` is asserted alongside it as the second, independent
+    witness — a second seed fetch would charge its body to the shared budget twice.
+    """
+    seed_html = _page("/one", "/two")
+    requests_per_path: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        requests_per_path[path] = requests_per_path.get(path, 0) + 1
+        return httpx.Response(200, html=seed_html if path == "/" else _page())
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            frontier_from_seed=_seed_links,
+            resolver=_fake_resolver(),
+        )
+
+    assert requests_per_path == {"/": 1, "/one": 1, "/two": 1}
+    assert result.stats["bytes_fetched"] == len(seed_html) + 2 * len(_page())
+
+
+async def test_a_frontier_supplied_up_front_wins_and_the_callback_is_never_called() -> None:
+    """The fallback is a fallback. When the caller already knows a frontier — `service.py`
+    passing `select_urls(discover_sitemap_urls(...))` — the seed's own links are not consulted
+    at all, and the two sources are never merged into one frontier."""
+    called = False
+
+    def callback(page: CrawledPage) -> list[str]:
+        nonlocal called
+        called = True
+        return ["https://seed.test/from-the-page"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/from-the-page":
+            raise AssertionError("the seed's own links must not be fetched when a frontier exists")
+        return httpx.Response(200, html=_page("/from-the-page"))
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            extra_urls=["https://seed.test/from-the-sitemap"],
+            frontier_from_seed=callback,
+            resolver=_fake_resolver(),
+        )
+
+    assert called is False
+    assert sorted(page.url for page in result.pages) == [
+        "https://seed.test/",
+        "https://seed.test/from-the-sitemap",
+    ]
+
+
+async def test_the_callback_is_never_called_when_the_seed_fetch_fails() -> None:
+    """There is no page to read links off, and the run is already a failure. This is also
+    what lets `CrawlService`'s hoisted `discovery_source`/`urls_discovered`/`urls_selected`
+    defaults survive unchanged into a seed-failure row without extra plumbing."""
+    called = False
+
+    def callback(page: CrawledPage) -> list[str]:
+        nonlocal called
+        called = True
+        return []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated connection failure", request=request)
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            frontier_from_seed=callback,
+            resolver=_fake_resolver(),
+        )
+
+    assert called is False
+    assert result.pages == []
+    assert isinstance(result.seed_error, httpx.ConnectError)
+
+
+async def test_a_link_derived_frontier_is_bound_by_the_same_page_cap() -> None:
+    """A frontier that came from a page gets no special treatment: the same
+    `limits.max_pages` truncation, and the same `cap_hit == "pages"` that
+    `test_page_cap_truncates_the_frontier_and_is_a_success_not_an_error` pins for a
+    caller-supplied one."""
+    seed_html = _page(*(f"/p{i}" for i in range(10)))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html=seed_html if request.url.path == "/" else _page())
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(max_pages=3),
+            frontier_from_seed=_seed_links,
+            resolver=_fake_resolver(),
+        )
+
+    assert len(result.pages) == 3
+    assert result.cap_hit == "pages"
+    assert result.stats["cap_hit"] == "pages"
+    assert result.seed_error is None
+
+
+async def test_a_seed_page_with_no_links_is_a_successful_single_page_run() -> None:
+    """The [Edge] criterion's loop half: no links, no frontier, no failure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html><body><h1>Nothing to see</h1></body></html>")
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client,
+            "https://seed.test/",
+            limits=_limits(),
+            frontier_from_seed=_seed_links,
+            resolver=_fake_resolver(),
+        )
+
+    assert result.seed_error is None
+    assert result.cap_hit is None
+    assert [page.url for page in result.pages] == ["https://seed.test/"]

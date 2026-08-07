@@ -427,6 +427,43 @@ would put content judgement upstream of the seam instead of behind it. How *fetc
 are ranked, summarized, or chosen for the artifact is still undesigned and still lives behind
 `generate_llms_txt`.
 
+**The depth-1 link fallback, for the minority of sites with no sitemap (PER-178).** Every
+documentation generator this crawler targets ships a sitemap, so the paragraphs above are the
+common case and this is the exception. `internals/links.py`'s `extract_links(html, *,
+base_url) -> list[str]` reads the `<a href>` values out of **one** page's HTML — the seed's —
+resolves them (relative, root-relative, protocol-relative, absolute, and against a declared
+`<base href>` if the document has one), keeps only the same-origin ones, strips fragments,
+dedupes in document order, and stops at a defensive `MAX_LINKS` ceiling. It is pure and
+never raises, the same contract `extract_content` and `discover_sitemap_urls` hold. Its
+output becomes `DiscoveredUrl`s with `source="links"` and no `lastmod` or `priority` — which
+is why `select_urls` had to rank a candidate carrying neither signal on path shape alone from
+the day it was written — and goes through **the same** `select_urls` call and **the same**
+`crawl_max_pages` cap as a sitemap-derived frontier. `runs.stats["discovery_source"]` reads
+`"links"` when it produced anything, and `RUN_STATS_VERSION` stays **4**: a new value in an
+existing key's vocabulary is not a new row shape.
+
+Three things about it are load-bearing and none of them is an implementation detail:
+
+* **It is a fallback, never a parallel path.** `CrawlService.execute_run` arms it only when
+  `discover_sitemap_urls` returned zero URLs — not when the *selection* came out empty. A
+  sitemap listing nothing but `/tag/` pages leaves the frontier empty after ranking, and that
+  site still has a sitemap; scraping its markup would overrule an answer its operator
+  actually gave. The two sources are never merged into one frontier.
+* **It costs no extra request.** `crawl_site` has already fetched the seed and
+  `CrawledPage.content` holds the body, so the frontier is derived from bytes already paid
+  for. `crawl_site` grew one optional parameter for this — `frontier_from_seed`, a
+  **synchronous** `Callable[[CrawledPage], Sequence[str]]` invoked once, after a successful
+  seed fetch, only when `extra_urls` is empty. Synchronous is the guarantee: a function that
+  cannot `await` cannot make a request. `crawler.py` still parses no page content itself; it
+  calls a function and treats the result as more URLs.
+* **Depth 1 is enforced by call count, not by policy code.** The callback runs once, on the
+  seed, and the pages fetched from the frontier it returns are never handed back to it.
+  There is deliberately no frontier queue, no visited set, no cycle detection, and no depth
+  counter anywhere in this feature — with one extraction per run there is no second level for
+  any of them to bound. Recursive multi-level crawling remains out of scope (§11). A site
+  that needs more than the seed's links plus ranking gets a worse `llms.txt`, and that is an
+  accepted v1 outcome.
+
 `select_urls` is deterministic by construction: survivors sort by `(-score, url)`, so the URL
 tie-break makes a selection a pure function of *which* URLs were discovered rather than of
 the order a sitemap or a set of racing fetches happened to yield them in. That is the
@@ -1360,15 +1397,17 @@ Deliberately not decided here, and not to be decided by accident in an implement
   (`runs/internals/runs_reader.py`) names its columns explicitly, which is why adding the
   column did not silently widen the API. Serving both at stable, cacheable URLs is its own
   ticket.
-- **Link extraction — the frontier's second half.** PER-176 wired the first:
-  `internals/sitemap.py` discovers a site's URLs from `sitemap.xml`, `sitemap_index.xml`, or
-  `robots.txt`'s `Sitemap:` directive, `internals/url_ranking.py` ranks them, and `service.py`
-  hands the selection to `crawl_site`'s `extra_urls` (§3.4). What is still undesigned is
-  following `<a href>` links out of pages already fetched, which is what a site with no
-  sitemap at all would need — today such a site produces a correct single-page run
-  (`discovery_source: "none"`) rather than a crawl. That is a separate ticket, and it is
-  deliberately the *fallback* for when sitemap discovery finds nothing, not a parallel path:
-  nothing downstream of a fetched page's body may grow a link parser without one.
+- **Recursive, multi-level crawling.** Both halves of the frontier are now built: PER-176
+  discovers a site's URLs from `sitemap.xml`, `sitemap_index.xml`, or `robots.txt`'s
+  `Sitemap:` directive, and PER-178 falls back to the `<a href>` links on the seed page for
+  the minority of sites with neither (§3.4). What remains undesigned is everything past that
+  first level — following links found on *frontier* pages, and the machinery a crawl needs
+  once it does: a frontier queue, a visited set, cycle detection, and a depth or breadth
+  policy. None of those exists in this codebase, and none of them should be added
+  incrementally: at depth 1 there is no second level for any of them to bound, so the first
+  one to appear would be a component with no job, and the second would be a crawler nobody
+  designed. A site that needs more than its seed's links plus ranking gets a worse
+  `llms.txt`, which is the accepted v1 outcome, not a bug to fix inline.
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**

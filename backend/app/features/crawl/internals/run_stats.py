@@ -22,10 +22,11 @@ something the crawl loop is structurally incapable of reporting:
   the crawl — `internals/llms_txt.py` is what decides both, and the crawl loop has finished
   by the time either is knowable.
 * `discovery_source`, `urls_discovered` and `urls_selected` are facts about the frontier the
-  crawl loop was HANDED. `crawl_site` receives `extra_urls` as a plain sequence and has no
-  idea whether it came from a sitemap, a `robots.txt` directive, or nowhere at all — that is
-  exactly the seam its own module docstring describes, and keeping these three out of
-  `CrawlResult.stats` is what preserves it.
+  crawl loop was HANDED. `crawl_site` receives `extra_urls` as a plain sequence — or, since
+  PER-178, calls a `frontier_from_seed` function it knows nothing about — and has no idea
+  whether the result came from a sitemap, a `robots.txt` directive, a page's own links, or
+  nowhere at all; that is exactly the seam its own module docstring describes, and keeping
+  these three out of `CrawlResult.stats` is what preserves it.
 * `version` only exists because a stored jsonb value outlives the code that wrote it.
 
 Building the persisted shape here, one call site away from the write path, keeps
@@ -82,6 +83,16 @@ it fetched anything — which of `internals/sitemap.py`'s entry points produced 
 (`"sitemap"`, `"sitemap_index"`, `"robots"`, or `"none"`), how many same-origin candidates
 that produced, and how many `url_ranking.select_urls` kept. Every version-3 key keeps its
 version-3 meaning here.
+
+**PER-178 added a fifth `discovery_source` value, `"links"`, and deliberately did NOT bump
+the version for it.** A version is about the SHAPE of this dict — which keys a row has, and
+what each one means — and a new value in an existing key's vocabulary is neither. A reader
+that knows what version 4 is already knows `discovery_source` names where the frontier came
+from; `"links"` (the seed page's own `<a href>` links, `internals/links.py`, used only when
+sitemap discovery found nothing) is one more answer to the question the key was already
+asking, and every version-4 row still carries exactly these keys. Bumping here would have
+made two identically-shaped dicts distinguishable only by a version number, which is the
+opposite of what the field is for.
 
 **Why this is version 4 and not three more keys folded into version 3.** PER-179 and PER-176
 are separate merges, so they are separate deploys, and version 3 was already live and writing
@@ -142,17 +153,26 @@ def build_run_stats(
             one that fetched exactly what it published are otherwise indistinguishable in this
             row, and the caps are the sort of limit whose value is only revisited if someone
             can see how often it binds.
-        discovery_source: Which of `internals/sitemap.py`'s four discovery entry points
-            actually produced this run's frontier — `"sitemap"`, `"sitemap_index"`,
-            `"robots"`, or `"none"`. Typed as a plain `str`, not that module's
-            `DiscoverySource` literal: this is a pure, I/O-free module, and importing a type
-            from `internals/sitemap.py` would make it depend on an I/O module for the first
-            time. The vocabulary those four strings are drawn from is owned by
-            `internals/sitemap.py`, not here.
-        urls_discovered: How many same-origin candidates `internals/sitemap.py`'s discovery
-            step handed to `url_ranking.select_urls` — not every `<loc>` in whatever document
-            it read, which may have listed more before off-origin entries were dropped.
-        urls_selected: How many of those candidates `select_urls` actually chose, i.e.
+        discovery_source: Which discovery path actually produced this run's frontier — one of
+            `internals/sitemap.py`'s four entry points (`"sitemap"`, `"sitemap_index"`,
+            `"robots"`, `"none"`), or `"links"` for the depth-1 fallback that reads the seed
+            page's own `<a href>` links when sitemap discovery found nothing
+            (`internals/links.py`, PER-178). Named only when that path actually yielded at
+            least one candidate: a fallback that ran and found no links reports `"none"`,
+            exactly as a `/sitemap.xml` that 404s does, so `"none"` reads as "this run found
+            no frontier anywhere" rather than as "no sitemap specifically". Typed as a plain
+            `str`, not `sitemap.DiscoverySource` or `service.RunDiscoverySource`: this is a
+            pure, I/O-free module, and importing a type from either would make it depend on
+            an I/O module for the first time. The vocabulary these five strings are drawn
+            from is owned by those modules, not by this one.
+        urls_discovered: How many same-origin candidates the winning discovery path handed to
+            `url_ranking.select_urls` — for a sitemap, not every `<loc>` in whatever document
+            it read, which may have listed more before off-origin entries were dropped; for
+            `"links"`, the same-origin links the seed page carried, after `extract_links`'s
+            own filtering and deduping.
+        urls_selected: How many of those candidates `select_urls` actually chose — the same
+            `select_urls` call for both discovery paths, since a URL found on a page is
+            ranked by the same rules as one found in a sitemap — i.e.
             `len(SelectionResult.selected)` — the size of the frontier `crawl_site` was
             actually given via `extra_urls`. Recorded next to `urls_discovered` rather than
             instead of it because the RATIO is the tunable thing: a run that discovered 4,000

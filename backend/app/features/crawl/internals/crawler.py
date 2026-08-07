@@ -13,12 +13,23 @@ own). Only the SEED failing to fetch at all is a failure — `CrawlResult.seed_e
 **The frontier is a parameter, not something this module discovers.** `extra_urls` is
 whatever the caller already knows about beyond the seed — since PER-176, that is
 `internals/url_ranking.py`'s `select_urls` output over whatever `internals/sitemap.py`'s
-`discover_sitemap_urls` found, wired together one layer up in `service.py`. This module still
-does not discover anything itself: it does not parse a single byte of any page's content to
-find a link, and link extraction (finding URLs ON already-fetched pages, as opposed to a
-sitemap) remains out of scope (ARCHITECTURE.md §3.4, CLAUDE.md #9). `extra_urls` staying a
-plain parameter is what let the page cap be tested without either pipeline existing yet, and
-it is exactly the seam PER-176's discovery-and-selection pipeline plugs into now.
+`discover_sitemap_urls` found, wired together one layer up in `service.py`. `extra_urls`
+staying a plain parameter is what let the page cap be tested without either pipeline existing
+yet, and it is exactly the seam PER-176's discovery-and-selection pipeline plugged into.
+
+**PER-178 made that frontier dynamic, and did it without moving discovery in here.** A site
+with no sitemap has nothing for `extra_urls` to carry, and the only place its links exist is
+in the seed page's own HTML — which does not exist until this function has already fetched it.
+So `crawl_site` grew a second, optional way to be handed a frontier: `frontier_from_seed`, a
+caller-supplied function invoked once, on the fetched seed page, when and only when
+`extra_urls` is empty. **This module still does not discover anything itself**: it does not
+parse a single byte of any page's content to find a link, and it does not know or care that
+the function it calls does. Both frontiers land in the same list, under the same truncation,
+the same page cap, and the same politeness gate; the difference is only WHEN the caller gets
+to compute one. What remains genuinely out of scope here, and is not a thing this seam can
+grow into by accident, is recursion: `frontier_from_seed` is called exactly once per run, on
+the seed alone, and the pages fetched from the frontier are never handed back to it (see
+`crawl_site`'s own parameter docstring, and `app/features/crawl/internals/links.py`).
 
 **Two independent timeout mechanisms, not one.** A monotonic deadline (`clock() +
 limits.max_wall_clock_s`) is checked before every non-seed fetch is even attempted — cheap,
@@ -175,6 +186,7 @@ async def crawl_site(
     *,
     limits: CrawlLimits,
     extra_urls: Sequence[str] = (),
+    frontier_from_seed: Callable[[CrawledPage], Sequence[str]] | None = None,
     budget: ByteBudget | None = None,
     resolver: Resolver | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -192,10 +204,36 @@ async def crawl_site(
         client: The shared crawl client (`build_crawl_client`). Every fetch goes through it.
         seed_url: The one URL this run is guaranteed to attempt.
         limits: The six caps for this run — see `CrawlLimits`.
-        extra_urls: The rest of the frontier, already known to the caller — since PER-176,
-            `service.py`'s `select_urls(discover_sitemap_urls(...))` pipeline. Truncated to
+        extra_urls: The rest of the frontier, already known to the caller BEFORE the seed is
+            fetched — since PER-176, `service.py`'s
+            `select_urls(discover_sitemap_urls(...))` pipeline. Truncated to
             `limits.max_pages - 1` up front, and re-checked against the live page count
-            before each fetch (the frontier becomes dynamic once link extraction lands).
+            before each fetch. Empty is an ordinary value, not a degenerate one: it is what a
+            site with no sitemap produces, and it is the condition `frontier_from_seed` below
+            answers.
+        frontier_from_seed: How to derive a frontier from the SEED PAGE ITSELF, for the
+            caller that could not know one up front. Called at most once per run — after the
+            seed fetch succeeds, and only when `extra_urls` is empty — with the fetched
+            `CrawledPage`, and whatever sequence it returns becomes the frontier, truncated
+            and capped exactly as `extra_urls` would have been. `service.py` passes
+            `internals/links.py`'s `extract_links` fed through the same `select_urls` the
+            sitemap path uses (PER-178); every other caller, and every caller that already
+            has a sitemap-derived frontier, leaves it `None`.
+
+            **Three properties of this parameter are the whole depth-1 rule**, and none of
+            them is enforced by the function it is given: it is called exactly ONCE, it is
+            called with the SEED page only, and its result is fetched but never fed back into
+            it. There is no frontier queue, no visited set, and no depth counter anywhere in
+            this module, because with one extraction per run there is no second level for any
+            of them to bound. `tests/test_crawler_caps.py` pins the "second level is never
+            reached" half of that directly, with a callback that would happily return more
+            links if it were ever called a second time.
+
+            Skipped entirely when `extra_urls` is non-empty, so a run cannot end up with a
+            frontier assembled from two sources: a sitemap is a site operator's own statement
+            about which pages matter, and links scraped off one page do not get a vote
+            alongside it. Never called at all when the seed fetch fails — there is no page to
+            derive anything from, and the run is already a failure.
         budget: A caller-supplied `ByteBudget` to spend from, instead of a fresh one built
             from `limits.max_bytes`. Both caller-supplied production values, alongside
             `extra_urls` — `resolver`/`clock` below are the test-injection pair instead.
@@ -287,6 +325,15 @@ async def crawl_site(
             else:
                 pages.append(seed_page)
 
+                # The frontier, from whichever of the two sources supplied one. The
+                # `if not frontier` guard is what keeps them mutually exclusive rather than
+                # additive — see `frontier_from_seed`'s own docstring — and it is also why
+                # `frontier_from_seed` cannot be reached at all on the seed-failure path
+                # above: this whole block is the seed fetch's `else`.
+                frontier = list(extra_urls)
+                if not frontier and frontier_from_seed is not None:
+                    frontier = list(frontier_from_seed(seed_page))
+
                 # Truncated up front — but `cap_hit` is deliberately NOT set here yet.
                 # Setting it before the gather below would make every truncated task's own
                 # `if cap_hit is not None: return` check fire immediately, since that same
@@ -294,7 +341,6 @@ async def crawl_site(
                 # at all. Whether truncation happened is remembered separately
                 # (`frontier_was_truncated`) and only turned into `cap_hit` once the
                 # truncated batch has actually been attempted, below.
-                frontier = list(extra_urls)
                 allowed = max(0, limits.max_pages - 1)
                 frontier_was_truncated = len(frontier) > allowed
                 frontier = frontier[:allowed]

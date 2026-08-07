@@ -6,9 +6,11 @@ sitemap protocol's own discovery order for one website's origin — `/sitemap.xm
 document answers first with usable content, and returns the `<url><loc>` entries it found as
 `DiscoveredUrl`s (`internals/url_ranking.py`), ready for that module's `select_urls` to rank
 and `crawl_site`'s `extra_urls` to fetch. It is not link extraction: nothing here reads a
-fetched page's HTML, because that milestone remains undesigned (ARCHITECTURE.md §3.4,
-CLAUDE.md #9) — every URL this module returns came out of a sitemap or a `robots.txt`
-`Sitemap:` line, never out of an `<a href>`. It is not politeness either: `robots.txt`'s
+fetched page's HTML — every URL this module returns came out of a sitemap or a `robots.txt`
+`Sitemap:` line, never out of an `<a href>`. That is `internals/links.py`'s job (PER-178),
+and it is a strictly SECONDARY one: `service.py` runs it only when this module comes back
+with nothing, so a site that ships a sitemap never has its markup read for links at all. It
+is not politeness either: `robots.txt`'s
 `Disallow`, `Allow`, and `Crawl-delay` directives are read by nothing here — see
 `_robots_sitemap_urls` — because respecting them for a crawler that already caps itself at
 `crawl_max_pages` pages a user explicitly asked to run is a different product decision than
@@ -767,7 +769,7 @@ async def discover_sitemap_urls(
             # `url_ranking.select_urls`'s own `"duplicate"` rule already merges a URL's
             # `priority`/`lastmod` order-independently downstream, so a second pass here
             # would only repeat work that module already has to do for every OTHER source of
-            # duplication (a URL a sitemap and a future link-extraction pass both find).
+            # duplication (a URL two `Sitemap:` targets both list).
             for target in await _robots_targets(state, origin):
                 collected.extend(await _collect(state, target, allow_index=True))
                 if state.stop or state.remaining_urls() == 0:
