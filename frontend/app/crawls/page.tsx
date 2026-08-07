@@ -33,7 +33,17 @@ export default function CrawlsPage() {
       <CrawlsHeader />
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6">
-        <h1 className="mb-6 text-xl font-medium tracking-tight text-foreground">Crawls</h1>
+        <div className="mb-6">
+          <h1 className="text-xl font-medium tracking-tight text-foreground">Crawls</h1>
+          {/* States the read/write split before the reader hits a disabled control and has to
+              infer it. Deliberately worded to match the per-control copy in `run-now-button`
+              and `schedule-tab` ("Only the owner can …"), so the page-level promise and the
+              tooltip a non-owner actually lands on say the same thing. */}
+          <p className="mt-1 text-sm text-muted-foreground">
+            Every crawl is visible to everyone signed in. Only its owner can start a run or
+            change its schedule.
+          </p>
+        </div>
         <CrawlsView />
       </main>
     </div>
