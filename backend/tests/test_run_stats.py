@@ -9,17 +9,20 @@ beside it is in.
 from app.features.crawl.internals.run_stats import RUN_STATS_VERSION, build_run_stats
 
 
-def test_run_stats_version_is_3() -> None:
-    """PER-179 bumped this from 2 to 3, and unlike the 1-to-2 bump it changes two things at
-    once: `full_txt_truncated` joins the persisted shape as a new key, AND `links_emitted`
-    stops meaning one-bullet-per-fetched-page, now that the real index omits pages with no
-    extractable content. See `RUN_STATS_VERSION`'s own docstring for the full history.
+def test_run_stats_version_is_4() -> None:
+    """PER-176 bumped this from 3 to 4 when `discovery_source`, `urls_discovered` and
+    `urls_selected` joined the persisted shape. It is a second bump in the same release as
+    PER-179's 2-to-3, and deliberately so: the two tickets deploy separately, so version 3 was
+    already writing rows before discovery existed, and folding the new keys into 3 would have
+    left two different shapes wearing the same version number. See `RUN_STATS_VERSION`'s own
+    docstring for the full history and for why the bump — rather than a documented caveat — is
+    what makes a version-3 row and a version-4 row unambiguous.
 
     Pinned here, directly, so a future change to the persisted shape has to bump this constant
     deliberately rather than by accident: `tests/test_run_persistence.py` only checks the
     version NUMBER a live row lands with, which would pass just as happily against a
     `RUN_STATS_VERSION` that was bumped again without anyone noticing this test existed."""
-    assert RUN_STATS_VERSION == 3
+    assert RUN_STATS_VERSION == 4
 
 
 def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_six_keys() -> None:

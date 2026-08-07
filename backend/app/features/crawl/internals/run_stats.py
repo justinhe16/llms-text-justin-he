@@ -40,7 +40,7 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
-RUN_STATS_VERSION: Final = 3
+RUN_STATS_VERSION: Final = 4
 """Which definition of this whole dict's shape a stored row was written under — not just
 `links_emitted`'s meaning, but which KEYS a row of this version even has.
 
@@ -58,23 +58,10 @@ existing one.
 **Version 3** rows are the first written by a real `generate_llms_txt` (PER-179), and they
 change both of the things a version can change, at once.
 
-New KEYS, four of them. `full_txt_truncated` (PER-179) is the number of pages whose body the
-`llms-full.txt` artifact could not carry in full — `internals/llms_txt.py`'s
-`count_full_txt_truncations`, which documents why a page dropped entirely by the
-whole-artifact cap is counted alongside one merely cut by the per-page cap. `discovery_source`,
-`urls_discovered` and `urls_selected` (PER-176) describe the frontier the crawl loop was given
-before it fetched anything: which of `internals/sitemap.py`'s entry points produced it, how
-many candidates that produced, and how many `url_ranking.select_urls` kept. They are folded
-into version 3 rather than given a version of their own because both tickets landed in the
-same release, one immediately after the other, and a version is meant to name a SHAPE rather
-than a commit.
-
-**The one caveat a future reader deserves, stated rather than discovered:** PER-179 merged
-first, so any row written in the window between the two deploys carries `version: 3` with
-`full_txt_truncated` but WITHOUT the three discovery keys. Read those three defensively — a
-missing key means "written before discovery landed", never "this run discovered nothing",
-which is instead spelled `discovery_source: "none"` explicitly. That window is bounded and
-closed; nothing written from PER-176 onward is missing them.
+A new KEY: `full_txt_truncated`, the number of pages whose body the `llms-full.txt` artifact
+could not carry in full — `internals/llms_txt.py`'s `count_full_txt_truncations`, which
+documents why a page dropped entirely by the whole-artifact cap is counted alongside one
+merely cut by the per-page cap.
 
 And a REDEFINITION, which is the more consequential half: `links_emitted` stops meaning "one
 bullet per fetched page". The artifact now omits pages whose extraction came back empty, so
@@ -87,7 +74,30 @@ The redefinition is why a reader cannot interpret this key without `version`.
 the artifact; the same equality on a version-3 row is a real measurement that happened to
 come out equal, and means every fetched page had extractable content. No row carries
 anything else a reader could infer this from — a row's age is not a fact about the code that
-wrote it — which is what keeps this a stored field rather than a derivation."""
+wrote it — which is what keeps this a stored field rather than a derivation.
+
+**Version 4** rows add three keys and redefine nothing (PER-176): `discovery_source`,
+`urls_discovered` and `urls_selected` describe the frontier the crawl loop was HANDED, before
+it fetched anything — which of `internals/sitemap.py`'s entry points produced it
+(`"sitemap"`, `"sitemap_index"`, `"robots"`, or `"none"`), how many same-origin candidates
+that produced, and how many `url_ranking.select_urls` kept. Every version-3 key keeps its
+version-3 meaning here.
+
+**Why this is version 4 and not three more keys folded into version 3.** PER-179 and PER-176
+are separate merges, so they are separate deploys, and version 3 was already live and writing
+rows by the time discovery landed. Folding these keys into 3 would have left two genuinely
+different shapes both stamped `version: 3`, distinguishable only by a reader who happened to
+know the deploy order — which is precisely the knowledge this field exists so that nobody
+needs. Two bumps in one release is cosmetically odd and semantically honest, and for a value
+stored permanently in jsonb, honest wins.
+
+The bump is what makes the shapes unambiguous rather than merely documented: `build_run_stats`
+writes the three discovery keys and `version` into the SAME dict in the same call, so no build
+of this module can emit one without the other. A version-3 row therefore never carries the
+discovery keys, and a version-4 row always does — there is no window, and no defensive read
+of a possibly-absent key is required. Read `discovery_source: "none"` (an explicit value, and
+the honest answer for a site with no sitemap) as different in kind from a version-3 row's
+silence on the subject."""
 
 
 def build_run_stats(

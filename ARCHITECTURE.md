@@ -381,8 +381,8 @@ the next exception.
 page yields less than `MIN_BODY_CHARS` of body: the signature of a JavaScript-rendered shell
 that returned a mount div and a bundle. Whether to pay for headless rendering is an open
 question with a real cost attached, and this flag exists to measure how often it would matter,
-not to decide it. It is counted once per run, as `runs.stats["pages_empty_content"]` at
-`RUN_STATS_VERSION` 3 (`internals/crawler.py`, `internals/run_stats.py`).
+not to decide it. It is counted once per run, as `runs.stats["pages_empty_content"]` on every
+row from `RUN_STATS_VERSION` 2 onwards (`internals/crawler.py`, `internals/run_stats.py`).
 
 **Exactly one thing branches on it, and it is downstream of the seam.** `generate_llms_txt`
 omits an empty page from the index (PER-179) — a bullet with no title and no description is
@@ -435,10 +435,11 @@ Its per-rule `SelectionResult.dropped` counters reconcile exactly — `discovere
 len(selected) + sum(dropped.values())`, every candidate either selected or dropped under
 exactly one rule — and `runs.stats["discovery_source"]`, `["urls_discovered"]`, and
 `["urls_selected"]` record where the frontier came from and how it was cut down
-(`internals/run_stats.py`'s `build_run_stats`). Those three keys joined `RUN_STATS_VERSION` 3
-alongside PER-179's `full_txt_truncated` rather than bumping the version a second time: both
-tickets landed in the same release, and a version names a shape rather than a commit — see
-`RUN_STATS_VERSION`'s own docstring for the one window that qualifies.
+(`internals/run_stats.py`'s `build_run_stats`). Those three keys are what `RUN_STATS_VERSION`
+**4** adds, one release after PER-179's 3. Two bumps in one release is deliberate: the two
+tickets deploy separately, so version 3 was already writing rows before discovery existed, and
+folding the new keys into 3 would have left two different shapes stamped with the same version
+— exactly the ambiguity the field exists to prevent. See `RUN_STATS_VERSION`'s own docstring.
 
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
