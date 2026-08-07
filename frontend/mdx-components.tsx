@@ -16,16 +16,35 @@ import Link from "next/link";
  */
 export function useMDXComponents(components: MDXComponents): MDXComponents {
   return {
-    h1: ({ children }) => (
-      <h1 className="mb-3 text-3xl font-medium tracking-tight text-foreground">{children}</h1>
+    // Headings forward `id`. They do not invent it: `rehype-slug` (wired in
+    // `next.config.ts`) has already put a `github-slugger` slug on every heading node by the
+    // time this map runs, and dropping the prop here would throw it away and leave
+    // `lib/docs/sections.ts` pointing at nothing.
+    //
+    // `scroll-mt-24` is 96px, and it is not a taste decision: it must stay *below*
+    // `ACTIVE_LINE_PX` (112px) in `lib/docs/use-active-section.ts`. Clicking a diagram node
+    // lands its heading at 96px, and 96 < 112 means that heading is unambiguously the active
+    // one the moment the scroll settles. Setting the two equal puts the clicked heading
+    // exactly on the boundary, where a sub-pixel shortfall in a smooth scroll leaves the node
+    // you just pressed unlit. Change one of these numbers and change the other — keeping the
+    // inequality in this direction.
+    h1: ({ id, children }) => (
+      <h1 id={id} className="mb-3 scroll-mt-24 text-3xl font-medium tracking-tight text-foreground">
+        {children}
+      </h1>
     ),
-    h2: ({ children }) => (
-      <h2 className="mt-12 mb-3 text-lg font-medium tracking-tight text-foreground">
+    h2: ({ id, children }) => (
+      <h2
+        id={id}
+        className="mt-12 mb-3 scroll-mt-24 text-lg font-medium tracking-tight text-foreground"
+      >
         {children}
       </h2>
     ),
-    h3: ({ children }) => (
-      <h3 className="mt-8 mb-2 text-base font-medium text-foreground">{children}</h3>
+    h3: ({ id, children }) => (
+      <h3 id={id} className="mt-8 mb-2 scroll-mt-24 text-base font-medium text-foreground">
+        {children}
+      </h3>
     ),
     p: ({ children }) => <p className="my-4 text-sm/7 text-muted-foreground">{children}</p>,
     ul: ({ children }) => (

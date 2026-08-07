@@ -1,122 +1,222 @@
 # Documentation
 
-Everything llms-text does, in one page.
+llms-text generates an `llms.txt` file for a website.
 
 {/* This page describes what the product DOES, in the present tense. It deliberately does not
     describe build state — no "not built yet", no "coming soon", no naming of milestones. A
     public page written against a roadmap goes stale the moment an unrelated change merges,
     and nobody remembers to come back and fix it. Describe a capability and the sentence stays
     true or gets edited by the change that alters the behaviour, which is the only edit anyone
-    will reliably make. */}
+    will reliably make.
 
-> **What a run produces.** A run fetches the URL you give it and writes an `llms.txt` that
-> lists what it fetched. It does not follow links to the rest of the site, and the file is a
-> plain listing rather than a written summary — useful as a starting point, not as something
-> to publish unedited.
+    Every number on this page is read from the code that enforces it, not from memory. The
+    caps in "Limits" are `Settings` defaults in backend/app/core/settings.py; the retry ladder
+    is backend/app/worker/policy.py. A cap changed there is wrong here until someone edits
+    both.
 
-## What is llms.txt
+    One section states a condition rather than a flat behaviour. "Summarize" is gated by
+    `CRAWL_ENRICH_WITH_LLM`, which is `false` in the deployed service — so the sentence that
+    would read best ("Claude Haiku 4.5 writes a title for every page") is not true of this
+    site today. The stage is described with its condition instead. That is a fact about
+    configuration, not a roadmap note. */}
 
-`llms.txt` is a small Markdown file a website publishes at its root — `example.com/llms.txt` —
-that tells a large language model what the site is and which of its pages are worth reading.
-The convention is described at [llmstxt.org](https://llmstxt.org).
+`llms.txt` is a Markdown file a site publishes at its root — `example.com/llms.txt`. It names
+the site and lists the pages worth reading. The convention is defined at
+[llmstxt.org](https://llmstxt.org).
 
-The problem it solves is that a model reading a site through a browser or a crawler gets
-navigation, cookie banners, footers and duplicated boilerplate along with the content, and has
-to guess what matters. A hand-written index of the pages that do matter is smaller, cheaper to
-read, and says what the site's author would have said if asked.
+A model reading a site through a crawler receives navigation, cookie banners, footers and
+duplicated boilerplate alongside the content. An index of the pages that carry the content is
+smaller and faster to read.
 
-llms-text writes a first draft of that file for you. Point it at a URL and it fetches that
-page and writes an `llms.txt` naming what it found. Turning that draft into the curated index
-above — deciding which of a site's pages carry the content, and describing them — is still
-yours to do.
+> **What a run produces.** A run discovers a site's URLs and fetches up to 100 pages. It
+> writes two files: `llms.txt`, an index, and `llms-full.txt`, the page text. A run writes a
+> listing. Review it before publishing.
+
+A run passes through seven stages. Each stage is described below, in the order it executes.
+
+## Input
+
+A website record holds one seed URL. The URL is absolute, `http` or `https`, and at most 2,048
+characters. Its host is at most 253 characters.
+
+A URL carrying credentials (`user:pass@host`) is rejected. A leading `www.` is preserved, so
+`www.example.com` and `example.com` are separate records. One account holds one record per
+origin. Two accounts can each hold a record for the same origin.
+
+## Discovery
+
+Discovery collects candidate URLs from the site itself. It reads four sources in order:
+
+1. `/sitemap.xml`
+2. `/sitemap_index.xml`
+3. Every `Sitemap:` line in `/robots.txt`
+4. The `<a href>` links on the seed page
+
+The first source returning at least one same-origin URL wins. Source 4 runs only when the
+first three return nothing, and it reads the seed page alone — no second level, no recursion.
+It keeps same-origin links and stops at 10,000.
+
+Discovery fetches at most 5 sitemap documents and accepts at most 50,000 URLs. It spends at
+most 25% of the run's byte budget, which is 12.5 MiB. It reads `<loc>`, `<lastmod>` and
+`<priority>`, and follows a sitemap index one level down. A document containing a `<!DOCTYPE`
+declaration is refused before parsing.
+
+Every other `robots.txt` directive is ignored. A failure at any source is logged and skipped.
+Discovery returns an empty list on total failure, and the run continues with the seed page
+alone.
+
+## Selection
+
+Selection turns discovered URLs into the fetch list. It normalizes each URL, drops URLs by
+rule, scores the survivors, sorts them, and caps the result.
+
+Eleven drop rules apply in a fixed order: unparseable, duplicate, seed, off-origin, dated
+archive, taxonomy, pagination, feed, changelog, localized duplicate, and over-limit. A dated
+archive is a path segment holding a year from 1990 to 2099. A taxonomy path contains a segment
+such as `tag`, `category` or `author`. A localized duplicate sits under a locale prefix whose
+unprefixed form ranked higher and was already selected.
+
+Scoring starts at zero. The site root adds 6.0. A path segment such as `docs`, `guide`,
+`reference` or `api` adds 4.0. Each path segment subtracts 1.0. A sitemap `priority` moves the
+score by up to ±1.0. A `lastmod` moves it by up to ±0.2, measured against the other URLs in
+the same run. Equal scores break on the URL string, so a repeat run of an unchanged site
+selects the same pages.
+
+## Fetch
+
+Fetching runs under six caps: 100 pages, 5 minutes, 50 MiB, 10 seconds per request, 5
+concurrent requests, and 200 ms between requests.
+
+Every URL passes an SSRF check before a socket opens. The check requires an `http` or `https`
+scheme, port 80 or 443, and no embedded credentials. It resolves the host and refuses the URL
+when any resolved address is private, loopback, link-local, multicast, reserved, or a cloud
+metadata address. It resolves the host once and connects to that address. One resolution
+closes the window in which a name changes between the check and the connection.
+
+Redirects are followed for up to 5 hops. Every hop is checked again before it is followed. A
+redirect from `https` to `http` is refused. Response bodies are counted against the byte
+budget as they stream, so a declared `Content-Length` is never trusted.
+
+## Extract
+
+trafilatura parses each fetched page's HTML. It returns the main content as Markdown —
+headings, prose, lists, tables and code blocks. Navigation, headers, footers and cookie
+banners are discarded.
+
+The title comes from JSON-LD, then `og:title`, then a lone `<h1>`, then `<title>`. The
+description comes from the page's meta description. Either can be absent.
+
+A page whose extracted body is under 200 characters is marked empty. Empty pages are omitted
+from `llms.txt`.
+
+## Summarize
+
+A configuration flag gates this stage. The deployed service sets `CRAWL_ENRICH_WITH_LLM` to
+`false`, so the stage is inactive. Each page keeps the title and description that extraction
+produced, and a run completes without calling a model.
+
+Where the flag is `true`, each page's first 4,000 characters go to Claude Haiku 4.5. The model
+returns a 3–4 word title and a 9–10 word description for that page. Ten requests run at a
+time, under 15 seconds per request and 90 seconds for the stage. A page whose request fails
+keeps its extracted title and description. The archived page data keeps the extracted values
+under either setting.
+
+## Output
+
+A run writes two files.
+
+`llms.txt` is the index. It opens with one `#` heading naming the site and one blockquote
+counting the pages. Each following `##` section holds one `- [title](url): description` line
+per page. Sections run `Docs`, `Guide`, `API`, `Reference`, then the remaining groups
+alphabetically, then `Other`.
+
+`llms-full.txt` holds the same pages in the same order, each followed by its full Markdown. A
+page is trimmed at 50 KiB. The document is trimmed at 5 MiB, always at a page boundary. A
+trimmed file records the trim on its last line.
+
+Both files are on a finished run's **Output** tab, with line numbers, a **Copy** button and a
+**Download** button. A download is named after the site — `llms-example-com.txt` for
+`https://example.com` — so saving several of them overwrites nothing. Rename the file to
+`llms.txt` and publish it at the site's root, where it answers as plain text at
+`https://example.com/llms.txt`. Where the file goes depends on the host: a `public/` or
+`static/` directory for most frameworks, the site root for anything served from disk.
+
+Runs are retained. Open an older run from the **Runs** tab to read the file it produced.
 
 ## Adding a site
 
-Paste a URL into the box on the [home page](/) and press Enter. It has to be an absolute
-`http://` or `https://` URL — `https://example.com`, not `example.com`.
+The field on the [home page](/) takes an absolute URL. The URL carries its scheme:
+`https://example.com`. Pressing Enter sends two requests: one registers the website, one
+starts its first run.
 
-That does two things: it registers the site, and it starts the first crawl immediately. You
-land on the site's page with a run already showing as **pending**, and the page updates itself
-as the run progresses — there is nothing to refresh and nothing else to press.
+The browser then opens the site's page with a run showing as **pending**. That page updates
+itself as the run progresses. Nothing needs refreshing.
 
-Pasting a URL you have already added takes you straight to it rather than reporting an error.
-Two people can each add the same site; one person cannot add it twice.
+Submitting a URL the account already holds opens that site. The **Run now** button on a site's
+page starts another run at any time.
 
-## Manual vs scheduled runs
+## Schedules
 
-A **run** is one crawl of one site. A run is either manual or scheduled, and both produce the
-same thing.
+A schedule repeats a run without a person pressing anything. A website carries at most one
+schedule, set through `PUT /websites/{id}/schedule`. Four intervals are available: hourly,
+every 6 hours, daily, and weekly.
 
-**Manual.** The **Run now** button on a site's page starts a run, and adding a site starts one
-too. Use it after you have changed the site and want the file regenerated.
+A scheduler tick runs every 60 seconds and claims up to 50 due schedules. Each fire time after
+the first is offset by up to ±5% of the interval. That is about ±3 minutes on an hourly
+schedule and ±72 minutes on a daily one. The offset keeps sites added in one sitting from
+crawling in the same second forever.
 
-**Scheduled.** A schedule repeats a run on its own, at one of four intervals — these are the
-only four:
-
-- **Hourly** — a site that changes through the day: a changelog, a status page.
-- **Every 6 hours** — an active documentation site.
-- **Daily** — most sites.
-- **Weekly** — a site that rarely changes: a marketing site, a personal page.
-
-A site has at most one schedule, set through `PUT /websites/{id}/schedule` — see **API** at
-the end of this page. After the first one, fire times are not exact: each is nudged by up to
-±5% — about ±3 minutes on an hourly schedule, ±72 on a daily one — so that a batch of sites
-added in the same sitting does not settle into crawling in the same second forever. A schedule
-can be switched off without being deleted, and its run history outlives it.
-
-## Reading the output
-
-A finished run's `llms.txt` is on the site's **Output** tab, with line numbers, a **Copy**
-button and a **Download** button. The download is named after the site — `llms-example-com.txt`
-for `https://example.com` — so that saving several of them does not overwrite one file; rename
-it to `llms.txt` when you publish it.
-
-Publish it at the root of your site, so it answers at `https://your-site.com/llms.txt` as
-plain text. Where the file goes depends on your host — a `public/` or `static/` directory for
-most frameworks, the site root for anything served from disk. As the note at the top says,
-what a run writes is a listing rather than a curated index, so read it before you publish it.
-
-Runs are kept, so you can open an older one from the **Runs** tab and see what the file looked
-like before a change.
+A schedule can be switched off without being deleted. Its run history outlives it.
 
 ## Limits
 
-Every crawl runs inside fixed caps, and there are two per-account caps on top of them. They
-are listed here so nobody has to discover one by hitting it.
+Every run executes inside fixed caps, and two more caps apply per account. They are listed
+here so nobody discovers one by hitting it.
 
-**Per crawl**
+**Per run**
 
-- **100 pages** — the most a single run will fetch.
-- **50 MiB** — the total downloaded across the whole run (52,428,800 bytes).
-- **3 minutes** — how long a run gets. The crawler's own budget is 5 minutes, but the job
-  runner stops a job at 3, so 3 is the number that actually bites.
+- **100 pages** — the most a single run fetches.
+- **50 MiB** — the total downloaded across the run (52,428,800 bytes), counted across
+  discovery and fetching together.
+- **5 minutes** — the crawler's wall clock. The job runner stops a job at 10 minutes.
 
-The page and size caps are budgets, not errors: reaching one part-way through a crawl ends the
-run with whatever it already collected, so a big site gives you a partial file rather than no
-file.
+The page and byte caps are budgets. Reaching one part-way through ends the run with the pages
+already collected, so a large site yields a partial file and a `completed` run.
 
-Two cases have nothing to salvage and so fail the run outright — when the very first page
-cannot be fetched, and when that page is itself over the size cap, which reports "The site's
-response was too large." The time limit is blunt in the same way: a run stopped at 3 minutes is
-cut off mid-flight rather than wrapped up neatly.
+Two cases fail a run outright. The first is a seed page that cannot be fetched. The second is
+a seed page over the byte cap, which reports "The site's response was too large." A run
+stopped at 5 minutes is cut off mid-flight.
+
+A run gets 3 attempts when it fails on a request timeout, a transport error, or a storage
+upload failure. The two retries wait 10 seconds and 60 seconds. Every other failure is
+permanent and ends the run at the first attempt.
 
 **Per account**
 
-- **2 concurrent runs** — you can have two manual runs in flight at once. A third has to wait
-  for one of them to finish.
-- **50 runs per day** — across a rolling 24 hours, counting manual and scheduled runs
-  together. Reaching it refuses further **manual** runs; a schedule keeps firing, so a busy
-  schedule can spend the budget a manual run would then be refused for.
+- **2 concurrent manual runs** — a third waits for one of them to finish.
+- **50 runs per rolling 24 hours** — counting manual and scheduled runs together.
 
-Going over either one is answered immediately, with a message naming the cap you hit. The
-daily cap also says when it resets; the concurrent one does not, because "when a run you are
-already waiting on finishes" is not a time anybody can predict. Nothing is queued behind a cap
-and nothing is silently dropped.
+Exceeding either cap is answered immediately with a message naming the cap. The daily cap also
+reports when it resets. The concurrent cap reports no time, because it clears when a run
+already in flight finishes. The daily cap refuses further manual runs while schedules keep
+firing. A busy schedule can therefore spend a budget a manual run is then refused for. Nothing
+is queued behind a cap and nothing is silently dropped.
 
 ## API
 
-llms-text is a FastAPI service, and it publishes its own interactive OpenAPI documentation —
-every endpoint, every request and response shape, generated from the code that serves them.
+llms-text is a FastAPI service. It publishes interactive OpenAPI documentation generated from
+the code that serves each endpoint.
+
+Every endpoint requires a Supabase JWT in an `Authorization: Bearer` header. Read endpoints
+are unscoped: a signed-in caller reads every website and every run. Write endpoints check
+ownership and answer `403` to anyone else.
+
+Two endpoints return a run's files as plain text:
+
+- `GET /runs/{id}/llms.txt`
+- `GET /runs/{id}/llms-full.txt`
+
+Each answers `404` while the run is pending, processing, or failed.
 
 {/* A hyperlink a reader clicks, not a request this application makes. ARCHITECTURE.md §8.1
     ("the browser never calls Fly") is about how this app fetches data — which is always

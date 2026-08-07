@@ -33,6 +33,23 @@
  *      opacity 0 fails instead of shipping a blank page.
  *   9. No uncaught exception, no console error, no same-origin response >= 400.
  *
+ * Then `/docs`, whose diagram is wired to its prose by string ids that no compiler checks:
+ *
+ *  10. Every id in `lib/docs/sections.ts` resolves to an `h2` on the rendered page. This is
+ *      the gate the diagram cannot live without. `rehype-slug` derives each heading's id
+ *      from its *text*, so renaming `## Fetch` silently turns one diagram node into a
+ *      button that scrolls nowhere — `tsc`, eslint and `next build` all pass on it. The
+ *      check reads the ids off the rendered nodes rather than parsing the TypeScript, so it
+ *      tests the actual relationship between the two columns.
+ *  11. Seven nodes and six beams, and every beam's path endpoints land on the centres of the
+ *      two nodes it connects. A beam measured before webfonts settle lands wrong, which is
+ *      invisible to every gate above this one and to a hot reload.
+ *  12. Clicking each of the seven nodes scrolls its heading to the top of the viewport. All
+ *      seven, because six working nodes and one dead one is the failure worth catching.
+ *  13. Under `prefers-reduced-motion: reduce` the beams drop their animated gradient. (That
+ *      is the media feature this repository allows; `prefers-color-scheme` is the banned
+ *      one, and assertion 7 above covers it.)
+ *
  * USAGE
  *
  *     npm run build && npm run smoke        # starts `next start` itself
@@ -233,6 +250,190 @@ async function probePage() {
   };
 }
 
+/**
+ * Everything measured on `/docs`: the diagram's nodes, its beams, and whether each node's id
+ * resolves to a heading in the prose column.
+ *
+ * The beams are selected as *direct* `<svg>` children of the diagram container — the seven
+ * icons are `<svg>` too, but they are nested inside the buttons.
+ */
+function probeDocs() {
+  const container = document.querySelector("[data-docs-diagram]");
+  if (!container) return { container: false };
+
+  const containerRect = container.getBoundingClientRect();
+  const nodes = [...container.querySelectorAll("[data-docs-node]")].map((button) => {
+    const rect = button.getBoundingClientRect();
+    const heading = document.getElementById(button.dataset.docsNode);
+    return {
+      id: button.dataset.docsNode,
+      // The accessible name is the button's own text (visible label + an sr-only
+      // continuation), never an aria-label — see `description` in lib/docs/sections.ts.
+      name: (button.textContent ?? "").trim(),
+      centerX: rect.left - containerRect.left + rect.width / 2,
+      centerY: rect.top - containerRect.top + rect.height / 2,
+      headingTag: heading?.tagName ?? null,
+    };
+  });
+
+  const beams = [...container.querySelectorAll(":scope > svg")].map((svg) => ({
+    d: svg.querySelector("path")?.getAttribute("d") ?? "",
+    // The animated beam draws a second path plus a <linearGradient>; the static one does not.
+    gradients: svg.querySelectorAll("linearGradient").length,
+  }));
+
+  return { container: true, nodes, beams };
+}
+
+/** `M x,y Q cx,cy ex,ey` → its endpoints, or null when the path never got measured. */
+function beamEndpoints(d) {
+  const match = d.match(/M ([\d.-]+),([\d.-]+) Q [\d.-]+,[\d.-]+ ([\d.-]+),([\d.-]+)/);
+  if (!match) return null;
+  return { startX: +match[1], startY: +match[2], endX: +match[3], endY: +match[4] };
+}
+
+/** Assertions 10-13. */
+async function checkDocs(page) {
+  const response = await page.goto(`${BASE_URL}/docs`, { waitUntil: "load" });
+  check(response?.status() === 200, "GET /docs returns 200", `got ${response?.status()}`);
+
+  // The gotcha this whole section exists for: a beam measured before the font swap lands a
+  // few pixels off, and the swap has not happened yet on a cold load.
+  await page.evaluate(() => document.fonts.ready);
+  await page.waitForFunction(
+    () => {
+      const container = document.querySelector("[data-docs-diagram]");
+      const svg = container?.querySelector(":scope > svg path");
+      return Boolean(svg?.getAttribute("d"));
+    },
+    { timeout: 10_000 },
+  ).catch(() => {
+    // Reported by the assertions below, with the measurements attached.
+  });
+
+  const docs = await page.evaluate(probeDocs);
+  if (!docs.container) {
+    check(false, "the /docs diagram renders", "no [data-docs-diagram] in the document");
+    return;
+  }
+
+  check(docs.nodes.length === 7, "/docs renders seven diagram nodes", `got ${docs.nodes.length}`);
+  check(docs.beams.length === 6, "/docs renders six beams", `got ${docs.beams.length}`);
+
+  // THE ANCHOR GATE. A renamed heading fails here and nowhere else.
+  const dead = docs.nodes.filter((node) => node.headingTag !== "H2");
+  check(
+    dead.length === 0 && docs.nodes.length > 0,
+    "every diagram node id resolves to an h2 heading",
+    dead.length > 0
+      ? `no <h2 id> for: ${dead.map((node) => node.id).join(", ")} — a heading in ` +
+          "app/docs/page.mdx was renamed, or lib/docs/sections.ts names an id that " +
+          "rehype-slug never generated"
+      : "the diagram rendered no nodes at all",
+  );
+
+  check(
+    // `.length > 0` is not redundant: `.every()` on an empty array is vacuously true, so a
+    // diagram that rendered no nodes at all would pass this assertion on its way past.
+    docs.nodes.length > 0 && docs.nodes.every((node) => (node.name ?? "").length > 0),
+    "every diagram node has an accessible name",
+    docs.nodes
+      .filter((node) => !(node.name ?? "").length)
+      .map((node) => node.id)
+      .join(", "),
+  );
+
+  const misaligned = docs.beams
+    .map((beam, index) => {
+      const points = beamEndpoints(beam.d);
+      const from = docs.nodes[index];
+      const to = docs.nodes[index + 1];
+      if (!points || !from || !to) return `beam ${index}: unmeasured (d="${beam.d}")`;
+      const drift = Math.max(
+        Math.abs(points.startX - from.centerX),
+        Math.abs(points.startY - from.centerY),
+        Math.abs(points.endX - to.centerX),
+        Math.abs(points.endY - to.centerY),
+      );
+      // One pixel of slack for sub-pixel layout; a beam measured before the font swap is
+      // out by far more than that.
+      return drift <= 1 ? null : `${from.id}→${to.id} out by ${drift.toFixed(1)}px`;
+    })
+    .filter(Boolean);
+  check(
+    misaligned.length === 0,
+    "every beam lands on the centres of the nodes it connects",
+    misaligned.join(", "),
+  );
+
+  // Click → scroll, all seven. Reduced motion is emulated so the scroll is instant and the
+  // step needs no sleeping; it also proves the beams go static, which is assertion 13.
+  // Both features in one call, deliberately. `Emulation.setEmulatedMedia` *replaces* the
+  // override list rather than merging into it, so naming only reduced-motion here would
+  // silently drop the `prefers-color-scheme: light` override set earlier and hand the rest
+  // of the run whatever the CI runner's real OS preference is.
+  await page.emulateMediaFeatures([
+    { name: "prefers-color-scheme", value: "light" },
+    { name: "prefers-reduced-motion", value: "reduce" },
+  ]);
+  await page.reload({ waitUntil: "load" });
+  await page.evaluate(() => document.fonts.ready);
+
+  const notScrolled = [];
+  for (const node of docs.nodes) {
+    const landed = await page.evaluate(async (id) => {
+      window.scrollTo(0, 0);
+      const button = document.querySelector(`[data-docs-node="${id}"]`);
+      if (!button) return { clicked: false };
+      button.click();
+      // `behavior: "auto"` under reduced motion, so one frame is enough.
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      const heading = document.getElementById(id);
+      return { clicked: true, top: heading?.getBoundingClientRect().top ?? null };
+    }, node.id);
+    // Headings carry scroll-mt-24 (96px), so a scrolled-to heading sits just below it.
+    if (!landed.clicked || landed.top === null || landed.top < 0 || landed.top > 160) {
+      notScrolled.push(`${node.id} (heading top ${landed.top})`);
+    }
+  }
+  check(
+    notScrolled.length === 0,
+    "clicking each of the seven nodes scrolls to its section",
+    notScrolled.join(", "),
+  );
+
+  // Scroll → highlight. The click loop above proves the anchors resolve; this proves the
+  // observer in lib/docs/use-active-section.ts actually engages. Without it, a hook that
+  // silently never sets an active section (its headings missing at effect time, say) would
+  // leave every assertion here green and the diagram permanently unlit.
+  const unlit = [];
+  for (const node of docs.nodes) {
+    const active = await page.evaluate(async (id) => {
+      document.getElementById(id)?.scrollIntoView({ behavior: "auto", block: "start" });
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      return document.querySelector("[data-docs-node][data-active]")?.dataset.docsNode ?? null;
+    }, node.id);
+    if (active !== node.id) unlit.push(`${node.id} lit ${active}`);
+  }
+  check(
+    unlit.length === 0,
+    "scrolling to a section highlights its node",
+    unlit.join(", "),
+  );
+
+  const reduced = await page.evaluate(probeDocs);
+  check(
+    reduced.beams.length === 6 && reduced.beams.every((beam) => beam.gradients === 0),
+    "beams are static under prefers-reduced-motion: reduce",
+    JSON.stringify(reduced.beams.map((beam) => beam.gradients)),
+  );
+  await page.emulateMediaFeatures([
+    { name: "prefers-color-scheme", value: "light" },
+    { name: "prefers-reduced-motion", value: "no-preference" },
+  ]);
+}
+
 async function main() {
   const executablePath = findChrome();
   console.log(`chrome: ${executablePath}`);
@@ -362,6 +563,10 @@ async function main() {
       JSON.stringify(probe.heading),
     );
     check(probe.textLength > 0, "the page renders text", `innerText length ${probe.textLength}`);
+
+    // `/docs` — the diagram, its anchors, and its beams. Runs on the same page object, so
+    // the console and response listeners above cover it too.
+    await checkDocs(page);
 
     check(consoleErrors.length === 0, "no console errors", consoleErrors.join(" | "));
     check(badResponses.length === 0, "every same-origin asset loads", badResponses.join(" | "));

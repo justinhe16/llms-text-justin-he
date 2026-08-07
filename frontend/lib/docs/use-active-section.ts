@@ -1,0 +1,99 @@
+"use client";
+
+// Which /docs section the reader is currently looking at.
+//
+// One `IntersectionObserver`, one hook — the diagram calls this and styles the matching
+// node; nothing else on the page needs to know. It lives here rather than in
+// `components/docs/` for the reason ARCHITECTURE.md §8.4 gives: "anything in `lib/<feature>/`
+// should be readable without knowing what the screen looks like", and this is a function of
+// scroll position and a list of ids.
+
+import { useEffect, useState } from "react";
+
+/**
+ * How far below the top of the viewport a heading counts as "the one being read", in
+ * pixels. A heading is active from the moment it crosses this line going up, until the next
+ * heading does.
+ *
+ * Deliberately 16px *below* the `scroll-mt-24` (96px) that `mdx-components.tsx` sets on every
+ * heading. Clicking a diagram node lands its heading at 96px; 96 < 112 means the node you
+ * clicked is unambiguously active once the scroll settles. Setting the two equal would put
+ * the heading exactly on the boundary, where a smooth scroll settling a fraction of a pixel
+ * short leaves the node unlit. If you change either number, keep the inequality this way
+ * round.
+ */
+const ACTIVE_LINE_PX = 112;
+
+/**
+ * The id of the section currently under `ACTIVE_LINE_PX`, or the first id before the reader
+ * has scrolled past anything.
+ *
+ * ## Why the observer does not decide this on its own
+ *
+ * An `IntersectionObserver` reports *transitions*, and the obvious encoding — "active means
+ * intersecting a thin band at the top" — breaks at both ends of the page. The first heading
+ * is above the band before any scrolling happens, and the last heading never reaches it when
+ * the final section is shorter than the viewport. Either case leaves no node highlighted.
+ *
+ * So the observer is used only as a cheap "something crossed the line" signal, and the
+ * answer is recomputed from live rects: the last heading whose top is at or above the line
+ * wins, falling back to the first id. That is correct at both ends by construction, and it
+ * costs one `getBoundingClientRect()` per heading on a callback that fires a handful of
+ * times per page.
+ *
+ * @param ids Heading ids in document order — `DOCS_SECTIONS.map(s => s.id)`.
+ * @returns The active id, or `null` until the first measurement lands.
+ */
+export function useActiveSection(ids: readonly string[]): string | null {
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  // `ids` is a new array on every render at most call sites, so the effect keys on its
+  // contents rather than its identity. The list is seven short strings and static in
+  // practice; this just stops a re-render from tearing down the observer.
+  //
+  // A comma is a safe delimiter because these are `github-slugger` slugs, and that slugger
+  // strips every punctuation character including this one — so no id can contain the
+  // separator and the round trip below is lossless.
+  const key = ids.join(",");
+
+  useEffect(() => {
+    const sectionIds = key.split(",").filter(Boolean);
+    const headings = sectionIds
+      .map((id) => document.getElementById(id))
+      .filter((element): element is HTMLElement => element !== null);
+
+    if (headings.length === 0) return;
+
+    const recompute = () => {
+      let current = headings[0].id;
+      for (const heading of headings) {
+        if (heading.getBoundingClientRect().top <= ACTIVE_LINE_PX) {
+          current = heading.id;
+        }
+      }
+      setActiveId(current);
+    };
+
+    // Bottom margin pulls the root's lower edge up past the fold so that a heading entering
+    // the top of the viewport is a transition worth waking up for, while one still far down
+    // the page is not. The callback recomputes from rects regardless of which entries it
+    // was handed, so this margin only tunes how often it runs.
+    const observer = new IntersectionObserver(recompute, {
+      rootMargin: `-${ACTIVE_LINE_PX}px 0px -55% 0px`,
+      threshold: [0, 1],
+    });
+    for (const heading of headings) observer.observe(heading);
+
+    // Resizing moves every heading without crossing an observer threshold, and the initial
+    // call covers a page loaded at a restored scroll position.
+    window.addEventListener("resize", recompute);
+    recompute();
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", recompute);
+    };
+  }, [key]);
+
+  return activeId;
+}
