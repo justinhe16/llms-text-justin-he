@@ -6,13 +6,16 @@ touches the database. `trafilatura.extract` parses a string that is already in m
 never fetches the URL it is handed, which is only used to resolve relative links found in
 the document.
 
-**Nothing calls this yet, and that is deliberate.** Wiring extraction into `CrawledPage` and
-the crawl loop is its own ticket (PER-177). This module lands unwired so that the extractor
-can be reviewed and tested as a pure function against real fixtures, rather than as a
-behaviour change buried inside the fetch path. Landing it separately is also what keeps the
+**`internals/fetcher.py`'s `fetch_page` is the only caller** — one `extract_content` call per
+fetched page whose `Content-Type` looks like HTML, its result copied straight onto
+`CrawledPage` (PER-177). This module deliberately landed *unwired* one ticket earlier
+(PER-173), so that the extractor could be reviewed and tested as a pure function against real
+fixtures rather than as a behaviour change buried inside the fetch path; that ordering is
+history now, not a description of the present. What has not changed is what keeps the
 `generate_llms_txt` seam (`internals/llms_txt.py`, ARCHITECTURE.md §3.4, CLAUDE.md #9)
 honest: this module parses a page, and it stops there. It ranks nothing, summarizes nothing,
-and calls no model.
+and calls no model. Being called from the fetch path does not widen that remit — extraction
+feeds the seam's input type, it is not the seam.
 
 **Why trafilatura rather than hand-rolled rules.** Its own evaluation puts it at F1 0.958
 against Mozilla Readability (0.947), newspaper4k (0.949) and goose3 (0.896), and the
@@ -50,8 +53,13 @@ A single-page app served as an empty mount div (`<div id="root"></div>` plus a b
 indistinguishable, to an HTTP fetch, from a page with nothing on it — the content only exists
 after a browser runs the JavaScript. Whether it is worth paying for a headless browser to
 render those pages is a real decision with a real cost, and this constant exists to *measure*
-how often it would matter, not to make that decision. Nothing in this milestone branches on
-`is_empty` beyond counting it (PER-176) and, later, declining to list a page with no content.
+how often it would matter, not to make that decision. That counting is implemented: every run
+records how many of its fetched pages came back empty as `runs.stats["pages_empty_content"]`
+(`internals/crawler.py`, at `RUN_STATS_VERSION` 2 — PER-177). Nothing branches on `is_empty`
+beyond counting it, and — later — declining to list a page with no content. In particular,
+`CrawledPage.title` is never nulled because a page is empty: a JavaScript shell is real HTML
+with a real `<title>`, which is exactly why `extract_content` below reads metadata even when
+the body came back empty.
 
 200 characters, and deliberately generous. The strings these shells actually ship are short —
 "You need to enable JavaScript to run this app." is 46 characters, and the longest common

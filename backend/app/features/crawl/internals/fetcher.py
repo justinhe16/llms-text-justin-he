@@ -150,8 +150,14 @@ def _looks_like_html(response: httpx.Response) -> bool:
     lowercased, so `text/html; charset=utf-8` and `TEXT/HTML` both match `text/html` — and
     returns `True` for that and `application/xhtml+xml`, `False` for any other explicit media
     type (`application/json`, `application/pdf`, `text/plain`, ...), and, deliberately,
-    **`True`** when the header is missing or carries nothing this function can parse as a
-    media type at all.
+    **`True`** when the response declares no media type at all — the header absent entirely,
+    empty, whitespace, or nothing but parameters (`; charset=utf-8`).
+
+    "Declares no media type" is meant literally, and is narrower than "unparseable": a header
+    with a non-empty value that is merely *malformed* (`Content-Type: garbage`, no `/`) takes
+    the `False` branch, because it still constitutes the server saying something about the
+    body, and nothing it could be saying is `text/html`. Only the genuinely absent declaration
+    gets the benefit of the doubt below.
 
     That last case is a considered choice, not an oversight, and the conservative-sounding
     alternative — treat "no header" as "not HTML" — was rejected because it is actually the

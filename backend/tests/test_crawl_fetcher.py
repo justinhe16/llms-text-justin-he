@@ -20,6 +20,7 @@ from app.features.crawl.internals.fetcher import (
     ByteBudget,
     ByteBudgetExceededError,
     FetchError,
+    _looks_like_html,
     fetch_page,
 )
 from app.features.crawl.internals.ssrf import Resolver, SsrfBlockedError
@@ -345,3 +346,46 @@ async def test_a_non_html_response_is_a_successful_fetch_with_nothing_extracted(
     assert page.description is None
     assert page.markdown == ""
     assert page.is_empty is True
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        # Declared HTML, in the shapes real servers actually send it.
+        ("text/html", True),
+        ("text/html; charset=utf-8", True),
+        ("TEXT/HTML; CHARSET=UTF-8", True),
+        ("  text/html  ", True),
+        ("application/xhtml+xml", True),
+        ("application/xhtml+xml; charset=utf-8", True),
+        # An explicit non-HTML declaration is a real assertion, and is honored.
+        ("application/json", False),
+        ("application/pdf", False),
+        ("text/plain; charset=utf-8", False),
+        ("text/xml", False),
+        ("image/png", False),
+        # No media type declared at all — the permissive path.
+        (None, True),
+        ("", True),
+        ("   ", True),
+        ("; charset=utf-8", True),
+        # Malformed but non-empty is NOT "no declaration": the server said something, and
+        # nothing it said was `text/html`. See `_looks_like_html`'s docstring on why this is
+        # narrower than "unparseable".
+        ("garbage", False),
+    ],
+)
+def test_looks_like_html_classifies_content_types(content_type: str | None, expected: bool) -> None:
+    """Every branch of `_looks_like_html`, asserted directly rather than through `fetch_page`.
+
+    The permissive-on-no-declaration rows are the ones worth the parametrization: they are a
+    deliberate design decision (see the function's own docstring — an absent `Content-Type` is
+    not an assertion that the body is not HTML), and a future edit that "tightened" them into
+    returning `False` would silently start counting real HTML pages as empty in
+    `runs.stats["pages_empty_content"]`, which is exactly the measurement that counter exists
+    to keep honest.
+    """
+    headers = {} if content_type is None else {"Content-Type": content_type}
+    response = httpx.Response(200, headers=headers, content=b"<html></html>")
+
+    assert _looks_like_html(response) is expected

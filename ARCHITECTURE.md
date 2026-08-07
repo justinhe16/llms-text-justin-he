@@ -1245,11 +1245,14 @@ Deliberately not decided here, and not to be decided by accident in an implement
 
 - **The crawler pipeline design.** That milestone has not been designed. Until it is,
   everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Two pieces have landed,
-  both pure and both called by nothing (§3.4): `internals/extract.py`, which turns one
-  page's HTML into text, and `internals/url_ranking.py`, which decides which discovered URLs
-  are worth fetching at all. Together they still do not constitute a design for the rest —
-  how *fetched* pages are ranked, what a generated artifact selects and summarizes, and
-  whether a model is involved at all are all still open.
+  both pure (§3.4): `internals/extract.py`, which turns one page's HTML into a title, a
+  description and a markdown body, and `internals/url_ranking.py`, which decides which
+  discovered URLs are worth fetching at all. The first is now **wired** — `internals/
+  fetcher.py` runs every HTML response through it, so a `CrawledPage` arrives at the seam
+  already parsed; the second is still called by nothing. Neither changes what remains
+  undecided, because both sit *upstream* of the seam: how *fetched* pages are ranked, what a
+  generated artifact selects and summarizes, and whether a model is involved at all are all
+  still open.
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**
