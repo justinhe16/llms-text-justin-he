@@ -229,25 +229,55 @@ def test_duplicate_metadata_is_merged_order_independently() -> None:
     in the one place this module promises the opposite.
     """
     later = _dt(20)
+    # `/docs/deploy` is the rival deliberately: it sorts BEFORE `/docs/intro`, so the
+    # `(-score, url)` tie-break cannot rescue a failed merge. An alphabetically later
+    # rival makes this test vacuous — pre-fix, the reversed input scores both at 0.0 and
+    # the tie-break alone reproduces the expected order, proving nothing.
     split_across_two = [
         _url(f"{SEED}/docs/intro", priority=0.9),
         _url(f"{SEED}/docs/intro", lastmod=later, source="links"),
-        _url(f"{SEED}/guide/deploy", priority=0.5, lastmod=later),
+        _url(f"{SEED}/docs/deploy", priority=0.7),
     ]
     both_on_one = [
         _url(f"{SEED}/docs/intro", priority=0.9, lastmod=later),
-        _url(f"{SEED}/guide/deploy", priority=0.5, lastmod=later),
+        _url(f"{SEED}/docs/deploy", priority=0.7),
     ]
 
-    forward = select_urls(split_across_two, seed_url=SEED, limit=2)
-    reversed_ = select_urls(list(reversed(split_across_two)), seed_url=SEED, limit=2)
-    merged = select_urls(both_on_one, seed_url=SEED, limit=2)
+    # `limit=1` so a dropped merge changes which URL is *selected*, not merely its rank.
+    forward = select_urls(split_across_two, seed_url=SEED, limit=1)
+    reversed_ = select_urls(list(reversed(split_across_two)), seed_url=SEED, limit=1)
+    merged = select_urls(both_on_one, seed_url=SEED, limit=1)
 
-    assert forward.selected == reversed_.selected
-    # The merge is not merely stable, it is *correct*: the surviving candidate ranks exactly
-    # as if one discovery had carried both fields all along.
-    assert forward.selected == merged.selected
+    # Not merely stable but *correct*: the survivor ranks exactly as if one discovery had
+    # carried both fields all along.
+    assert forward.selected == [f"{SEED}/docs/intro"]
+    assert reversed_.selected == forward.selected
+    assert merged.selected == forward.selected
     assert forward.dropped["duplicate"] == 1
+    _assert_reconciles(forward)
+    _assert_reconciles(reversed_)
+
+
+def test_duplicate_lastmod_is_merged_order_independently() -> None:
+    """The `lastmod` half of the same guarantee, which the `priority` test above cannot
+    reach on its own.
+
+    Three distinct `lastmod` values on purpose: the recency term is normalized between the
+    survivors' earliest and latest, so a candidate set carrying only one distinct date
+    collapses every recency term to `0.0` and would pass without merging anything.
+    """
+    candidates = [
+        _url(f"{SEED}/docs/intro", lastmod=_dt(20)),
+        _url(f"{SEED}/docs/intro", source="links"),  # rediscovered, carrying nothing
+        _url(f"{SEED}/docs/deploy", lastmod=_dt(1)),
+        _url(f"{SEED}/docs/extra", lastmod=_dt(10)),
+    ]
+
+    forward = select_urls(candidates, seed_url=SEED, limit=1)
+    reversed_ = select_urls(list(reversed(candidates)), seed_url=SEED, limit=1)
+
+    assert forward.selected == [f"{SEED}/docs/intro"]
+    assert reversed_.selected == forward.selected
     _assert_reconciles(forward)
     _assert_reconciles(reversed_)
 
@@ -316,7 +346,6 @@ def test_off_origin_comparison_collapses_the_schemes_default_port() -> None:
     [
         pytest.param("https://[2001:db8::1]:8080", "/docs/intro", id="ipv6-with-port"),
         pytest.param("https://[2001:db8::1]", "/docs/intro", id="ipv6-no-port"),
-        pytest.param("https://[::1]:3000", "/es/docs/intro", id="ipv6-locale-stripped"),
     ],
 )
 def test_ipv6_hosts_round_trip_through_normalization_without_corruption(
@@ -324,13 +353,33 @@ def test_ipv6_hosts_round_trip_through_normalization_without_corruption(
 ) -> None:
     """`urlsplit().hostname` strips the brackets from an IPv6 literal, so rebuilding an
     authority as `f"{host}:{port}"` yields `2001:db8::1:8080` — a string that reparses with
-    hostname `2001` and raises on `.port`. `_authority` puts the brackets back. The locale
-    case is here because `_leading_locale_free_url` rebuilds the authority a second time,
-    on a different code path, and an IPv6 host has to survive that one too."""
+    hostname `2001` and raises on `.port`. `_authority` puts the brackets back.
+
+    This covers `_parse_candidate`'s rebuild; the second site has its own test below.
+    """
     result = select_urls([_url(f"{seed}{path}")], seed_url=seed, limit=10)
 
     assert result.selected == [f"{seed}{path}"]
     assert result.dropped == {}
+    _assert_reconciles(result)
+
+
+def test_ipv6_host_survives_the_locale_stripping_authority_rebuild() -> None:
+    """`_leading_locale_free_url` rebuilds the authority a second time, on a separately
+    reached code path that `_parse_candidate`'s own test cannot exercise.
+
+    The delocalized peer has to be present and already selected for a corrupt rebuild to
+    be observable at all: with a lone `/es/...` candidate the delocalized URL is computed,
+    compared against an empty selected-set, and discarded — so the corruption is real but
+    invisible, and a single-candidate test would pass with this site still broken.
+    """
+    seed = "https://[::1]:3000"
+    candidates = [_url(f"{seed}/docs/intro"), _url(f"{seed}/es/docs/intro")]
+
+    result = select_urls(candidates, seed_url=seed, limit=10)
+
+    assert result.selected == [f"{seed}/docs/intro"]
+    assert result.dropped == {"localized_duplicate": 1}
     _assert_reconciles(result)
 
 
@@ -743,3 +792,28 @@ def test_fixture_selection_is_deterministic_across_repeated_calls() -> None:
     second = select_urls(candidates, seed_url=FIXTURE_SEED, limit=40)
 
     assert first == second
+
+
+def test_fixture_selection_is_deterministic_across_shuffles() -> None:
+    """The whole-fixture backstop for the duplicate-metadata merge.
+
+    The fixture carries `/reference/saml` twice — once from the sitemap with `priority=1.0`
+    and no `lastmod`, once rediscovered by link extraction with a `lastmod` and no
+    `priority`, which is precisely the split PER-176 will produce. Without the merge, which
+    copy `select_urls` happens to visit first decides whether that page keeps its priority
+    or its recency, and the selection moves under a shuffle.
+    """
+    candidates = _load_fixture_candidates()
+    baseline = select_urls(candidates, seed_url=FIXTURE_SEED, limit=40)
+
+    # A sweep rather than a couple of hand-picked seeds: against the pre-merge code roughly
+    # 45% of orderings move the selection, so a two-or-three-seed test has a real chance of
+    # picking only stable ones and passing against the very bug it exists to catch. This
+    # range contains several that do move it (5, 8, 10, 12-15).
+    for seed in range(16):
+        shuffled = list(candidates)
+        random.Random(seed).shuffle(shuffled)
+        result = select_urls(shuffled, seed_url=FIXTURE_SEED, limit=40)
+
+        assert result.selected == baseline.selected, f"shuffle seed {seed} moved the selection"
+        assert result.dropped == baseline.dropped, f"shuffle seed {seed} moved the drop counts"

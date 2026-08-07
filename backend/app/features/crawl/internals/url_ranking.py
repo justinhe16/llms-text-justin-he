@@ -525,7 +525,13 @@ def _merge_lastmod(existing: datetime | None, incoming: datetime | None) -> date
     landmine `_to_utc` itself documents — but the value RETURNED is whichever original
     `datetime` won, not a UTC-normalized copy, because `_score` already calls `_to_utc` again
     wherever it reads a `lastmod`; this function does not need to be the only place that
-    normalizes one. Commutative and associative for the same reason `_merge_priority` is.
+    normalizes one.
+
+    Commutative and associative **up to the UTC instant**, which is the only thing any
+    caller reads. Two values naming the same instant with different `tzinfo` are ordered by
+    argument position rather than by value, so `merge(naive, aware)` and `merge(aware, naive)`
+    can return different objects — equal instants, distinct representations. Every consumer
+    re-normalizes through `_to_utc`, so the difference is unobservable in a score.
     """
     if existing is None:
         return incoming

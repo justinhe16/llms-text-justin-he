@@ -2296,5 +2296,11 @@
     "lastmod": "2024-09-11T17:00:00",
     "priority": 1.0,
     "source": "sitemap"
+  },
+  {
+    "url": "https://docs.fictional-cloud.test/reference/saml/",
+    "lastmod": "2025-06-18T00:00:00+00:00",
+    "priority": null,
+    "source": "links"
   }
 ]
