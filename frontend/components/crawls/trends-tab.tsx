@@ -1,12 +1,19 @@
 "use client";
 
 import type { StatsWindow } from "@/lib/api/runs";
-import { outcomeBreakdown, toTrendPoints, windowHasRuns } from "@/lib/crawls/stats-display";
+import {
+  outcomeBreakdown,
+  toTrendPoints,
+  windowHasComparisons,
+  windowHasIndexSizes,
+  windowHasRuns,
+} from "@/lib/crawls/stats-display";
 import { useWebsiteStats } from "@/lib/query/use-website-stats";
 
 import { CrawlsError } from "./crawls-error";
-import { DurationChart, OutcomeChart, PagesChart, TrendsChartsSkeleton } from "./trends-charts";
-import { TrendsStatTiles, TrendsStatTilesSkeleton } from "./trends-stat-tiles";
+import { ChangeChart, IndexSizeChart, OutcomeChart, TrendsChartsSkeleton } from "./trends-charts";
+import { TrendsHealthRow, TrendsOutputTiles, TrendsStatTilesSkeleton } from "./trends-stat-tiles";
+import { TrendsWhatChanged, TrendsWhatChangedSkeleton } from "./trends-what-changed";
 import { TrendsWindowSwitcher } from "./trends-window-switcher";
 
 interface TrendsTabProps {
@@ -36,11 +43,19 @@ interface TrendsTabProps {
 }
 
 /**
- * The Trends tab: four stat tiles and three charts over `GET /websites/{id}/stats`.
+ * The Trends tab: output tiles, three charts, a "what changed" list, and a demoted health
+ * line, over `GET /websites/{id}/stats`.
+ *
+ * **As of PER-193 this tab reports on the ARTIFACT, not on the crawler.** The four primary
+ * tiles (`TrendsOutputTiles`) and the "what changed" panel (`TrendsWhatChanged`) answer "what
+ * does this site's `llms.txt` look like, and what changed in it" — index size, pages added,
+ * removed and changed against the previous completed run. Runs, success rate and duration are
+ * still here, because a broken schedule is still worth knowing about, but they are now one
+ * quiet line (`TrendsHealthRow`) rather than the headline four tiles they used to be.
  *
  * ## Four states, and the one distinction that needs two queries
  *
- * "No runs in the last 30 days" and "this site has never been crawled" want completely
+ * "No runs in the last 7 days" and "this site has never been crawled" want completely
  * different words — the first is a fact about a window the reader can widen, the second is an
  * invitation to press Run now — and the stats endpoint cannot tell them apart, because
  * everything it returns is window-scoped. So the never-run answer comes from `hasEverRun`,
@@ -48,7 +63,7 @@ interface TrendsTabProps {
  *
  * Guessing would not look like an error; it would look like a correct panel that says the
  * wrong thing for a moment. Deep-linking to `?tab=trends` starts both queries at once, and
- * the run list — one page of rows — lands well before a ninety-day aggregate does, so the
+ * the run list — one page of rows — lands well before even a 14-day aggregate does, so the
  * extra wait is theoretical in the case that actually occurs.
  *
  * `hasEverRun` is `false` rather than `null` when the run query *failed*, which deliberately
@@ -105,7 +120,7 @@ export function TrendsTab({
         <p className="text-sm font-medium text-foreground">Run a crawl to see trends</p>
         <p className="max-w-sm text-sm text-muted-foreground">
           {canRun
-            ? "Use Run now above to crawl this site. Once it has a run or two, its page counts and durations show up here."
+            ? "Use Run now above to crawl this site. Once it has a run or two, its index size and page changes show up here."
             : "Nothing has crawled this site yet. Its owner can start a run from this page."}
         </p>
       </div>
@@ -140,9 +155,14 @@ function TrendsPanel({
   const points = toTrendPoints(stats);
   const breakdown = outcomeBreakdown(stats.totals);
 
-  // One question asked once and handed to all three charts, so they cannot disagree about
-  // whether this window is empty.
-  const isEmptyWindow = !windowHasRuns(stats.totals);
+  // Three independent questions, one per chart — unlike the pre-PER-193 panel, where a
+  // single `isEmptyWindow` answered for all three, because all three read the same
+  // `total_runs`-shaped emptiness. `IndexSizeChart` and `ChangeChart` now ask their OWN
+  // questions: a window can have runs with no comparisons at all (every run predates
+  // PER-193, say), which is empty for the two new charts and not empty for the outcome bar.
+  const isIndexSizeEmpty = !windowHasIndexSizes(points);
+  const isChangeEmpty = !windowHasComparisons(stats.totals);
+  const isOutcomeEmpty = !windowHasRuns(stats.totals);
 
   return (
     <div className="min-w-0 space-y-4">
@@ -160,15 +180,19 @@ function TrendsPanel({
             : "space-y-4 transition-opacity"
         }
       >
-        <TrendsStatTiles totals={stats.totals} />
+        <TrendsOutputTiles latest={stats.latest} />
 
         <div className="space-y-4">
           {/* `stats.bucket` — the API's own field — decides the axis labels. Never derived
               from `window` here or anywhere below; see `formatBucketTick`. */}
-          <PagesChart points={points} bucket={stats.bucket} isEmpty={isEmptyWindow} />
-          <DurationChart points={points} bucket={stats.bucket} isEmpty={isEmptyWindow} />
-          <OutcomeChart breakdown={breakdown} isEmpty={isEmptyWindow} />
+          <IndexSizeChart points={points} bucket={stats.bucket} isEmpty={isIndexSizeEmpty} />
+          <ChangeChart points={points} bucket={stats.bucket} isEmpty={isChangeEmpty} />
+          <OutcomeChart breakdown={breakdown} isEmpty={isOutcomeEmpty} />
         </div>
+
+        <TrendsWhatChanged latest={stats.latest} />
+
+        <TrendsHealthRow totals={stats.totals} />
       </div>
     </div>
   );
@@ -215,6 +239,7 @@ function TrendsSkeleton({
       <TrendsHeader window={window} onWindowChange={onWindowChange} />
       <TrendsStatTilesSkeleton />
       <TrendsChartsSkeleton />
+      <TrendsWhatChangedSkeleton />
       <span role="status" aria-live="polite" className="sr-only">
         Loading trends
       </span>

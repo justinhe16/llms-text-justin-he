@@ -76,7 +76,7 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
 
   // Whether this website has ever been crawled at all — `null` only while that is still
   // loading. The Trends tab needs it because the stats endpoint is entirely window-scoped and
-  // cannot distinguish "nothing in the last 30 days" from "never run" (see `TrendsTab`).
+  // cannot distinguish "nothing in the last 7 days" from "never run" (see `TrendsTab`).
   //
   // Derived from the run list this page already fetches, rather than a query of its own. Note
   // that a *failed* run query yields `false` here, not `null`, which is the same call

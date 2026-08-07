@@ -20,9 +20,9 @@ for the three names that literal admits.
 
 | window | bucket | step   | bucket_count |
 | ------ | ------ | ------ | ------------ |
+| `1d`   | `hour` | 1 hour | 24           |
 | `7d`   | `hour` | 1 hour | 168          |
-| `30d`  | `day`  | 1 day  | 30           |
-| `90d`  | `day`  | 1 day  | 90           |
+| `14d`  | `day`  | 1 day  | 14           |
 
 **Boundary arithmetic**, all in UTC (`now` is converted with `.astimezone(UTC)` first, so a
 caller in any offset gets the same buckets a UTC clock would):
@@ -79,9 +79,9 @@ class _WindowSpec:
 
 
 _WINDOWS: Final[dict[StatsWindowName, _WindowSpec]] = {
+    "1d": _WindowSpec(bucket="hour", step=timedelta(hours=1), bucket_count=24),
     "7d": _WindowSpec(bucket="hour", step=timedelta(hours=1), bucket_count=168),
-    "30d": _WindowSpec(bucket="day", step=timedelta(days=1), bucket_count=30),
-    "90d": _WindowSpec(bucket="day", step=timedelta(days=1), bucket_count=90),
+    "14d": _WindowSpec(bucket="day", step=timedelta(days=1), bucket_count=14),
 }
 
 

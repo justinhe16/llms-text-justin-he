@@ -4,12 +4,12 @@ import { Button } from "@/components/ui/button";
 import type { StatsWindow } from "@/lib/api/runs";
 import { STATS_WINDOWS } from "@/lib/crawls/use-detail-view";
 
-/** The full words behind "7d" / "30d" / "90d", for the accessible name. "7d" read aloud is
+/** The full words behind "1d" / "7d" / "14d", for the accessible name. "7d" read aloud is
  * "seven dee", which is not what it means. */
 const WINDOW_LABELS: Record<StatsWindow, string> = {
+  "1d": "Last 24 hours",
   "7d": "Last 7 days",
-  "30d": "Last 30 days",
-  "90d": "Last 90 days",
+  "14d": "Last 14 days",
 };
 
 interface TrendsWindowSwitcherProps {
@@ -20,7 +20,7 @@ interface TrendsWindowSwitcherProps {
 }
 
 /**
- * The 7d / 30d / 90d selector above the Trends panel.
+ * The 1d / 7d / 14d selector above the Trends panel.
  *
  * ## Buttons with `aria-pressed`, not a `<Tabs>` and not a `<select>`
  *
@@ -37,7 +37,7 @@ interface TrendsWindowSwitcherProps {
  *
  * The selected window lives in the URL (`lib/crawls/use-detail-view.ts`), so this component
  * is fully controlled and holds nothing of its own. That is what makes
- * `?tab=trends&window=90d` restore this control's position on load without any effect
+ * `?tab=trends&window=14d` restore this control's position on load without any effect
  * synchronising a `useState` back to the query string.
  */
 export function TrendsWindowSwitcher({

@@ -19,7 +19,7 @@ import gzip
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -45,6 +45,7 @@ from app.features.crawl.internals.sitemap import DiscoveryResult
 from app.features.crawl.schemas import CrawledPage
 from app.features.crawl.service import TransientCrawlError, build_crawl_service
 from app.features.runs.internals.runs_writer import RunsWriter
+from app.features.runs.service import RunService
 from app.infrastructure.db.transaction import transaction as real_transaction
 from app.infrastructure.storage.supabase_storage import StorageUploadError
 
@@ -138,7 +139,7 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 6
+    assert stats["version"] == 7
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
     assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
@@ -411,7 +412,7 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 6
+    assert stats["version"] == 7
     # A failure row carries the same KEYS as a success row, at their hoisted defaults — the
     # shape `runs.stats` stores must not depend on how far a run got before it failed. The
     # four PER-180 counters are part of that same guarantee now: this suite's `_execute`
@@ -424,6 +425,13 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert stats["enrich_failures"] == 0
     assert stats["enrich_input_tokens"] == 0
     assert stats["enrich_output_tokens"] == 0
+    # `llms_txt_bytes`/`index_diff` are the ONE pair on this row that is NOT a hoisted
+    # default, and that asymmetry is deliberate: `execute_run` computes both right after
+    # `generate_llms_txt`, strictly before the Storage upload that fails this attempt — see
+    # the module docstring's "PER-193 added a FOURTH call" paragraph. This is a first run for
+    # a freshly seeded website, so the diff has nothing to compare against.
+    assert stats["llms_txt_bytes"] > 0
+    assert stats["index_diff"] == {"state": "first_run", "previous_run_completed": None}
 
 
 @pytest.mark.parametrize(
@@ -537,6 +545,261 @@ async def test_the_upload_never_happens_inside_a_database_transaction(
             assert depth == 0, f"upload {phase!r} happened while a transaction was open"
     assert saw_an_upload_event
     assert depth == 0, "a transaction was left open"
+
+
+# -----------------------------------------------------------------------------------------
+# PER-193: the index diff against the previous completed run, computed inside `execute_run`
+# right after this run's own `llms_txt` exists. `tests/test_index_diff.py` pins the pure diff
+# function in isolation; what is pinned here is the WIRING — that `execute_run` actually calls
+# it with the right previous run, that a read failure degrades to `index_diff: None` rather
+# than failing the crawl, and that the read never happens inside a transaction.
+# -----------------------------------------------------------------------------------------
+
+
+def _diff_page(path: str, *, title: str = "Page") -> CrawledPage:
+    """A `CrawledPage` with real, non-empty content — shaped so `generate_llms_txt` lists it,
+    which is the precondition for it showing up on either side of a diff."""
+    return CrawledPage(
+        url=f"http://{_SEED_IP}{path}",
+        status=200,
+        title=title,
+        content="x",
+        fetched_at=datetime.now(UTC),
+        content_bytes=1,
+        description=None,
+        markdown="Real content, long enough to survive extraction's emptiness check here.",
+        is_empty=False,
+    )
+
+
+async def test_a_first_run_stores_a_first_run_diff_block(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A website's very first run has nothing to compare against — `index_diff` records
+    `state: "first_run"` and `previous_run_completed: None` (no earlier run of ANY kind),
+    never a `"compared"` block padded out with fabricated zeroes."""
+    _website_id, run_id = await _seed_pending(websites_db, "diff-first-run")
+    storage = FakeStorage()
+
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/diff-first-run")],
+            stats=_crawl_stats(pages_crawled=1),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+
+    outcome = await _execute(websites_db, storage, run_id, _unreachable_handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    assert stats["index_diff"] == {"state": "first_run", "previous_run_completed": None}
+
+
+async def test_a_second_run_diffs_against_the_first_and_records_added_and_removed_pages(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two REAL `execute_run` calls against the same website, serving different page sets —
+    the end-to-end version of `tests/test_index_diff.py`'s pure-function coverage. The second
+    run's `llms_txt` is diffed against the first's stored `llms_txt`, not against anything
+    this test hands it directly."""
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, f"http://{_SEED_IP}/diff-second")
+    storage = FakeStorage()
+
+    run_id_1 = await seed_run(websites_db, website_id, started_at=_NOW, status="pending")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/docs/a", title="Page A"), _diff_page("/docs/b", title="Page B")],
+            stats=_crawl_stats(pages_crawled=2),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+    outcome_1 = await _execute(websites_db, storage, run_id_1, _unreachable_handler)
+    assert outcome_1 is not None
+
+    # Started strictly after run 1. Page A survives unchanged, B is dropped, C is new.
+    run_id_2 = await seed_run(
+        websites_db, website_id, started_at=_NOW + timedelta(minutes=1), status="pending"
+    )
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/docs/a", title="Page A"), _diff_page("/docs/c", title="Page C")],
+            stats=_crawl_stats(pages_crawled=2),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+    outcome_2 = await _execute(websites_db, storage, run_id_2, _unreachable_handler)
+    assert outcome_2 is not None
+
+    stats_2 = json.loads(
+        await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id_2)
+    )
+    diff = stats_2["index_diff"]
+    assert diff["state"] == "compared"
+    assert diff["compared_to_run_id"] == str(run_id_1)
+    assert diff["previous_run_completed"] is True
+    assert diff["pages_added"] == 1
+    assert diff["pages_removed"] == 1
+    assert diff["pages_changed"] == 0
+    assert {entry["url"] for entry in diff["added_sample"]} == {f"http://{_SEED_IP}/docs/c"}
+    assert {entry["url"] for entry in diff["removed_sample"]} == {f"http://{_SEED_IP}/docs/b"}
+
+
+async def test_the_diff_skips_a_failed_run_and_compares_against_the_last_completed_one(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Completed, then failed, then completed. The third run's `compared_to_run_id` is the
+    FIRST run, not the second — and `previous_run_completed` is `False`, because the run
+    immediately before this one (the second) did not complete, even though an earlier one
+    did."""
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, f"http://{_SEED_IP}/diff-skip")
+    storage = FakeStorage()
+
+    run_id_1 = await seed_run(websites_db, website_id, started_at=_NOW, status="pending")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/docs/a")],
+            stats=_crawl_stats(pages_crawled=1),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+    outcome_1 = await _execute(websites_db, storage, run_id_1, _unreachable_handler)
+    assert outcome_1 is not None
+
+    # A failed run in between, seeded directly rather than executed — its own `llms_txt`
+    # is `NULL`, exactly as `RunsWriter.mark_processing_failed` leaves it.
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW + timedelta(minutes=1),
+        status="failed",
+        completed_at=_NOW + timedelta(minutes=1),
+        error="simulated failure",
+    )
+
+    run_id_3 = await seed_run(
+        websites_db, website_id, started_at=_NOW + timedelta(minutes=2), status="pending"
+    )
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/docs/a")],
+            stats=_crawl_stats(pages_crawled=1),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+    outcome_3 = await _execute(websites_db, storage, run_id_3, _unreachable_handler)
+    assert outcome_3 is not None
+
+    stats_3 = json.loads(
+        await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id_3)
+    )
+    diff = stats_3["index_diff"]
+    assert diff["state"] == "compared"
+    assert diff["compared_to_run_id"] == str(run_id_1)
+    assert diff["previous_run_completed"] is False
+
+
+async def test_a_previous_run_read_failure_does_not_fail_the_crawl(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`RunService.get_previous_completed_index` raising must not fail an otherwise-successful
+    crawl — the run still completes, with `index_diff` recorded as `None` rather than the
+    exception propagating out of `execute_run`."""
+    _website_id, run_id = await _seed_pending(websites_db, "diff-read-fails")
+    storage = FakeStorage()
+
+    async def _raise(self: RunService, *args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated database failure")
+
+    monkeypatch.setattr(RunService, "get_previous_completed_index", _raise)
+
+    outcome = await _execute(websites_db, storage, run_id, _ok_handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["index_diff"] is None
+    # The read failure must not have suppressed the index itself — only the COMPARISON.
+    assert stats["llms_txt_bytes"] > 0
+
+
+async def test_the_previous_run_read_never_happens_inside_a_database_transaction(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_the_upload_never_happens_inside_a_database_transaction` and
+    `test_the_anthropic_call_never_happens_inside_a_database_transaction` above exactly — the
+    transaction-boundary acceptance criterion for the PER-193 diff read: no transaction may be
+    open while `RunService.get_previous_completed_index` runs."""
+    _website_id, run_id = await _seed_pending(websites_db, "diff-no-tx")
+    storage = FakeStorage()
+
+    events: list[tuple[str, str]] = []
+
+    @asynccontextmanager
+    async def tracking_transaction(pool: Pool) -> AsyncIterator[Connection]:
+        events.append(("tx", "enter"))
+        try:
+            async with real_transaction(pool) as conn:
+                yield conn
+        finally:
+            events.append(("tx", "exit"))
+
+    monkeypatch.setattr("app.features.runs.service.transaction", tracking_transaction)
+
+    original_get_previous_completed_index = RunService.get_previous_completed_index
+
+    async def tracking_get_previous_completed_index(
+        self: RunService, *args: object, **kwargs: object
+    ) -> object:
+        events.append(("previous_run_read", "start"))
+        try:
+            return await original_get_previous_completed_index(self, *args, **kwargs)
+        finally:
+            events.append(("previous_run_read", "end"))
+
+    monkeypatch.setattr(
+        RunService, "get_previous_completed_index", tracking_get_previous_completed_index
+    )
+
+    outcome = await _execute(websites_db, storage, run_id, _ok_handler)
+    assert outcome is not None
+
+    depth = 0
+    saw_read = False
+    for kind, phase in events:
+        if kind == "tx":
+            depth += 1 if phase == "enter" else -1
+            assert depth >= 0, "a transaction exited more times than it entered"
+        else:
+            saw_read = True
+            assert depth == 0, f"{kind} {phase!r} happened while a transaction was open"
+    assert saw_read, "the previous-run read never happened at all"
+    assert depth == 0, "a transaction was left open"
+
+
+async def test_llms_txt_bytes_matches_the_stored_artifact(websites_db: Pool) -> None:
+    _website_id, run_id = await _seed_pending(websites_db, "llms-txt-bytes")
+    storage = FakeStorage()
+
+    outcome = await _execute(websites_db, storage, run_id, _ok_handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT llms_txt, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    stats = json.loads(row["stats"])
+    assert stats["llms_txt_bytes"] == len(row["llms_txt"].encode())
 
 
 # -----------------------------------------------------------------------------------------
@@ -713,12 +976,12 @@ async def test_a_site_with_no_sitemap_falls_back_to_the_links_on_its_seed_page(
     assert stats["urls_discovered"] == 3, "off-origin, mailto: and fragment-only never count"
     assert stats["urls_selected"] == 3
     assert stats["pages_crawled"] == 4
-    assert stats["version"] == 6, (
+    assert stats["version"] == 7, (
         "a new VALUE for an existing key is still not a new shape — PER-178 added "
-        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 6 '
-        "because PER-180 added four enrich KEYS and PER-191 added two robots KEYS after "
-        "that, both shape changes; the number moved for a reason that has nothing to do "
-        "with the value asserted above."
+        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 7 '
+        "because PER-180, PER-191, and PER-193 each added new KEYS after that, which are "
+        "shape changes; the number moved for reasons that have nothing to do with the value "
+        "asserted above."
     )
 
 
@@ -1069,7 +1332,7 @@ async def test_model_titles_reach_llms_txt_and_the_extracted_title_does_not(
     assert "Extracted Title Nobody Should See In The Artifact" not in row["llms_txt"]
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 6
+    assert stats["version"] == 7
     assert stats["pages_enriched"] == 1
     assert stats["enrich_failures"] == 0
 
@@ -1458,11 +1721,11 @@ async def test_an_unreadable_robots_txt_completes_the_run(websites_db: Pool) -> 
     assert stats["crawl_delay_ms"] == settings.crawl_politeness_delay_ms
 
 
-async def test_stats_version_is_six(websites_db: Pool) -> None:
-    """[Observability]. A live row lands with `RUN_STATS_VERSION` 6 — the persistence-layer
+async def test_stats_version_is_seven(websites_db: Pool) -> None:
+    """[Observability]. A live row lands with `RUN_STATS_VERSION` 7 — the persistence-layer
     companion to `tests/test_run_stats.py::test_run_stats_version_is_pinned`, which only
     checks the constant itself."""
-    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-six")
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-seven")
     storage = FakeStorage()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1476,4 +1739,4 @@ async def test_stats_version_is_six(websites_db: Pool) -> None:
     row = await websites_db.fetchrow("SELECT stats FROM runs WHERE id = $1", run_id)
     assert row is not None
     stats = json.loads(row["stats"])
-    assert stats["version"] == 6
+    assert stats["version"] == 7

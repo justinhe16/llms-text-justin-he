@@ -137,7 +137,7 @@ LimitQuery = Annotated[
 
 WindowQuery = Annotated[
     StatsWindowName,
-    Query(description="Time span to aggregate over. One of 7d, 30d, 90d; anything else is a 422."),
+    Query(description="One of 1d, 7d, 14d; anything else is a 422."),
 ]
 
 
@@ -343,7 +343,7 @@ async def get_website_stats(
     id: UUID,
     user_id: CurrentUserId,
     service: RunServiceDep,
-    window: WindowQuery = "30d",
+    window: WindowQuery = "7d",
 ) -> WebsiteStatsResponse:
     """Return one website's run statistics over `window`, bucketed and zero-filled, plus a
     whole-window summary. Any signed-in user, any website.

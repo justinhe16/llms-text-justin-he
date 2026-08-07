@@ -166,12 +166,13 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from arq.connections import ArqRedis
 from asyncpg import Connection, ForeignKeyViolationError, Pool
 from fastapi import HTTPException, status
+from pydantic import ValidationError
 
 from app.core.auth.ownership import require_owner
 from app.core.pagination import Page
@@ -190,8 +191,10 @@ from app.features.runs.internals.runs_reader import RunsReader
 from app.features.runs.internals.runs_writer import RunsWriter
 from app.features.runs.internals.stats_window import StatsWindow, resolve_window
 from app.features.runs.schemas import (
+    LatestRunSnapshot,
     RunAlreadyInFlightDetail,
     RunDetailResponse,
+    RunIndexDiff,
     RunLimitExceededDetail,
     RunListItemResponse,
     RunStatsPoint,
@@ -359,6 +362,38 @@ class RunArtifact:
     into a quoted `Content-Disposition` with no escaping and no header-injection surface."""
 
 
+@dataclass(frozen=True)
+class PreviousCompletedIndex:
+    """The previous completed run's index, as `RunService.get_previous_completed_index`
+    hands it to `CrawlService._build_index_diff` (PER-193).
+
+    Lives here rather than in `schemas.py`, for the same reason `RunArtifact` above does: it
+    is not a response body — this is a worker-to-worker handoff between two services' own
+    business logic, never serialized as JSON, and has no reason to appear in `openapi.json`.
+    """
+
+    run_id: UUID
+    """The previous completed run's own id — becomes `index_diff["compared_to_run_id"]`
+    (`internals/index_diff.py`)."""
+
+    completed_at: datetime | None
+    """When that run completed. Typed optional to match the column it is read from
+    (`runs.completed_at` is nullable in general), though a `completed` row always has one in
+    practice — `RunsWriter.mark_processing_completed` sets it in the same `UPDATE` that sets
+    `status = 'completed'`."""
+
+    llms_txt: str
+    """That run's stored `llms.txt` index — what `internals/index_diff.py`'s `parse_index`
+    reads to reconstruct the previous run's page list. Never `None`: `get_previous_completed_
+    index` returns `None` for the whole lookup, not a `PreviousCompletedIndex` with a `None`
+    `llms_txt`, when the nearest completed row has no index (see that method's docstring)."""
+
+    urls_discovered: int | None
+    """That run's `runs.stats["urls_discovered"]`, read defensively — `None` when the value
+    is absent (a row that predates `RUN_STATS_VERSION` 4) or is not an `int`. Feeds
+    `index_diff["urls_discovered_delta"]`, which is `None` under the same condition."""
+
+
 def _duration_ms(started_at: datetime, completed_at: datetime | None) -> int | None:
     """`None` while a run is still in flight; otherwise its elapsed time in whole ms.
 
@@ -481,8 +516,21 @@ def _daily_limit_exceeded(limit: int, resets_at: datetime, now: datetime) -> HTT
     )
 
 
-def _to_stats(window: StatsWindow, rows: list[dict[str, Any]]) -> WebsiteStatsResponse:
-    """Build the full `GET /websites/{id}/stats` body from `_WEBSITE_STATS`'s rows.
+def _as_int(value: Any) -> int | None:
+    """`value` if it is genuinely an `int`, else `None` — the one place this module reads a
+    number back out of a `runs.stats` jsonb value defensively. `bool` is deliberately
+    excluded even though `isinstance(True, int)` is `True` in Python: `runs.stats` never
+    stores a boolean where these fields expect a count, but guarding against it here costs
+    nothing and matches the same defensiveness `_parse_stats` already applies to the dict
+    itself."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _to_stats(
+    window: StatsWindow, rows: list[dict[str, Any]], latest_row: dict[str, Any] | None
+) -> WebsiteStatsResponse:
+    """Build the full `GET /websites/{id}/stats` body from `_WEBSITE_STATS`'s rows and
+    `_LATEST_COMPLETED_INDEX`'s single row.
 
     `rows` is never empty — `RunsReader.website_stats`'s `generate_series` always yields
     `window.bucket_count` of them — so `totals` is read off `rows[0]` rather than recomputed
@@ -503,6 +551,14 @@ def _to_stats(window: StatsWindow, rows: list[dict[str, Any]]) -> WebsiteStatsRe
             failed=row["failed"],
             avg_pages=round(row["avg_pages"], 2),
             avg_duration_ms=round(row["avg_duration_ms"]),
+            runs_compared=row["runs_compared"],
+            pages_added=row["pages_added"],
+            pages_removed=row["pages_removed"],
+            # Never `round(...)`ed or otherwise touched — `index_pages`/`index_bytes` are
+            # already `None` or a plain `int` off the row, and rounding a possibly-`None`
+            # value is exactly the mistake the null-vs-zero discipline exists to prevent.
+            index_pages=row["index_pages"],
+            index_bytes=row["index_bytes"],
         )
         for row in rows
     ]
@@ -519,10 +575,78 @@ def _to_stats(window: StatsWindow, rows: list[dict[str, Any]]) -> WebsiteStatsRe
         avg_duration_ms=round(rows[0]["total_avg_duration_ms"]),
         avg_pages=round(rows[0]["total_avg_pages"], 2),
         last_run_at=rows[0]["last_run_at"],
+        runs_compared=rows[0]["total_runs_compared"],
+        pages_added=rows[0]["total_pages_added"],
+        pages_removed=rows[0]["total_pages_removed"],
     )
 
     return WebsiteStatsResponse(
-        window=window.name, bucket=window.bucket, series=series, totals=totals
+        window=window.name,
+        bucket=window.bucket,
+        series=series,
+        totals=totals,
+        latest=_to_latest(latest_row),
+    )
+
+
+def _to_latest(row: dict[str, Any] | None) -> LatestRunSnapshot | None:
+    """Build `WebsiteStatsResponse.latest` from `RunsReader.latest_completed_index`'s row, or
+    `None` when the window holds no completed run at all (`row is None`).
+
+    **Defensive, mirroring `_parse_stats`.** `runs.stats` has no shape Postgres enforces
+    (ARCHITECTURE.md §3.4) — a stored `index_diff` can be malformed JSON that decoded to
+    something other than an object, an object with the wrong keys, or simply absent on a row
+    that predates `RUN_STATS_VERSION` 7. Every one of those degrades to `diff_state=
+    "not_recorded"` here rather than raising, so a single bad row can never 500 this endpoint
+    for every OTHER website.
+    """
+    if row is None:
+        return None
+
+    stats = _parse_stats(row["stats"]) or {}
+    index_pages = _as_int(stats.get("links_emitted"))
+    index_bytes = _as_int(stats.get("llms_txt_bytes"))
+    raw_diff = stats.get("index_diff")
+
+    diff_state: Literal["compared", "first_run", "not_recorded"]
+    previous_run_completed: bool | None = None
+    diff: RunIndexDiff | None = None
+
+    if not isinstance(raw_diff, dict):
+        # Covers both a version-5-and-earlier row (no `index_diff` key at all, so `.get`
+        # returns `None`) and a stored value that is JSON but not a JSON OBJECT.
+        diff_state = "not_recorded"
+    else:
+        raw_previous_run_completed = raw_diff.get("previous_run_completed")
+        if isinstance(raw_previous_run_completed, bool):
+            previous_run_completed = raw_previous_run_completed
+
+        state = raw_diff.get("state")
+        if state == "first_run":
+            diff_state = "first_run"
+        elif state == "compared":
+            try:
+                diff = RunIndexDiff.model_validate(raw_diff)
+            except ValidationError:
+                logger.warning(
+                    "runs: malformed index_diff on run %s; reporting diff_state=not_recorded",
+                    row["id"],
+                    exc_info=True,
+                )
+                diff_state = "not_recorded"
+            else:
+                diff_state = "compared"
+        else:
+            diff_state = "not_recorded"
+
+    return LatestRunSnapshot(
+        run_id=row["id"],
+        completed_at=row["completed_at"],
+        index_pages=index_pages,
+        index_bytes=index_bytes,
+        diff_state=diff_state,
+        previous_run_completed=previous_run_completed,
+        diff=diff,
     )
 
 
@@ -806,13 +930,22 @@ class RunService:
         self, website_id: UUID, *, window: StatsWindowName
     ) -> WebsiteStatsResponse:
         """Return `website_id`'s run statistics over `window`, pre-aggregated into fixed,
-        zero-filled buckets plus a whole-window summary — one query, no per-bucket queries.
+        zero-filled buckets plus a whole-window summary and the newest completed run's index
+        diff — three reads, no per-bucket queries.
 
         Reuses `WebsiteService.get_website` purely for its `404`, exactly like `list_runs`
         above — its return value is unused here (ARCHITECTURE.md §3.1: a feature calls
         another feature's service, never its reader). Never scoped by caller: reads are
         unscoped in this codebase (ARCHITECTURE.md §4.1), and there is no `require_owner`
         call anywhere in this path.
+
+        **Three reads, not two — the one deliberate widening PER-193 makes here.**
+        `RunsReader.website_stats`'s own claim ("one aggregate query, no per-bucket queries")
+        is about `_WEBSITE_STATS` specifically and still holds unchanged; `latest_completed_
+        index` is a second, `LIMIT 1` lookup added purposefully so the whole `stats` jsonb of
+        the newest completed run — samples included — never has to ride every row of the
+        168-bucket aggregate to answer one question only the single newest row can answer.
+        See `_LATEST_COMPLETED_INDEX`'s own comment.
 
         Raises:
             HTTPException: `404` if there is no website with that id.
@@ -821,7 +954,10 @@ class RunService:
 
         resolved = resolve_window(window, datetime.now(UTC))
         rows = await self._reader.website_stats(website_id, window=resolved)
-        return _to_stats(resolved, rows)
+        latest_row = await self._reader.latest_completed_index(
+            website_id, start=resolved.start, end=resolved.end
+        )
+        return _to_stats(resolved, rows, latest_row)
 
     async def claim_for_processing(self, run_id: UUID) -> int | None:
         """Atomically flip `run_id` from `pending` to `processing`, or refuse to.
@@ -1108,6 +1244,72 @@ class RunService:
             else:
                 enqueued += 1
         return enqueued, already_queued, failures
+
+    async def get_previous_completed_index(
+        self, website_id: UUID, *, before_started_at: datetime, before_run_id: UUID
+    ) -> tuple[PreviousCompletedIndex | None, bool | None]:
+        """The previous COMPLETED run's index, and whether the run immediately before the
+        current one actually completed — what `CrawlService._build_index_diff`
+        (`crawl/service.py`, PER-193) needs to build this run's `index_diff` block.
+
+        Called only from the worker path, on `CrawlService.execute_run`'s no-transaction
+        window between `claim_for_processing` and `record_success` — the same window the
+        Storage upload and the enrichment call already occupy (`crawl/service.py`'s module
+        docstring, §5.1). **No transaction, no ownership check**, for the identical reasoning
+        `claim_for_processing` gives for itself: a background job acting on its own behalf has
+        no caller to check ownership against, and this read has no write to be atomic with.
+
+        Args:
+            website_id: The current run's own website.
+            before_started_at: The current run's `started_at` — "previous" is relative to
+                THIS run, never to `datetime.now(UTC)`.
+            before_run_id: The current run's own id, the tie-break half of the keyset pair.
+
+        Returns:
+            `(previous, previous_run_completed)`.
+
+            `previous` is `None` in two cases the caller cannot tell apart from this return
+            value alone (and does not need to — both feed `build_index_diff`'s `state:
+            "first_run"` branch identically): there is no completed run before this one at
+            all, or the nearest completed row has `llms_txt IS NULL` — a completed run with
+            no index cannot be compared against, so it is treated the same as none existing.
+            Otherwise it carries that run's id, `completed_at`, `llms_txt`, and a defensively
+            parsed `urls_discovered` (`int` only; `None` for anything else, including a row
+            that predates `RUN_STATS_VERSION` 4 or has unparseable `stats`) — read through
+            `_parse_stats`, the same defensive decoder `_shared_fields` uses for every other
+            read of this column.
+
+            `previous_run_completed` is a tri-state independent of `previous`: `None` when
+            there is no earlier run of ANY status, `False` when the immediately preceding run
+            exists but is not `completed`, `True` when it is. Note that `previous is not None`
+            implies `previous_run_completed is True`, but not the reverse — the run
+            immediately before this one can be `completed` while still having no `llms_txt`,
+            which is the one case where `previous_run_completed` is `True` and `previous` is
+            still `None`.
+        """
+        row = await self._reader.previous_completed_index(
+            website_id, before_started_at=before_started_at, before_run_id=before_run_id
+        )
+
+        previous_status: RunStatusName | None = row["previous_status"]
+        previous_run_completed = None if previous_status is None else previous_status == "completed"
+
+        if row["run_id"] is None or row["llms_txt"] is None:
+            return None, previous_run_completed
+
+        stats = _parse_stats(row["stats"]) or {}
+        raw_urls_discovered = stats.get("urls_discovered")
+        urls_discovered = raw_urls_discovered if isinstance(raw_urls_discovered, int) else None
+
+        return (
+            PreviousCompletedIndex(
+                run_id=row["run_id"],
+                completed_at=row["completed_at"],
+                llms_txt=row["llms_txt"],
+                urls_discovered=urls_discovered,
+            ),
+            previous_run_completed,
+        )
 
     async def record_success(
         self,

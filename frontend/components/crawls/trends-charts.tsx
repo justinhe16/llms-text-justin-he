@@ -1,6 +1,15 @@
 "use client";
 
-import { Bar, BarChart, CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceLine,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 import {
   ChartContainer,
@@ -10,7 +19,7 @@ import {
 } from "@/components/ui/chart";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { StatsBucket } from "@/lib/api/runs";
-import type { OutcomeBreakdown, TrendPoint } from "@/lib/crawls/stats-display";
+import { signedCount, type OutcomeBreakdown, type TrendPoint } from "@/lib/crawls/stats-display";
 
 // ---------------------------------------------------------------------------------------
 // Colour
@@ -33,13 +42,20 @@ import type { OutcomeBreakdown, TrendPoint } from "@/lib/crawls/stats-display";
 // (`--status-completed`, `--status-failed`), so a red segment in this chart means exactly
 // what a red dot means in the Runs table. Recolouring a status stays a one-line edit in
 // globals.css, and this file is not an exception to it.
+//
+// PER-193's `ChangeChart` extends this rather than starting a second convention: its `added`
+// series reuses `--status-completed` and its `removedNegative` series reuses `--status-failed`
+// — the same green/red the outcome bar below already means "succeeded" and "failed" with, now
+// carrying "grew" and "shrank" instead. One reader learns one meaning for each colour across
+// the whole panel rather than two unrelated ones.
 
-const PAGES_CHART_CONFIG = {
-  pages: { label: "Avg pages per run", color: "var(--chart-1)" },
+const INDEX_SIZE_CHART_CONFIG = {
+  indexKb: { label: "Index size (KB)", color: "var(--chart-1)" },
 } satisfies ChartConfig;
 
-const DURATION_CHART_CONFIG = {
-  seconds: { label: "Avg duration", color: "var(--chart-2)" },
+const CHANGE_CHART_CONFIG = {
+  added: { label: "Pages added", color: "var(--status-completed)" },
+  removedNegative: { label: "Pages removed", color: "var(--status-failed)" },
 } satisfies ChartConfig;
 
 const OUTCOME_CHART_CONFIG = {
@@ -105,11 +121,16 @@ function ChartCard({
   title,
   description,
   isEmpty,
+  emptyLabel = "No runs in this window",
   children,
 }: {
   title: string;
   description: string;
   isEmpty: boolean;
+  /** What the overlay says when `isEmpty`. Defaults to the outcome chart's own wording;
+   * `IndexSizeChart` and `ChangeChart` below pass their own, since "no runs" is not the right
+   * explanation for a window that had runs but none of them recorded a comparison. */
+  emptyLabel?: string;
   children: React.ReactNode;
 }) {
   return (
@@ -125,7 +146,7 @@ function ChartCard({
         {isEmpty && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
             <span className="rounded-md border border-border bg-card/90 px-2.5 py-1 text-xs text-muted-foreground">
-              No runs in this window
+              {emptyLabel}
             </span>
           </div>
         )}
@@ -159,21 +180,118 @@ interface TimeSeriesProps {
 }
 
 /**
- * Pages crawled per bucket.
+ * The generated `llms.txt` index's size per bucket, in KB — the last completed run in each
+ * bucket that recorded one.
  *
- * Bars rather than a line or an area, specifically because of the zero buckets. The API
- * zero-fills every quiet hour, and a bar chart renders "nothing ran here" as the absence of a
- * bar — which is what happened — where a line has to travel down to the axis and back up,
- * drawing two slopes through a period in which nothing changed because nothing occurred.
+ * A line, not bars: index size is a LEVEL — "how big is this site's index around this time" —
+ * not a quantity accumulated within one bucket, the same distinction the deleted
+ * `DurationChart` drew for run duration.
+ *
+ * **`connectNulls={false}`, and this is the one chart in this panel that needs it.** Contrast
+ * the deleted `DurationChart`'s own comment ("no `connectNulls`, there are no nulls to
+ * connect"): THAT chart's zero buckets were real zeroes with nothing to bridge. This chart's
+ * `indexKb` is `null` — not `0` — for a bucket with no completed run to ask
+ * (`toTrendPoints`'s docstring, lib/crawls/stats-display.ts), and Recharts must break the line
+ * across that gap rather than bridge it. Bridging it would draw a straight line through a
+ * period this data cannot speak to, at whatever value happens to interpolate between the two
+ * real points either side of it — exactly the kind of confident-looking lie `connectNulls`
+ * exists to prevent.
  */
-export function PagesChart({ points, bucket, isEmpty }: TimeSeriesProps) {
+export function IndexSizeChart({ points, bucket, isEmpty }: TimeSeriesProps) {
   return (
     <ChartCard
-      title="Pages crawled"
-      description="Average pages per run, per bucket."
+      title="Index size"
+      description="llms.txt size per bucket, from the last completed run in it."
       isEmpty={isEmpty}
+      emptyLabel="No comparisons in this window"
     >
-      <ChartContainer config={PAGES_CHART_CONFIG} className={TIME_SERIES_BOX}>
+      <ChartContainer config={INDEX_SIZE_CHART_CONFIG} className={TIME_SERIES_BOX}>
+        <LineChart accessibilityLayer data={points} margin={{ left: 4, right: 8, top: 4 }}>
+          <CartesianGrid vertical={false} />
+          <XAxis
+            dataKey="tick"
+            tickLine={false}
+            axisLine={false}
+            tickMargin={8}
+            minTickGap={tickGapFor(bucket)}
+          />
+          <YAxis
+            tickLine={false}
+            axisLine={false}
+            width={48}
+            tickMargin={4}
+            tickFormatter={(value: number) => `${value} KB`}
+          />
+          <ChartTooltip
+            content={
+              <ChartTooltipContent
+                labelFormatter={bucketTooltipLabel}
+                formatter={(value, _name, item) => {
+                  const point = trendPointOf(item?.payload);
+                  const kb = typeof value === "number" ? `${value.toFixed(1)} KB` : String(value);
+                  const pages =
+                    point?.indexPages === null || point?.indexPages === undefined
+                      ? ""
+                      : ` · ${point.indexPages.toLocaleString()} pages`;
+                  return (
+                    <span className="font-mono text-foreground tabular-nums">
+                      {kb}
+                      {pages}
+                    </span>
+                  );
+                }}
+              />
+            }
+          />
+          <Line
+            dataKey="indexKb"
+            // `linear`, not `monotone`, for the same reason the deleted `DurationChart` chose
+            // it: these are discrete per-bucket measurements with nothing between them, and a
+            // spline would round the approach into a gap in a way that misrepresents it as a
+            // gentle trend rather than an absence of data.
+            type="linear"
+            stroke="var(--color-indexKb)"
+            strokeWidth={2}
+            // A visible dot on every point, unlike the deleted `DurationChart`'s `dot={false}`
+            // (168 hourly circles would be noise) — and this is not the same situation.
+            // `connectNulls={false}` means an isolated real point, with `null` on both
+            // neighbouring buckets, has no line segment to appear as: with `dot={false}` it
+            // would render NOTHING at all, silently dropping the one measurement in the
+            // window. A small, low-opacity dot keeps every real point visible on its own,
+            // whether or not it happens to sit next to another one.
+            dot={{ r: 2.5, strokeWidth: 0, fill: "var(--color-indexKb)" }}
+            activeDot={{ r: 4 }}
+            connectNulls={false}
+            isAnimationActive={ANIMATE}
+          />
+        </LineChart>
+      </ChartContainer>
+    </ChartCard>
+  );
+}
+
+/**
+ * Pages added and removed per bucket, as a diverging bar — added reaching up from zero,
+ * removed reaching down from it, on a shared `stackId` so the two never overlap and a
+ * `ReferenceLine` at `y={0}` marks the axis both series share.
+ *
+ * Bars, not a line: `pages_added`/`pages_removed` are quantities accumulated WITHIN one
+ * bucket (how many pages changed around this time), the same shape the deleted `PagesChart`
+ * chose bars for, not a level a line would suit.
+ *
+ * No `connectNulls` here either, but for the opposite reason `IndexSizeChart` needs one:
+ * `added`/`removedNegative` are never `null` — a bucket with no comparisons measured zero of
+ * each, which is a real number a bar renders as no bar at all, not a gap to bridge.
+ */
+export function ChangeChart({ points, bucket, isEmpty }: TimeSeriesProps) {
+  return (
+    <ChartCard
+      title="Index changes"
+      description="Pages added and removed per bucket, from runs that recorded a comparison."
+      isEmpty={isEmpty}
+      emptyLabel="No comparisons in this window"
+    >
+      <ChartContainer config={CHANGE_CHART_CONFIG} className={TIME_SERIES_BOX}>
         <BarChart accessibilityLayer data={points} margin={{ left: 4, right: 8, top: 4 }}>
           <CartesianGrid vertical={false} />
           <XAxis
@@ -190,78 +308,32 @@ export function PagesChart({ points, bucket, isEmpty }: TimeSeriesProps) {
             allowDecimals={false}
             tickMargin={4}
           />
-          <ChartTooltip content={<ChartTooltipContent labelFormatter={bucketTooltipLabel} />} />
-          <Bar dataKey="pages" fill="var(--color-pages)" isAnimationActive={ANIMATE} />
-        </BarChart>
-      </ChartContainer>
-    </ChartCard>
-  );
-}
-
-/**
- * Run duration per bucket, in seconds.
- *
- * A line here, where pages got bars, because duration is a level rather than a quantity
- * accumulated in each bucket — "how long a run took around this time" is a thing that trends,
- * and the eye reads a trend off a line far better than off a row of columns.
- *
- * **No `connectNulls`, and no gap handling of any kind.** There are no nulls to connect: a
- * bucket with no runs reports `0`, and it is drawn as `0`. Bridging those points would draw a
- * straight line across an outage at the average of its two ends, which is the single most
- * confident-looking way this chart could lie.
- */
-export function DurationChart({ points, bucket, isEmpty }: TimeSeriesProps) {
-  return (
-    <ChartCard
-      title="Run duration"
-      description="Average seconds per run, per bucket."
-      isEmpty={isEmpty}
-    >
-      <ChartContainer config={DURATION_CHART_CONFIG} className={TIME_SERIES_BOX}>
-        <LineChart accessibilityLayer data={points} margin={{ left: 4, right: 8, top: 4 }}>
-          <CartesianGrid vertical={false} />
-          <XAxis
-            dataKey="tick"
-            tickLine={false}
-            axisLine={false}
-            tickMargin={8}
-            minTickGap={tickGapFor(bucket)}
-          />
-          <YAxis
-            tickLine={false}
-            axisLine={false}
-            width={40}
-            tickMargin={4}
-            tickFormatter={(value: number) => `${value}s`}
-          />
           <ChartTooltip
             content={
               <ChartTooltipContent
                 labelFormatter={bucketTooltipLabel}
                 formatter={(value) => (
                   <span className="font-mono text-foreground tabular-nums">
-                    {typeof value === "number" ? `${value.toFixed(1)}s` : String(value)}
+                    {signedCount(Number(value))}
                   </span>
                 )}
               />
             }
           />
-          <Line
-            dataKey="seconds"
-            // `linear`, not `monotone`. A monotone spline still passes through every real
-            // point, but it rounds the approach into and out of a zero bucket, so a day with
-            // no runs reads as a gentle dip rather than a drop to the axis. These are
-            // discrete per-bucket measurements with nothing between them; straight segments
-            // are the honest join, and they keep an outage looking like an outage.
-            type="linear"
-            stroke="var(--color-seconds)"
-            strokeWidth={2}
-            // No dot per point: 168 hourly buckets would be 168 circles, which reads as
-            // noise. The active dot on hover still marks whichever bucket is being read.
-            dot={false}
+          <ReferenceLine y={0} stroke="var(--border)" />
+          <Bar
+            dataKey="added"
+            stackId="change"
+            fill="var(--color-added)"
             isAnimationActive={ANIMATE}
           />
-        </LineChart>
+          <Bar
+            dataKey="removedNegative"
+            stackId="change"
+            fill="var(--color-removedNegative)"
+            isAnimationActive={ANIMATE}
+          />
+        </BarChart>
       </ChartContainer>
     </ChartCard>
   );

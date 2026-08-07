@@ -22,6 +22,7 @@ from app.features.crawl.internals.url_ranking import (
     DiscoveredUrl,
     DiscoveredUrlSource,
     SelectionResult,
+    normalize_url,
     select_urls,
 )
 
@@ -900,3 +901,17 @@ def test_fixture_selection_is_deterministic_across_shuffles() -> None:
 
         assert result.selected == baseline.selected, f"shuffle seed {seed} moved the selection"
         assert result.dropped == baseline.dropped, f"shuffle seed {seed} moved the drop counts"
+
+
+# -----------------------------------------------------------------------------------------
+# `normalize_url` — the public export `internals/index_diff.py` (PER-193) matches its
+# own comparison key against, so a trailing-slash change is not a page swap.
+# -----------------------------------------------------------------------------------------
+
+
+def test_normalize_url_returns_the_same_key_for_a_trailing_slash_variant() -> None:
+    assert normalize_url("https://example.test/docs") == normalize_url("https://example.test/docs/")
+
+
+def test_normalize_url_returns_none_for_an_unparseable_url() -> None:
+    assert normalize_url("not a url at all") is None

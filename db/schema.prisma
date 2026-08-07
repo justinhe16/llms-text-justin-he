@@ -173,11 +173,21 @@ model Run {
   llmsFullTxt String? @map("llms_full_txt")
 
   /// `pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`, `cap_hit`,
-  /// `pages_empty_content`, `links_emitted`, `full_txt_truncated`, and `version` — the shape
-  /// `internals/run_stats.py` builds and owns, at `RUN_STATS_VERSION` 3. Jsonb rather than
-  /// columns because the set of keys has changed three times already and belongs to the
-  /// crawler feature rather than to this schema; `version` is what lets a reader tell which
-  /// definition a stored row was written under (ARCHITECTURE.md §3.4).
+  /// `pages_empty_content`, `links_emitted`, `full_txt_truncated`, `discovery_source`,
+  /// `urls_discovered`, `urls_selected`, `urls_robots_disallowed`, `crawl_delay_ms`,
+  /// `pages_enriched`, `enrich_failures`, `enrich_input_tokens`, `enrich_output_tokens`,
+  /// `llms_txt_bytes`, `index_diff`, and `version` — the shape `internals/run_stats.py`
+  /// builds and owns, at `RUN_STATS_VERSION` 7. Jsonb rather than columns because the set of
+  /// keys has changed seven times already and belongs to the crawler feature rather than to
+  /// this schema; `version` is what lets a reader tell which definition a stored row was
+  /// written under (ARCHITECTURE.md §3.4). `urls_robots_disallowed` (int) and
+  /// `crawl_delay_ms` (int) are PER-191's additions: how many candidates this run's
+  /// `robots.txt` disallowed, and the politeness delay the crawl phase actually used.
+  /// `llms_txt_bytes` (int) and `index_diff` (object | null) are PER-193's additions: the
+  /// generated index's size, and what changed against the previous completed run's index —
+  /// see `internals/index_diff.py`'s `build_index_diff` for the two shapes `index_diff` can
+  /// take. This is a doc-comment update only; the column type is unchanged (CLAUDE.md #2),
+  /// so it needs no migration.
   stats Json? @db.JsonB
 
   /// Set when `status` is `failed`.

@@ -616,7 +616,16 @@ def _page_count(count: int) -> str:
 def _bullet(entry: _Entry) -> str:
     """One `- [label](url): description` line, with the description omitted entirely rather
     than left as a dangling `: ` when the page has none. A description is optional in the
-    llmstxt.org shape, and an empty one is not a different thing from an absent one."""
+    llmstxt.org shape, and an empty one is not a different thing from an absent one.
+
+    **This format has a reverse parser.** `internals/index_diff.py`'s `parse_index` recovers
+    an `IndexEntry` from exactly this line shape, to diff one run's index against the
+    previous one's (PER-193). The two are two descriptions of one format and can drift apart
+    silently if either changes without the other —
+    `tests/test_index_diff.py::test_parse_index_round_trips_generate_llms_txt` is the one
+    test tying them together; touching this function or `_escape_label`/`_escape_target`
+    without re-running it is how that drift happens unnoticed.
+    """
     link = f"- [{_escape_label(entry.label)}]({_escape_target(entry.url)})"
     return f"{link}: {entry.description}" if entry.description else link
 

@@ -45,6 +45,7 @@ from app.features.runs.internals.runs_reader import (
     _LIST_BY_WEBSITE,
     _LIST_BY_WEBSITE_AFTER_CURSOR,
     _LIST_BY_WEBSITE_WITH_STATUS,
+    _PREVIOUS_COMPLETED_INDEX,
 )
 from app.features.runs.service import MAX_LIMIT
 
@@ -660,4 +661,58 @@ async def test_the_keyset_cursor_bound_reaches_the_index_condition(websites_db: 
         "starting at the cursor -- it is starting at the newest run and filtering. This is "
         "the exact regression the OR-expanded WHERE clause causes; see the module docstring "
         f"of app/features/runs/internals/runs_reader.py. Index Conds: {index_conds}"
+    )
+
+
+async def test_previous_completed_index_query_plan_avoids_a_seq_scan(websites_db: Pool) -> None:
+    """`_PREVIOUS_COMPLETED_INDEX`'s own EXPLAIN test — the worker-path sibling of the one
+    above, not `test_stats_api.py`'s `LIMIT 1` tests: `_LATEST_COMPLETED_INDEX` there is a
+    plain range filter (`started_at >= $2 AND started_at < $3`) with nothing to get wrong at
+    the Index Cond level, while `_PREVIOUS_COMPLETED_INDEX` compares the sort key as the same
+    kind of ROW `_LIST_BY_WEBSITE_AFTER_CURSOR` does — `(started_at, id) < ($2, $3)` — against
+    a cursor drawn from a real row deep in a website's history, so the identical OR-expansion
+    regression `test_the_keyset_cursor_bound_reaches_the_index_condition` guards against is
+    possible here too, and for a query that runs on every successful crawl
+    (`CrawlService._build_index_diff`), not merely on a page load.
+
+    **Two CTEs, `previous` and `previous_completed`, each with their own row-value
+    comparison** (`internals/runs_reader.py`'s own comment above `_PREVIOUS_COMPLETED_INDEX`
+    explains why there are two), so this asserts the started_at bound reached the Index Cond
+    of EVERY `Index Scan`/`Index Only Scan` node in the plan, not merely one of them — a
+    regression in either CTE's WHERE clause is exactly as real as a regression in the other.
+    """
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://explain-previous.example")
+    await _seed_many_runs_for_explain(websites_db, website_id)
+
+    # Same deep cursor shape as the keyset test above -- 1,000 rows in, where the OR-expanded
+    # form's wasted work would show up.
+    deep_row = await websites_db.fetchrow(
+        """
+        SELECT started_at, id FROM runs
+        WHERE website_id = $1
+        ORDER BY started_at DESC, id DESC
+        OFFSET 1000 LIMIT 1
+        """,
+        website_id,
+    )
+    assert deep_row is not None
+
+    plan = await explain_plan(
+        websites_db, _PREVIOUS_COMPLETED_INDEX, website_id, deep_row["started_at"], deep_row["id"]
+    )
+
+    # The same shape guarantee as the cursor test: composite index, by name, no plain Sort
+    # (an `Incremental Sort` atop the index's own `started_at` ordering is expected, exactly
+    # as it is for the first-page and cursor regimes above).
+    nodes = _assert_uses_the_composite_index_via_its_natural_ordering(plan)
+
+    index_scans = [n for n in nodes if n["Node Type"] in ("Index Scan", "Index Only Scan")]
+    assert index_scans, [n["Node Type"] for n in nodes]
+
+    index_conds = [n.get("Index Cond", "") for n in index_scans]
+    assert all("started_at" in cond for cond in index_conds), (
+        "At least one of the two CTEs' started_at bound did not reach its Index Cond, so that "
+        "scan is starting at the newest run and filtering rather than starting at the cursor. "
+        "This is the exact regression the OR-expanded WHERE clause causes; see the module "
+        f"docstring of app/features/runs/internals/runs_reader.py. Index Conds: {index_conds}"
     )

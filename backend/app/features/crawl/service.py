@@ -52,6 +52,15 @@ already runs: `discover_sitemap_urls` returns `DiscoveryResult.robots`, this met
 into `select_urls(..., robots=...)` for frontier filtering and into `crawl_site(...,
 is_allowed=robots.is_allowed)` for the seed — one parsed `RobotsRules`, two consumers, neither
 of which re-fetches or re-parses anything.
+
+**PER-193 added a FOURTH call to that same window: `_build_index_diff`'s read of the previous
+completed run, via `RunService.get_previous_completed_index`.** It is a database read rather
+than an external HTTP call, but the rule it sits under is the same one — no transaction may be
+open while it runs, and it runs strictly after `generate_llms_txt` has produced this run's own
+index and strictly before the Storage upload. Like enrichment, it CANNOT fail the run:
+`_build_index_diff` catches every `Exception` the read raises and degrades to `index_diff =
+None`, on the same reasoning enrichment's own belt-and-braces catch gives — a diff is derived
+bookkeeping, and the artifact is the product.
 """
 
 import asyncio
@@ -79,6 +88,7 @@ from app.features.crawl.internals.fetcher import (
     FetchError,
     PolitenessGate,
 )
+from app.features.crawl.internals.index_diff import PreviousIndex, build_index_diff
 from app.features.crawl.internals.links import extract_links
 from app.features.crawl.internals.llms_txt import (
     count_full_txt_truncations,
@@ -97,6 +107,7 @@ from app.features.crawl.internals.sitemap import DiscoverySource, discover_sitem
 from app.features.crawl.internals.ssrf import SsrfBlockedError
 from app.features.crawl.internals.url_ranking import DiscoveredUrl, SelectionResult, select_urls
 from app.features.crawl.schemas import CrawledPage, CrawlOutcome
+from app.features.runs.schemas import RunDetailResponse
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
 from app.infrastructure.storage.supabase_storage import StorageUploadError, SupabaseStorage
@@ -424,6 +435,13 @@ class CrawlService:
         enrich_failures = 0
         enrich_input_tokens = 0
         enrich_output_tokens = 0
+        # Same hoisting reasoning again, for the two PER-193 keys: `llms_txt_bytes` stays 0
+        # and `index_diff` stays `None` on every path that never generated an index — a seed
+        # failure, or any failure before `generate_llms_txt` ran — for the identical reason
+        # `links_emitted` does. The shape `runs.stats` stores must not depend on how far a
+        # run got, and that now includes whether it got as far as diffing its own index.
+        llms_txt_bytes = 0
+        index_diff: dict[str, Any] | None = None
         outcome: CrawlOutcome | None = None
         # Same hoisting reasoning as the three locals above: a seed failure never reaches the
         # `discover_sitemap_urls`/`select_urls` call below, so `build_run_stats` in that path
@@ -600,6 +618,8 @@ class CrawlService:
                         enrich_failures=enrich_failures,
                         enrich_input_tokens=enrich_input_tokens,
                         enrich_output_tokens=enrich_output_tokens,
+                        llms_txt_bytes=llms_txt_bytes,
+                        index_diff=index_diff,
                     ),
                 )
             else:
@@ -665,6 +685,16 @@ class CrawlService:
                 # above for why the two can differ, and `serialize_payload` a few lines down
                 # for why the PAYLOAD deliberately does not follow this same substitution.
                 llms_txt = generate_llms_txt(artifact_pages)
+
+                # THE DIFF READ. No transaction is open here, and none may be opened around
+                # it — see the module docstring's "PER-193 added a FOURTH call" paragraph.
+                # Sits between generating this run's own index and everything downstream of
+                # it (the full-text expansion, the payload, the upload): the diff needs only
+                # `llms_txt` and `urls_discovered`, both already in hand, so there is no
+                # reason to delay it behind work it does not depend on.
+                llms_txt_bytes = len(llms_txt.encode())
+                index_diff = await self._build_index_diff(run, run_id, llms_txt, urls_discovered)
+
                 llms_full_txt = generate_llms_full_txt(artifact_pages)
                 links_emitted = count_indexed_pages(artifact_pages)
                 full_txt_truncated = count_full_txt_truncations(artifact_pages)
@@ -710,6 +740,8 @@ class CrawlService:
                     enrich_failures=enrich_failures,
                     enrich_input_tokens=enrich_input_tokens,
                     enrich_output_tokens=enrich_output_tokens,
+                    llms_txt_bytes=llms_txt_bytes,
+                    index_diff=index_diff,
                 )
                 await self._runs.record_success(
                     run_id,
@@ -762,6 +794,8 @@ class CrawlService:
                     enrich_failures=enrich_failures,
                     enrich_input_tokens=enrich_input_tokens,
                     enrich_output_tokens=enrich_output_tokens,
+                    llms_txt_bytes=llms_txt_bytes,
+                    index_diff=index_diff,
                 )
                 if result is not None
                 else None
@@ -773,6 +807,72 @@ class CrawlService:
         if pending_retry is not None:
             raise pending_retry
         return outcome
+
+    async def _build_index_diff(
+        self, run: RunDetailResponse, run_id: UUID, llms_txt: str, urls_discovered: int
+    ) -> dict[str, Any] | None:
+        """This run's `index_diff` block, or `None` if computing it failed.
+
+        Reads the previous completed run via `RunService.get_previous_completed_index` and
+        feeds both indexes to `internals/index_diff.py`'s `build_index_diff` — the pure half
+        of this work, which never raises on its own. **This method's entire body is the read,
+        wrapped in one `try`/`except Exception`.** A diff is derived bookkeeping computed
+        AFTER this run's own artifact already exists; failing an otherwise-successful crawl
+        because a bookkeeping read against `runs` hit a transient database blip would be
+        exactly the wrong trade — the identical argument `execute_run`'s enrichment
+        belt-and-braces catch makes for a bad model call, in the module docstring's own
+        words. `asyncio.CancelledError` is a `BaseException`, not an `Exception`, and is
+        therefore deliberately NOT caught here either — arq's job timeout and a deploy's
+        SIGTERM still reach `execute_run`'s own `except asyncio.CancelledError` handler
+        unchanged, exactly as they would if this method did not exist.
+
+        Called once, from the success branch, strictly after this run's own `llms_txt` exists
+        and strictly before the Storage upload — see the call site's comment and the module
+        docstring's "PER-193 added a FOURTH call" paragraph for why no transaction may be
+        open here.
+
+        Args:
+            run: This run's own `RunDetailResponse`, already fetched at the top of
+                `execute_run` — reused for its `website_id` and `started_at` rather than
+                fetched again.
+            run_id: This run's own id — the tie-break half of the keyset pair
+                `get_previous_completed_index` compares against.
+            llms_txt: This run's own freshly generated index.
+            urls_discovered: This run's own `runs.stats["urls_discovered"]` value.
+
+        Returns:
+            `build_index_diff`'s result, or `None` on any exception from the read.
+        """
+        try:
+            previous, previous_run_completed = await self._runs.get_previous_completed_index(
+                run.website_id, before_started_at=run.started_at, before_run_id=run_id
+            )
+        except Exception:
+            logger.warning(
+                "crawl: could not read the previous completed run's index; recording no "
+                "index_diff for this run",
+                exc_info=True,
+            )
+            return None
+
+        previous_index = (
+            None
+            if previous is None
+            else PreviousIndex(
+                run_id=str(previous.run_id),
+                completed_at=(
+                    previous.completed_at.isoformat() if previous.completed_at is not None else None
+                ),
+                llms_txt=previous.llms_txt,
+                urls_discovered=previous.urls_discovered,
+            )
+        )
+        return build_index_diff(
+            current_llms_txt=llms_txt,
+            current_urls_discovered=urls_discovered,
+            previous=previous_index,
+            previous_run_completed=previous_run_completed,
+        )
 
     def _select_seed_links(
         self, seed_page: CrawledPage, *, limit: int, robots: RobotsRules | None = None

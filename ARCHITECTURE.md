@@ -553,6 +553,31 @@ calling an API — and `anthropic_client.py` sits at the top of the feature, bes
 gives: `app/worker/settings.py` has to import it to build the shared client, and `internals/`
 is private to this feature (§3.1).
 
+**Diffing one run's index against the previous completed run's, as of PER-193.**
+`internals/index_diff.py`'s `build_index_diff` is a fourth model-free, pure module in this
+feature, alongside `run_stats.py`, `llms_txt.py`, and `url_ranking.py`. It never sees a
+`CrawledPage` — its two inputs are the current run's freshly generated `llms.txt` string and
+the previous completed run's STORED `llms_txt` string, both parsed back into page lists by the
+same reverse parser, `parse_index`. Parsing both sides rather than diffing the current pages
+directly against a parsed previous list is the load-bearing choice: it makes the two sides
+comparable as what the ARTIFACT says rather than what the crawler originally saw, so a
+rendering imperfection (a title's 500-character ellipsis, an escape round-trip) cancels
+instead of reading as a page swap on every run. `CrawlService._build_index_diff` calls it from
+`execute_run`'s success branch, right after `generate_llms_txt` produces this run's own index
+and strictly before the Storage upload — a fourth call in the no-transaction window §5.1
+already grants `crawl_site`, the upload, and enrichment, reading the previous run via
+`RunService.get_previous_completed_index` (no transaction, no ownership check, the same
+worker-path reasoning `claim_for_processing` gives for itself). Like enrichment, this call
+CANNOT fail the run: a read failure is caught and degrades to `index_diff: None`, because the
+diff is derived bookkeeping and the artifact already exists by the time it runs. The result —
+`llms_txt_bytes` and `index_diff` — lands in `runs.stats` at `RUN_STATS_VERSION` **7**, the
+second bump since PER-180's 5 (PER-191 took 6 for `urls_robots_disallowed`/`crawl_delay_ms`
+first), and `GET /websites/{id}/stats` (§8.6) is what surfaces it: the
+per-bucket series gains `runs_compared`/`pages_added`/`pages_removed` (real zeroes) and
+`index_pages`/`index_bytes` (`null`, never `0`, for a bucket with no completed run to ask), and
+a new `latest` field carries the newest completed run's own diff, window-scoped like
+`last_run_at`.
+
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
 table-free I/O to do may keep it in `internals/` anyway, as this one keeps `ssrf.py`,
@@ -1304,9 +1329,9 @@ very same rows. `runs.forWebsite(id)` exists to be invalidated and is a prefix o
 `["runs", "list", websiteId]`; nesting stats under `runs` would either fall outside that
 prefix, making the nesting decorative, or inside it, so that every "this website's history
 changed" invalidation also dropped an aggregate the Trends tab may be rendering. Its
-`window` is part of the key for the reason `include` is part of `websites.list`: `?window=7d`
-and `?window=90d` are different responses with different `bucket` fields and different
-series lengths, and one key for both would render 7d's hourly buckets under day labels until
+`window` is part of the key for the reason `include` is part of `websites.list`: `?window=1d`
+and `?window=14d` are different responses with different `bucket` fields and different
+series lengths, and one key for both would render 1d's hourly buckets under day labels until
 the refetch landed.
 
 `runs` carries two further keys, both added for the detail page. `.infinite(websiteId,

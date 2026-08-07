@@ -12,23 +12,28 @@ from app.features.crawl.internals.run_stats import RUN_STATS_VERSION, build_run_
 def test_run_stats_version_is_pinned() -> None:
     """PER-191 bumped this from 5 to 6 when `urls_robots_disallowed` and `crawl_delay_ms`
     joined the persisted shape — the two numbers describing how this run's `robots.txt`
-    affected its frontier and its fetch pace. See `RUN_STATS_VERSION`'s own docstring for the
-    full history, including why both are real, recorded values on every row from this version
-    onward rather than absent keys.
+    affected its frontier and its fetch pace. PER-193 bumped it again, from 6 to 7, when
+    `llms_txt_bytes` and `index_diff` joined the shape — the generated index's byte size, and
+    the block describing what changed against the previous completed run's index. See
+    `RUN_STATS_VERSION`'s own docstring for the full history, including why every one of
+    those four keys is a real, recorded value on every row from the version that added it
+    onward — `llms_txt_bytes: 0` and `index_diff: None` included — rather than an absent key
+    or "not yet computed."
 
     Pinned here, directly, so a future change to the persisted shape has to bump this constant
     deliberately rather than by accident: `tests/test_run_persistence.py` only checks the
     version NUMBER a live row lands with, which would pass just as happily against a
     `RUN_STATS_VERSION` that was bumped again without anyone noticing this test existed."""
-    assert RUN_STATS_VERSION == 6
+    assert RUN_STATS_VERSION == 7
 
 
-def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_twelve_keys() -> None:
+def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_fourteen_keys() -> None:
     """`crawl_stats` — including `pages_empty_content` — is spread into the result verbatim;
     `links_emitted`, `full_txt_truncated`, `discovery_source`, `urls_discovered`,
     `urls_selected`, `urls_robots_disallowed`, `crawl_delay_ms`, `pages_enriched`,
-    `enrich_failures`, `enrich_input_tokens`, `enrich_output_tokens`, and `version` are the
-    only twelve keys `build_run_stats` itself contributes."""
+    `enrich_failures`, `enrich_input_tokens`, `enrich_output_tokens`, `llms_txt_bytes`,
+    `index_diff`, and `version` are the only fourteen keys `build_run_stats` itself
+    contributes."""
     crawl_stats = {
         "pages_crawled": 3,
         "pages_failed": 1,
@@ -51,6 +56,8 @@ def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_twelve_ke
         enrich_failures=0,
         enrich_input_tokens=1200,
         enrich_output_tokens=40,
+        llms_txt_bytes=512,
+        index_diff={"state": "first_run", "previous_run_completed": None},
     )
 
     assert stats == {
@@ -66,8 +73,39 @@ def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_twelve_ke
         "enrich_failures": 0,
         "enrich_input_tokens": 1200,
         "enrich_output_tokens": 40,
+        "llms_txt_bytes": 512,
+        "index_diff": {"state": "first_run", "previous_run_completed": None},
         "version": RUN_STATS_VERSION,
     }
+
+
+def test_index_diff_is_none_and_llms_txt_bytes_zero_on_a_failure_shaped_call() -> None:
+    """The key is present with a null value, which is what makes a version-7 row
+    unambiguous — a reader never has to distinguish "this run predates PER-193" from "this
+    run produced no index" by anything other than the key's presence and its value."""
+    crawl_stats = {"pages_crawled": 0, "pages_empty_content": 0}
+
+    stats = build_run_stats(
+        crawl_stats,
+        links_emitted=0,
+        full_txt_truncated=0,
+        discovery_source="none",
+        urls_discovered=0,
+        urls_selected=0,
+        urls_robots_disallowed=0,
+        crawl_delay_ms=200,
+        pages_enriched=0,
+        enrich_failures=0,
+        enrich_input_tokens=0,
+        enrich_output_tokens=0,
+        llms_txt_bytes=0,
+        index_diff=None,
+    )
+
+    assert "llms_txt_bytes" in stats
+    assert stats["llms_txt_bytes"] == 0
+    assert "index_diff" in stats
+    assert stats["index_diff"] is None
 
 
 def test_links_emitted_is_recorded_as_passed_even_when_it_differs_from_pages_crawled() -> None:
@@ -91,6 +129,8 @@ def test_links_emitted_is_recorded_as_passed_even_when_it_differs_from_pages_cra
         enrich_failures=0,
         enrich_input_tokens=0,
         enrich_output_tokens=0,
+        llms_txt_bytes=100,
+        index_diff=None,
     )
 
     assert stats["pages_crawled"] == 3
@@ -99,13 +139,13 @@ def test_links_emitted_is_recorded_as_passed_even_when_it_differs_from_pages_cra
 
 def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
     """Every key `crawl_stats` arrived with survives into the result with its original value,
-    alongside the twelve this module contributes.
+    alongside the fourteen this module contributes.
 
     Deliberately NOT a collision test. `build_run_stats` spreads `{**crawl_stats, ...}`, so a
-    `crawl_stats` that already carried one of the twelve contributed keys would have that
+    `crawl_stats` that already carried one of the fourteen contributed keys would have that
     value OVERWRITTEN, not preserved — asserting otherwise here would be asserting the
     opposite of what the code does. The real guarantee, as `build_run_stats`' own docstring
-    states, is that none of the twelve is a key `CrawlResult.stats` has ever produced, which
+    states, is that none of the fourteen is a key `CrawlResult.stats` has ever produced, which
     is a property of `internals/crawler.py` rather than of this function;
     `tests/test_crawler_caps.py` is where that side of it is pinned down."""
     crawl_stats = {"pages_crawled": 1, "pages_empty_content": 0}
@@ -123,6 +163,8 @@ def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
         enrich_failures=1,
         enrich_input_tokens=100,
         enrich_output_tokens=10,
+        llms_txt_bytes=64,
+        index_diff={"state": "first_run", "previous_run_completed": None},
     )
 
     assert stats["pages_crawled"] == 1
@@ -138,12 +180,14 @@ def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
     assert stats["enrich_failures"] == 1
     assert stats["enrich_input_tokens"] == 100
     assert stats["enrich_output_tokens"] == 10
+    assert stats["llms_txt_bytes"] == 64
+    assert stats["index_diff"] == {"state": "first_run", "previous_run_completed": None}
     assert stats["version"] == RUN_STATS_VERSION
 
 
 def test_build_run_stats_carries_the_discovery_counters() -> None:
     """The three PER-176 keys land with exactly the values passed in — a narrower,
-    single-purpose companion to the "adds twelve keys" test above, named for the acceptance
+    single-purpose companion to the "adds fourteen keys" test above, named for the acceptance
     criterion it pins rather than for the mechanics of the dict spread.
 
     `urls_discovered` (7) and `urls_selected` (3) are deliberately unequal to each other and
@@ -166,6 +210,8 @@ def test_build_run_stats_carries_the_discovery_counters() -> None:
         enrich_failures=0,
         enrich_input_tokens=0,
         enrich_output_tokens=0,
+        llms_txt_bytes=256,
+        index_diff=None,
     )
 
     assert stats["discovery_source"] == "robots"
@@ -194,6 +240,8 @@ def test_build_run_stats_carries_the_enrichment_counters() -> None:
         enrich_failures=2,
         enrich_input_tokens=8_400,
         enrich_output_tokens=320,
+        llms_txt_bytes=900,
+        index_diff=None,
     )
 
     assert stats["pages_enriched"] == 7
@@ -222,6 +270,8 @@ def test_build_run_stats_carries_the_robots_counters() -> None:
         enrich_failures=0,
         enrich_input_tokens=0,
         enrich_output_tokens=0,
+        llms_txt_bytes=0,
+        index_diff=None,
     )
 
     assert stats["urls_robots_disallowed"] == 2

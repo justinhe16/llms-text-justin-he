@@ -4,10 +4,17 @@
 // callable from a render pass and answerable on its own (ARCHITECTURE.md §8.4).
 //
 // The neighbouring `run-display.ts` formats ONE run for a table cell; this file folds MANY
-// runs into the shapes three charts and four tiles read. `formatDuration` there and
-// `avgDurationSeconds` here look like duplicates and are not: that one produces a string in
-// two bands ("18.2s", "3m 04s") for a column of text, this one produces a bare `number` in
-// seconds because a chart axis has to scale it, tick it and interpolate it.
+// runs into the shapes the Trends tab's tiles and charts read.
+//
+// As of PER-193 the tab reports on the ARTIFACT — index size, pages added/removed/changed —
+// rather than on the crawler's own timing, and `msToSeconds`/`avg_duration_ms`/`avg_pages` are
+// no longer part of that story. The API keeps both fields (removing a response field is a
+// breaking change with no user-visible benefit), but nothing under `components/crawls/`
+// reads either any more — `TrendsHealthRow` (trends-stat-tiles.tsx), the health summary that
+// replaces the old duration/pages tiles, is one line of `total_runs`/`success_rate` and
+// touches neither. Do not reintroduce a duration helper here on the strength of "this file
+// used to have one" — the ticket's acceptance criteria are explicit that run duration is
+// demoted out of the panel entirely.
 
 import type { StatsBucket, StatsPoint, StatsTotals, WebsiteStats } from "@/lib/api/runs";
 
@@ -47,9 +54,16 @@ const dayTickFormatter = new Intl.DateTimeFormat("en-US", {
 /**
  * "Thu, 14:00" — an `hour` bucket's axis tick.
  *
- * The weekday is what makes an hourly tick unambiguous without a date: `hour` buckets are
- * only ever used for the 7d window, and no weekday repeats inside seven days. A bare "14:00"
- * would appear seven times on one axis meaning seven different afternoons.
+ * The weekday is what makes an hourly tick unambiguous without a date. As of PER-193, `hour`
+ * buckets serve **both** the 1d and 7d windows (`internals/stats_window.py`) — 24 buckets or
+ * 168 — and this formatter cannot tell which window produced a given point, because it formats
+ * from `bucket`, not from `window` (see `formatBucketTick`'s docstring for why that is the
+ * rule and must stay the rule). For 1d, the weekday prefix is redundant — it repeats the same
+ * word across all 24 ticks — but redundant is the safe failure mode: for 7d, a bare "14:00"
+ * would appear seven times on one axis meaning seven different afternoons, which is actively
+ * misleading rather than merely repetitive. Do not add a `window` parameter to this formatter
+ * (or `hourLabelFormatter`) to special-case 1d — that would require threading `window` through
+ * every call site for a cosmetic difference on the shortest, least ambiguous window.
  */
 const hourTickFormatter = new Intl.DateTimeFormat("en-US", {
   timeZone: UTC,
@@ -126,17 +140,28 @@ export function successRatePercent(rate: number | null): number | null {
 }
 
 /**
- * Milliseconds to seconds, for display. The API reports every duration in milliseconds
- * (`avg_duration_ms`) and every chart and tile in this panel shows seconds, so this is the
- * single place the conversion happens rather than a `/ 1000` scattered across four call
- * sites.
+ * Bytes to kilobytes, for the index-size chart's axis and tooltip. `1024`, not `1000` — this
+ * mirrors the backend's own KiB/MiB constants (`internals/llms_txt.py`'s `MAX_PAGE_TEXT_BYTES`
+ * and `MAX_FULL_TEXT_BYTES`), so a number on this chart and the byte caps that bound it are
+ * expressed in the same unit.
  *
- * Not rounded here. The tile rounds to one decimal through `NumberTicker`'s
- * `decimalPlaces`, and the chart wants the unrounded value so its y-axis can pick its own
- * precision.
+ * Not rounded here, for the same reason the deleted `msToSeconds` was not: the chart wants the
+ * unrounded value so its y-axis and its tooltip can each pick their own precision.
  */
-export function msToSeconds(ms: number): number {
-  return ms / 1000;
+export function bytesToKb(bytes: number): number {
+  return bytes / 1024;
+}
+
+/**
+ * "+3" / "-2" / "0" — a delta with an explicit sign, for the change chart's tooltip and the
+ * "what changed" panel's secondary metrics strip.
+ *
+ * `toLocaleString()` already renders a negative number with its own `-`; the only case this
+ * adds anything is a positive one, where a bare "3" reads as a count rather than a CHANGE.
+ * Zero gets no sign either way — "+0" implies a direction nothing actually moved in.
+ */
+export function signedCount(n: number): string {
+  return n > 0 ? `+${n.toLocaleString()}` : n.toLocaleString();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -151,33 +176,59 @@ export interface TrendPoint {
   tick: string;
   /** The fuller tooltip heading for this bucket. */
   label: string;
-  /** `avg_pages`, unchanged. */
-  pages: number;
-  /** `avg_duration_ms` in seconds. */
-  seconds: number;
   /** How many runs fell in this bucket. `0` for a zero-filled bucket — see below. */
   runs: number;
+  /** How many of this bucket's completed runs recorded a comparison. `0` is real — see
+   * `StatsPoint.runs_compared`. */
+  runsCompared: number;
+  /** `bytesToKb(index_bytes)`, or `null` — never `0` — when no completed run in this bucket
+   * recorded an index size. The genuine gap `IndexSizeChart`'s `connectNulls={false}` must
+   * break the line across, rather than a quiet-hour zero a line should pass straight through. */
+  indexKb: number | null;
+  /** `index_pages`, same null-vs-zero rule as `indexKb` — always from the same run. */
+  indexPages: number | null;
+  /** `pages_added`, unchanged — a real `0` when nothing was added or nothing was compared. */
+  added: number;
+  /** `pages_removed`, unchanged. */
+  removed: number;
+  /** `-removed` — the diverging bar's downward series. Recharts stacks `added` and
+   * `removedNegative` on the same `stackId`, so a bucket with three added and two removed
+   * draws a bar reaching +3 and a bar reaching -2, meeting at the zero line the chart draws
+   * with a `ReferenceLine`. */
+  removedNegative: number;
 }
 
 /**
  * The response's `series` as chart rows.
  *
- * **Zero buckets stay zero.** The backend zero-fills every empty bucket with
+ * **Zero buckets stay zero — for the counts.** The backend zero-fills every empty bucket with
  * `generate_series`, so `series` always has exactly `bucket_count` entries and a quiet hour
- * arrives as `{ runs: 0, avg_pages: 0, avg_duration_ms: 0 }`. That is a measurement, not a
- * gap: nothing ran, and "nothing ran" is the most useful thing a trend chart can show. So
- * nothing here drops those rows, converts them to `null`, or smooths over them — and the
- * charts that consume this must not set `connectNulls` or any other gap-bridging option
- * either. A line that glides over a two-day outage is a line that lies about it.
+ * arrives as `{ runs: 0, runs_compared: 0, pages_added: 0, pages_removed: 0 }`. Those are
+ * measurements, not gaps: nothing ran (or nothing was compared), and "nothing happened" is the
+ * most useful thing a trend chart can show. So nothing here drops those rows, converts them to
+ * `null`, or smooths over them.
+ *
+ * **`indexKb`/`indexPages` are the other half of the same discipline, pointed the other
+ * way.** They are `null`, never `0`, for a bucket with no completed run that recorded an index
+ * size — the backend's own `index_pages`/`index_bytes` fields (`RunStatsPoint`) are `null`
+ * under exactly that condition, and this function is a straight pass-through of that
+ * distinction, not a place that resolves it. A chart rendering `indexKb` must treat `null` as
+ * a genuine gap (`connectNulls={false}`); this is not a contradiction of "zero buckets stay
+ * zero" above, it is the other half of the same rule — zero means "measured and nothing
+ * happened", `null` means "no measurement exists for this bucket."
  */
 export function toTrendPoints(stats: WebsiteStats): TrendPoint[] {
   return stats.series.map((point: StatsPoint) => ({
     t: point.t,
     tick: formatBucketTick(point.t, stats.bucket),
     label: formatBucketLabel(point.t, stats.bucket),
-    pages: point.avg_pages,
-    seconds: msToSeconds(point.avg_duration_ms),
     runs: point.runs,
+    runsCompared: point.runs_compared,
+    indexKb: point.index_bytes === null ? null : bytesToKb(point.index_bytes),
+    indexPages: point.index_pages,
+    added: point.pages_added,
+    removed: point.pages_removed,
+    removedNegative: -point.pages_removed,
   }));
 }
 
@@ -227,4 +278,29 @@ export function outcomeBreakdown(totals: StatsTotals): OutcomeBreakdown {
  */
 export function windowHasRuns(totals: StatsTotals): boolean {
   return totals.total_runs > 0;
+}
+
+/**
+ * Whether any completed run in the window recorded a comparison against a previous index —
+ * what `ChangeChart` (trends-charts.tsx) reads to decide its empty overlay.
+ *
+ * Read off `totals.runs_compared`, the summed `RunStatsPoint.runs_compared`, rather than
+ * scanning `series` for a nonzero `added`/`removed` — a window where every compared run
+ * happened to add and remove exactly zero pages is still a window WITH comparisons, and
+ * `windowHasComparisons` must say so.
+ */
+export function windowHasComparisons(totals: StatsTotals): boolean {
+  return totals.runs_compared > 0;
+}
+
+/**
+ * Whether any bucket in `points` has a known index size — what `IndexSizeChart`
+ * (trends-charts.tsx) reads to decide its empty overlay.
+ *
+ * `!== null`, never a truthiness check: `indexKb` can legitimately be `0` for a website whose
+ * `llms.txt` is an empty document, and `0` is exactly as "has a known size" as any other
+ * number.
+ */
+export function windowHasIndexSizes(points: TrendPoint[]): boolean {
+  return points.some((point) => point.indexKb !== null);
 }

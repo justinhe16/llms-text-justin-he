@@ -419,6 +419,25 @@ def _parse_candidate(url: str) -> _NormalizedCandidate | None:
     )
 
 
+def normalize_url(url: str) -> str | None:
+    """The comparison key for one URL — the exact normalized string `select_urls` compares
+    candidates by (fragment stripped, scheme/host lowercased, tracking parameters dropped,
+    trailing slash normalized). `None` when `url` is unparseable, the same condition
+    `_parse_candidate` itself signals.
+
+    The one public export this module makes beyond `DiscoveredUrl`/`SelectionResult`/
+    `select_urls`, added so that `internals/index_diff.py` (PER-193) can match a
+    previous-run URL against a current-run URL on the SAME key `select_urls` already
+    dedupes on — which is what makes a trailing-slash or `utm_*`-only change compare equal
+    instead of reading as a page swap. `index_diff.py` is a sibling module in this same
+    feature (`crawl/internals/`), so importing it there is not the cross-feature-internals
+    reach ARCHITECTURE.md §3.1 forbids; it is one module reusing another's normalization
+    inside one feature, which is exactly what that rule allows.
+    """
+    candidate = _parse_candidate(url)
+    return None if candidate is None else candidate.url
+
+
 def _origin(candidate: _NormalizedCandidate) -> tuple[str, str, int]:
     """`(scheme, host, port)` with the port collapsed to the scheme's default — the same
     equality `websites/internals/url_normalize.py`'s `NormalizedUrl.origin` already uses.
