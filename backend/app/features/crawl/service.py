@@ -30,6 +30,14 @@ a `completed` run whose `storage_path` points at an object that was never actual
 a 404 in the UI on a run the database swears succeeded. Nothing about this method holds a
 database transaction open while the upload is in flight; `RunService.record_success` opens
 its own transaction only after `await self._storage.upload(...)` has already returned.
+
+**PER-180 added a THIRD network call to that same no-transaction window: flag-gated,
+model-assisted enrichment (`internals/enrich.py`'s `enrich_pages`), between artifact
+generation and the Storage upload.** It is the one call in this window that CANNOT fail the
+run — unlike the Storage upload, whose failure is `StorageUploadError` and ends the attempt
+one way or another, a bad or unreachable model call degrades silently to the deterministic
+artifact `internals/llms_txt.py` has always produced. See `execute_run`'s own comment at the
+call site for exactly where it sits and why nowhere else would do.
 """
 
 import asyncio
@@ -38,11 +46,13 @@ from typing import Any, Final
 from uuid import UUID
 
 import httpx
+from anthropic import AsyncAnthropic
 from asyncpg import Pool
 from fastapi import HTTPException
 
 from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, CrawlResult, crawl_site
+from app.features.crawl.internals.enrich import apply_summaries, enrich_pages
 from app.features.crawl.internals.fetcher import ByteBudget, ByteBudgetExceededError, FetchError
 from app.features.crawl.internals.llms_txt import (
     count_full_txt_truncations,
@@ -235,12 +245,20 @@ class CrawlService:
         run_service: RunService,
         website_service: WebsiteService,
         settings: Settings,
+        *,
+        anthropic_client: AsyncAnthropic | None = None,
     ) -> None:
         self._client = client
         self._storage = storage
         self._runs = run_service
         self._websites = website_service
         self._settings = settings
+        # `None` when `settings.crawl_enrich_with_llm` is off, or in every test that builds a
+        # `CrawlService` without one — `execute_run`'s enrichment guard checks both the flag
+        # and this attribute before ever calling `enrich_pages`, so a service built with no
+        # client behaves exactly like one built with the flag off, regardless of which the
+        # caller forgot.
+        self._anthropic = anthropic_client
 
     async def execute_run(self, run_id: UUID, *, max_attempts: int) -> CrawlOutcome | None:
         """Crawl the website behind `run_id`, and return what it produced — or `None`.
@@ -348,6 +366,16 @@ class CrawlService:
         result: CrawlResult | None = None
         links_emitted = 0
         full_txt_truncated = 0
+        # Same reasoning again, for the four PER-180 counters: they stay 0 on every path that
+        # never reached enrichment — a seed failure, a run with the flag off, a run where
+        # `self._anthropic` is `None` — for exactly the reason `links_emitted` and
+        # `full_txt_truncated` above stay 0 on those same paths. The shape `runs.stats`
+        # stores must not depend on how far a run got, and that now includes whether it got
+        # as far as calling a model.
+        pages_enriched = 0
+        enrich_failures = 0
+        enrich_input_tokens = 0
+        enrich_output_tokens = 0
         outcome: CrawlOutcome | None = None
         # Same hoisting reasoning as the three locals above: a seed failure never reaches the
         # `discover_sitemap_urls`/`select_urls` call below, so `build_run_stats` in that path
@@ -430,9 +458,64 @@ class CrawlService:
                         discovery_source=discovery_source,
                         urls_discovered=urls_discovered,
                         urls_selected=urls_selected,
+                        pages_enriched=pages_enriched,
+                        enrich_failures=enrich_failures,
+                        enrich_input_tokens=enrich_input_tokens,
+                        enrich_output_tokens=enrich_output_tokens,
                     ),
                 )
             else:
+                # ENRICHMENT, FIRST THING IN THIS BRANCH, BEFORE `generate_llms_txt`. This is
+                # the only place it can sit: `generate_llms_txt`/`generate_llms_full_txt` read
+                # `title`/`description` straight off each `CrawledPage` (`internals/llms_txt.py`),
+                # so a summary applied after either had already run would never reach the
+                # artifact it was supposed to improve. ARCHITECTURE.md §11 requires this to be
+                # a layer ABOVE `internals/llms_txt.py`, never inside it — `artifact_pages`
+                # below, not `result.pages` itself, is what carries that layering: the seam's
+                # own module stays completely unaware a model was ever involved. And exactly
+                # like the upload two dozen lines down, NO TRANSACTION IS OPEN HERE and none
+                # may be opened around it (ARCHITECTURE.md §5.1) — this call sits in the same
+                # network-calls-outside-every-transaction window the Storage upload already
+                # occupies, between the atomic claim and `RunService.record_success`.
+                artifact_pages = result.pages
+                if self._settings.crawl_enrich_with_llm and self._anthropic is not None:
+                    try:
+                        enrichment = await enrich_pages(
+                            self._anthropic, result.pages, settings=self._settings
+                        )
+                    except Exception:
+                        # BELT-AND-BRACES. `enrich_pages` itself never raises for an API
+                        # reason (its own module docstring), so reaching this branch means a
+                        # bug in `internals/enrich.py` rather than an ordinary model failure —
+                        # and this codebase's rule is still "a model can never fail a run"
+                        # (ARCHITECTURE.md §11), so that has to be true structurally, not
+                        # merely true as long as that module stays bug-free. `artifact_pages`
+                        # is left at `result.pages`, exactly the fallback a per-page failure
+                        # inside `enrich_pages` already produces, so this branch and that one
+                        # are indistinguishable to everything downstream of it.
+                        #
+                        # `asyncio.CancelledError` is a `BaseException`, not an `Exception`,
+                        # and is therefore DELIBERATELY NOT caught by this clause — arq's job
+                        # timeout and a deploy's SIGTERM still reach this method's own
+                        # `except asyncio.CancelledError` handler unchanged, exactly as they
+                        # would if this call were not here at all.
+                        logger.error("crawl: enrichment failed unexpectedly", exc_info=True)
+                    else:
+                        artifact_pages = apply_summaries(result.pages, enrichment.summaries)
+                        pages_enriched = len(enrichment.summaries)
+                        enrich_failures = enrichment.failures
+                        enrich_input_tokens = enrichment.input_tokens
+                        enrich_output_tokens = enrichment.output_tokens
+                        logger.info(
+                            "crawl: enrichment complete",
+                            extra={
+                                "pages_enriched": pages_enriched,
+                                "enrich_failures": enrich_failures,
+                                "enrich_input_tokens": enrich_input_tokens,
+                                "enrich_output_tokens": enrich_output_tokens,
+                            },
+                        )
+
                 # All four calls are pure and none touches the network, so generating the
                 # artifacts here — before the upload, and long before any transaction — costs
                 # the run nothing it was not already going to spend. `links_emitted` is asked
@@ -440,11 +523,23 @@ class CrawlService:
                 # it used to be: the index omits pages with no extractable content, and the
                 # only component that knows how many it omitted is the one that built it
                 # (`internals/llms_txt.py`, and `RUN_STATS_VERSION` 3 for what that changed).
-                llms_txt = generate_llms_txt(result.pages)
-                llms_full_txt = generate_llms_full_txt(result.pages)
-                links_emitted = count_indexed_pages(result.pages)
-                full_txt_truncated = count_full_txt_truncations(result.pages)
+                # Reads `artifact_pages`, not `result.pages` — see the enrichment comment
+                # above for why the two can differ, and `serialize_payload` a few lines down
+                # for why the PAYLOAD deliberately does not follow this same substitution.
+                llms_txt = generate_llms_txt(artifact_pages)
+                llms_full_txt = generate_llms_full_txt(artifact_pages)
+                links_emitted = count_indexed_pages(artifact_pages)
+                full_txt_truncated = count_full_txt_truncations(artifact_pages)
 
+                # `result.pages` — the ORIGINAL, extracted pages, never `artifact_pages` — is
+                # deliberate and asymmetric with the four calls just above it. The payload is
+                # this run's archival record, "meant to outlive today's extractor"
+                # (`CrawledPage.markdown`'s own docstring) — a future re-extraction pass reads
+                # it to reproduce what THIS extractor produced, and overwriting an archived
+                # extracted title with a model-written one would destroy that record
+                # permanently and conflate "what this feature extracted" with "what a model
+                # wrote about it," a distinction nothing downstream of Storage could ever
+                # recover once it was gone.
                 payload = serialize_payload(result.pages)
                 object_path = payload_object_path(run.website_id, run_id)
 
@@ -471,6 +566,10 @@ class CrawlService:
                     discovery_source=discovery_source,
                     urls_discovered=urls_discovered,
                     urls_selected=urls_selected,
+                    pages_enriched=pages_enriched,
+                    enrich_failures=enrich_failures,
+                    enrich_input_tokens=enrich_input_tokens,
+                    enrich_output_tokens=enrich_output_tokens,
                 )
                 await self._runs.record_success(
                     run_id,
@@ -517,6 +616,10 @@ class CrawlService:
                     discovery_source=discovery_source,
                     urls_discovered=urls_discovered,
                     urls_selected=urls_selected,
+                    pages_enriched=pages_enriched,
+                    enrich_failures=enrich_failures,
+                    enrich_input_tokens=enrich_input_tokens,
+                    enrich_output_tokens=enrich_output_tokens,
                 )
                 if result is not None
                 else None
@@ -637,11 +740,17 @@ class CrawlService:
 
 
 def build_crawl_service(
-    pool: Pool, client: httpx.AsyncClient, storage: SupabaseStorage, settings: Settings
+    pool: Pool,
+    client: httpx.AsyncClient,
+    storage: SupabaseStorage,
+    settings: Settings,
+    *,
+    anthropic_client: AsyncAnthropic | None = None,
 ) -> CrawlService:
     """Build a `CrawlService` for one job, from the resources `app.worker.jobs.crawl_task`
-    already has on `ctx`: the process-wide pool, the shared crawl `httpx.AsyncClient`, and
-    the shared `SupabaseStorage` client.
+    already has on `ctx`: the process-wide pool, the shared crawl `httpx.AsyncClient`, the
+    shared `SupabaseStorage` client, and — only when the flag is on — the shared
+    `AsyncAnthropic` client.
 
     Constructs its own `WebsiteService` and `RunService` rather than importing either
     feature's router-level provider function — those are wired for FastAPI's dependency
@@ -650,7 +759,19 @@ def build_crawl_service(
     including handing `RunService` the same `Settings` object: it takes one so that its
     per-user run caps are configurable and testable without mutating the module singleton,
     and a worker-built instance must not quietly diverge from a request-built one.
+
+    `anthropic_client` is keyword-only AND optional, deliberately, rather than matching
+    `client`/`storage`'s required, positional shape: the crawl `httpx.AsyncClient` and the
+    Storage client exist in every worker process regardless of configuration, but the
+    Anthropic client exists only when `settings.crawl_enrich_with_llm` is on
+    (`app/worker/settings.py`'s `open_worker_resources`). Making it required would force
+    every caller — including every test that builds a `CrawlService` without enrichment in
+    mind — to pass `None` explicitly for a feature they are not exercising; making it
+    optional-and-keyword-only instead makes "absent" a first-class, ordinary state rather
+    than something that reads as a misconfiguration at every call site that predates PER-180.
     """
     website_service = WebsiteService(pool)
     run_service = RunService(pool, website_service, settings)
-    return CrawlService(client, storage, run_service, website_service, settings)
+    return CrawlService(
+        client, storage, run_service, website_service, settings, anthropic_client=anthropic_client
+    )

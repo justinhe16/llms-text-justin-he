@@ -13,6 +13,8 @@ would have selected is asserted from its inputs instead, and the drained-on-SIGT
 behaviour itself is exercised for real in tests/test_worker_shutdown.py.
 """
 
+import pytest
+from anthropic import AsyncAnthropic
 from arq.worker import Worker, get_kwargs
 
 from app.core.settings import settings
@@ -384,6 +386,24 @@ class _SpyClient:
         self.closed = True
 
 
+class _SpyAnthropicClient:
+    """A stand-in for `AsyncAnthropic` that only exposes `close()` — deliberately NOT
+    `aclose()`, unlike `_SpyClient` above. `AsyncAnthropic.close()` is a coroutine, spelled
+    differently from every `httpx.AsyncClient` this module also closes, and a test built
+    around a spy that happened to expose BOTH names would not catch a
+    `close_worker_resources` that called the wrong one — it would just silently invoke
+    whichever the implementation picked. This spy is written so that copying the
+    `await client.aclose()` idiom from `http_client`/`storage_client` onto the Anthropic
+    client raises `AttributeError`, exactly as it would against the real SDK.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 async def test_close_worker_resources_closes_the_http_client_and_the_storage_client() -> None:
     """PER-163 added a second `httpx.AsyncClient` (`ctx["storage_client"]`, built by
     `build_storage_client` for `SupabaseStorage`) beside the crawl task's own
@@ -401,8 +421,80 @@ async def test_close_worker_resources_closes_the_http_client_and_the_storage_cli
     assert storage_client.closed
 
 
+async def test_close_worker_resources_closes_the_anthropic_client_via_close_not_aclose() -> None:
+    """PER-180's third client, closed with the SDK's own `close()` rather than the `aclose()`
+    every `httpx.AsyncClient` above uses. `_SpyAnthropicClient` only defines `close`, so this
+    test fails with `AttributeError` if `close_worker_resources` is ever "fixed" to call
+    `aclose()` here by analogy with its two neighbours — exactly the copy-paste bug this spy
+    exists to catch, rather than merely trusting a docstring to prevent it.
+    """
+    anthropic_client = _SpyAnthropicClient()
+    ctx: dict[object, object] = {"anthropic_client": anthropic_client}
+
+    await worker_settings.close_worker_resources(ctx)
+
+    assert anthropic_client.closed
+
+
 async def test_close_worker_resources_tolerates_a_startup_that_never_opened_anything() -> None:
     """`Worker.run()`'s `finally` calls `close_worker_resources` even when `on_startup`
-    failed before it got as far as opening either client — every `ctx.get(...)` inside it
-    must be `None` and skipped rather than raising `KeyError`."""
+    failed before it got as far as opening any client — every `ctx.get(...)` inside it must
+    be `None` and skipped rather than raising `KeyError`, `"anthropic_client"` included: a
+    flag-off worker never sets that key at all (see the `open_worker_resources` tests below),
+    and this same empty-`ctx` call is what proves `close_worker_resources` tolerates that
+    absence exactly as it tolerates every other missing key."""
     await worker_settings.close_worker_resources({})
+
+
+# -----------------------------------------------------------------------------------------
+# PER-180: `ctx["anthropic_client"]` is the one conditional resource `open_worker_resources`
+# publishes — built only when `settings.crawl_enrich_with_llm` is on. `open_pool` is
+# monkeypatched in both tests below so that exercising the real function does not require a
+# real Postgres connection; everything else `open_worker_resources` builds
+# (`build_crawl_client`, `build_storage_client`, `build_supabase_storage`) opens no socket on
+# construction (see each factory's own docstring), so those run for real.
+# -----------------------------------------------------------------------------------------
+
+
+async def _fake_open_pool(settings: object) -> object:
+    """A stand-in for `app.infrastructure.db.pool.open_pool`, monkeypatched onto the NAME
+    `open_worker_resources` calls rather than onto the real `db.pool` module — so the real
+    module's process-wide singleton is never touched and nothing here needs a live Postgres.
+    What `open_worker_resources` does with the pool it gets back is covered by
+    `tests/test_pool.py`; these two tests are only about the Anthropic client beside it.
+    """
+    return object()
+
+
+async def test_open_worker_resources_builds_no_anthropic_client_while_the_flag_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance criterion 1, against the real function. With the flag off — the default,
+    and the case this whole test suite and CI run under — `ctx` never gets an
+    `"anthropic_client"` key at all, which is what lets `app.worker.jobs.crawl_task` tell
+    "the flag is off" apart from "the client failed to build" with a plain `ctx.get(...)`.
+    """
+    monkeypatch.setattr(worker_settings, "open_pool", _fake_open_pool)
+    monkeypatch.setattr(worker_settings.settings, "crawl_enrich_with_llm", False)
+
+    ctx: dict[str, object] = {}
+    await worker_settings.open_worker_resources(ctx)
+
+    assert "anthropic_client" not in ctx
+
+
+async def test_open_worker_resources_builds_the_anthropic_client_when_the_flag_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the guard: with the flag on and a key configured, `ctx` gets a real
+    `AsyncAnthropic` — built with no socket opened and no network call made, the same
+    property `build_anthropic_client`'s own docstring documents."""
+    monkeypatch.setattr(worker_settings, "open_pool", _fake_open_pool)
+    monkeypatch.setattr(worker_settings.settings, "crawl_enrich_with_llm", True)
+    monkeypatch.setattr(worker_settings.settings, "anthropic_api_key", "not-a-real-key")
+
+    ctx: dict[str, object] = {}
+    await worker_settings.open_worker_resources(ctx)
+
+    assert "anthropic_client" in ctx
+    assert isinstance(ctx["anthropic_client"], AsyncAnthropic)

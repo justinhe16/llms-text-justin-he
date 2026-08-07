@@ -570,7 +570,7 @@ async def test_crawl_task_binds_run_id_for_everything_it_calls(
             assert requested == run_id
             return None
 
-    monkeypatch.setattr(jobs, "build_crawl_service", lambda *args: _Service())
+    monkeypatch.setattr(jobs, "build_crawl_service", lambda *args, **kwargs: _Service())
 
     result = await jobs.crawl_task({"db_pool": None, "http_client": None, "storage": None}, run_id)
 

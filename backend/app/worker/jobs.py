@@ -131,10 +131,18 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
     `app.features.crawl.service.build_crawl_service`'s signature says they are, with
     nothing smuggled in through job-to-job state.
 
+    `ctx.get("anthropic_client")`, not `ctx["anthropic_client"]` — the one resource read with
+    `.get` rather than a bare subscript, because absence here means "the flag is off" for
+    every deployment and every test that does not opt in, not "the context was built wrong."
+    `open_worker_resources` only sets this key at all when `settings.crawl_enrich_with_llm`
+    is `True` (PER-180), so `.get` returning `None` is the ordinary, expected case rather
+    than a defensive fallback for a misconfigured `ctx`.
+
     Args:
         ctx: arq's job context. Must already carry `"db_pool"`, `"http_client"`, and
             `"storage"` — true for any job this `WorkerSettings` runs, and never true in a
-            plain unit test constructing this function's arguments by hand.
+            plain unit test constructing this function's arguments by hand. May also carry
+            `"anthropic_client"`, present only when `settings.crawl_enrich_with_llm` is on.
         run_id: The run to crawl, as arq's msgpack serialization actually delivers it — see
             the module docstring for why that is a `str` rather than a `UUID` in practice,
             and why the parameter still accepts either.
@@ -174,7 +182,13 @@ async def crawl_task(ctx: dict[Any, Any], run_id: str | UUID) -> str:
     # inherits a private copy of, so two crawls running concurrently on the same worker
     # (`max_jobs = 2`) can never show each other's id. See app/core/logging.py.
     with run_id_context(str(parsed_run_id)):
-        service = build_crawl_service(ctx["db_pool"], ctx["http_client"], ctx["storage"], settings)
+        service = build_crawl_service(
+            ctx["db_pool"],
+            ctx["http_client"],
+            ctx["storage"],
+            settings,
+            anthropic_client=ctx.get("anthropic_client"),
+        )
         try:
             outcome = await service.execute_run(parsed_run_id, max_attempts=MAX_ATTEMPTS)
         except TransientCrawlError as retry:

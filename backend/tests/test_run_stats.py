@@ -9,26 +9,25 @@ beside it is in.
 from app.features.crawl.internals.run_stats import RUN_STATS_VERSION, build_run_stats
 
 
-def test_run_stats_version_is_4() -> None:
-    """PER-176 bumped this from 3 to 4 when `discovery_source`, `urls_discovered` and
-    `urls_selected` joined the persisted shape. It is a second bump in the same release as
-    PER-179's 2-to-3, and deliberately so: the two tickets deploy separately, so version 3 was
-    already writing rows before discovery existed, and folding the new keys into 3 would have
-    left two different shapes wearing the same version number. See `RUN_STATS_VERSION`'s own
-    docstring for the full history and for why the bump — rather than a documented caveat — is
-    what makes a version-3 row and a version-4 row unambiguous.
+def test_run_stats_version_is_5() -> None:
+    """PER-180 bumped this from 4 to 5 when `pages_enriched`, `enrich_failures`,
+    `enrich_input_tokens` and `enrich_output_tokens` joined the persisted shape — the four
+    numbers `internals/enrich.py`'s flag-gated, model-assisted summarization pass reports
+    about itself. See `RUN_STATS_VERSION`'s own docstring for the full history, including why
+    all four are `0` (a real, recorded value) on a flag-off row rather than an absent key.
 
     Pinned here, directly, so a future change to the persisted shape has to bump this constant
     deliberately rather than by accident: `tests/test_run_persistence.py` only checks the
     version NUMBER a live row lands with, which would pass just as happily against a
     `RUN_STATS_VERSION` that was bumped again without anyone noticing this test existed."""
-    assert RUN_STATS_VERSION == 4
+    assert RUN_STATS_VERSION == 5
 
 
-def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_six_keys() -> None:
+def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_ten_keys() -> None:
     """`crawl_stats` — including `pages_empty_content` — is spread into the result verbatim;
     `links_emitted`, `full_txt_truncated`, `discovery_source`, `urls_discovered`,
-    `urls_selected` and `version` are the only six keys `build_run_stats` itself
+    `urls_selected`, `pages_enriched`, `enrich_failures`, `enrich_input_tokens`,
+    `enrich_output_tokens`, and `version` are the only ten keys `build_run_stats` itself
     contributes."""
     crawl_stats = {
         "pages_crawled": 3,
@@ -46,6 +45,10 @@ def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_six_keys(
         discovery_source="sitemap",
         urls_discovered=5,
         urls_selected=3,
+        pages_enriched=1,
+        enrich_failures=0,
+        enrich_input_tokens=1200,
+        enrich_output_tokens=40,
     )
 
     assert stats == {
@@ -55,6 +58,10 @@ def test_build_run_stats_passes_crawl_stats_through_unchanged_and_adds_six_keys(
         "discovery_source": "sitemap",
         "urls_discovered": 5,
         "urls_selected": 3,
+        "pages_enriched": 1,
+        "enrich_failures": 0,
+        "enrich_input_tokens": 1200,
+        "enrich_output_tokens": 40,
         "version": RUN_STATS_VERSION,
     }
 
@@ -74,6 +81,10 @@ def test_links_emitted_is_recorded_as_passed_even_when_it_differs_from_pages_cra
         discovery_source="sitemap",
         urls_discovered=9,
         urls_selected=2,
+        pages_enriched=0,
+        enrich_failures=0,
+        enrich_input_tokens=0,
+        enrich_output_tokens=0,
     )
 
     assert stats["pages_crawled"] == 3
@@ -82,13 +93,13 @@ def test_links_emitted_is_recorded_as_passed_even_when_it_differs_from_pages_cra
 
 def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
     """Every key `crawl_stats` arrived with survives into the result with its original value,
-    alongside the six this module contributes.
+    alongside the ten this module contributes.
 
     Deliberately NOT a collision test. `build_run_stats` spreads `{**crawl_stats, ...}`, so a
-    `crawl_stats` that already carried one of the six contributed keys would have that value
+    `crawl_stats` that already carried one of the ten contributed keys would have that value
     OVERWRITTEN, not preserved — asserting otherwise here would be asserting the opposite of
     what the code does. The real guarantee, as `build_run_stats`' own docstring states, is
-    that none of the six is a key `CrawlResult.stats` has ever produced, which is a property
+    that none of the ten is a key `CrawlResult.stats` has ever produced, which is a property
     of `internals/crawler.py` rather than of this function; `tests/test_crawler_caps.py` is
     where that side of it is pinned down."""
     crawl_stats = {"pages_crawled": 1, "pages_empty_content": 0}
@@ -100,6 +111,10 @@ def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
         discovery_source="none",
         urls_discovered=0,
         urls_selected=0,
+        pages_enriched=1,
+        enrich_failures=1,
+        enrich_input_tokens=100,
+        enrich_output_tokens=10,
     )
 
     assert stats["pages_crawled"] == 1
@@ -109,12 +124,16 @@ def test_build_run_stats_leaves_the_crawl_loops_own_keys_intact() -> None:
     assert stats["discovery_source"] == "none"
     assert stats["urls_discovered"] == 0
     assert stats["urls_selected"] == 0
+    assert stats["pages_enriched"] == 1
+    assert stats["enrich_failures"] == 1
+    assert stats["enrich_input_tokens"] == 100
+    assert stats["enrich_output_tokens"] == 10
     assert stats["version"] == RUN_STATS_VERSION
 
 
 def test_build_run_stats_carries_the_discovery_counters() -> None:
     """The three PER-176 keys land with exactly the values passed in — a narrower,
-    single-purpose companion to the "adds six keys" test above, named for the acceptance
+    single-purpose companion to the "adds ten keys" test above, named for the acceptance
     criterion it pins rather than for the mechanics of the dict spread.
 
     `urls_discovered` (7) and `urls_selected` (3) are deliberately unequal to each other and
@@ -131,8 +150,39 @@ def test_build_run_stats_carries_the_discovery_counters() -> None:
         discovery_source="robots",
         urls_discovered=7,
         urls_selected=3,
+        pages_enriched=0,
+        enrich_failures=0,
+        enrich_input_tokens=0,
+        enrich_output_tokens=0,
     )
 
     assert stats["discovery_source"] == "robots"
     assert stats["urls_discovered"] == 7
     assert stats["urls_selected"] == 3
+
+
+def test_build_run_stats_carries_the_enrichment_counters() -> None:
+    """The four PER-180 keys land with exactly the values passed in — the enrichment-layer
+    counterpart to `test_build_run_stats_carries_the_discovery_counters` above. `pages_enriched`
+    (7) and `enrich_failures` (2) deliberately do not sum to `pages_crawled` (10): the gap is
+    exactly the pages enrichment skipped for having no text to send (`RUN_STATS_VERSION`'s own
+    version-5 docstring), not a bug in this test's numbers."""
+    crawl_stats = {"pages_crawled": 10, "pages_empty_content": 1}
+
+    stats = build_run_stats(
+        crawl_stats,
+        links_emitted=9,
+        full_txt_truncated=0,
+        discovery_source="none",
+        urls_discovered=0,
+        urls_selected=0,
+        pages_enriched=7,
+        enrich_failures=2,
+        enrich_input_tokens=8_400,
+        enrich_output_tokens=320,
+    )
+
+    assert stats["pages_enriched"] == 7
+    assert stats["enrich_failures"] == 2
+    assert stats["enrich_input_tokens"] == 8_400
+    assert stats["enrich_output_tokens"] == 320

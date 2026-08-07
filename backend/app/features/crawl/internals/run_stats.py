@@ -40,7 +40,7 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
-RUN_STATS_VERSION: Final = 4
+RUN_STATS_VERSION: Final = 5
 """Which definition of this whole dict's shape a stored row was written under — not just
 `links_emitted`'s meaning, but which KEYS a row of this version even has.
 
@@ -97,7 +97,41 @@ of this module can emit one without the other. A version-3 row therefore never c
 discovery keys, and a version-4 row always does — there is no window, and no defensive read
 of a possibly-absent key is required. Read `discovery_source: "none"` (an explicit value, and
 the honest answer for a site with no sitemap) as different in kind from a version-3 row's
-silence on the subject."""
+silence on the subject.
+
+**Version 5** rows add four keys and redefine nothing (PER-180): `pages_enriched`,
+`enrich_failures`, `enrich_input_tokens`, and `enrich_output_tokens` describe
+`internals/enrich.py`'s flag-gated, model-assisted summarization pass — how many pages
+received a model-written title and description in place of their extracted ones, how many
+requests were attempted and could not be used, and how many tokens the pass spent doing it.
+Every version-4 key keeps its version-4 meaning here.
+
+All four are `0` on every run where `crawl_enrich_with_llm` is off, and — the point worth
+stating rather than assuming — **`0` is a real, recorded value here, not an absent key the
+way a version-3 row's silence on `discovery_source` was before version 4 existed.** A reader
+does not need to know which release wrote a version-5 row to know these four numbers mean
+something; they mean "this run's enrichment pass touched zero pages, in this many ways,"
+which is exactly as true for a flag-off run as for a flag-on run that got unlucky.
+
+That last clause is the reason `pages_enriched` cannot be read alone. `pages_enriched == 0`
+on a row where `pages_crawled > 0` is ambiguous by itself — it means either "the flag was
+off" or "the flag was on and every single call failed" — and `enrich_failures` is what tells
+those two apart: `0` failures alongside `0` enriched pages says the flag never ran at all;
+any positive `enrich_failures` alongside `0` enriched pages says it ran and lost completely.
+Contrast `SelectionResult.dropped` (`internals/url_ranking.py`), whose per-rule counters DO
+reconcile exactly against how many candidates were considered — that module owns every
+candidate it is handed and can account for all of them. This module's enrichment counters do
+not reconcile the same way: `pages_enriched + enrich_failures` need NOT equal
+`pages_crawled`, because a page whose truncated markdown is empty after `.strip()` is never
+sent to the model at all (`internals/enrich.py`'s own docstring — a precondition of making a
+request, not a content judgement) and is counted in neither. The gap between `pages_crawled`
+and `pages_enriched + enrich_failures` is exactly the number of pages enrichment skipped for
+having nothing to send.
+
+The two token keys exist so a run's model spend is readable from the row that already
+describes everything else about it, rather than requiring a trip to a billing dashboard to
+answer "did this run's enrichment pass cost anything, and how much" — the same motivation
+`bytes_fetched` already serves for the crawl's own network cost."""
 
 
 def build_run_stats(
@@ -108,10 +142,14 @@ def build_run_stats(
     discovery_source: str,
     urls_discovered: int,
     urls_selected: int,
+    pages_enriched: int,
+    enrich_failures: int,
+    enrich_input_tokens: int,
+    enrich_output_tokens: int,
 ) -> dict[str, Any]:
     """Combine `crawl_stats` (from `CrawlResult.stats`) with the two numbers only the
-    artifacts know, the three only the discovery step knows, and `version`, into the exact
-    `dict` `runs.stats` stores.
+    artifacts know, the three only the discovery step knows, the four only the enrichment
+    pass knows, and `version`, into the exact `dict` `runs.stats` stores.
 
     Args:
         crawl_stats: `CrawlResult.stats` — `pages_crawled`, `pages_failed`, `bytes_fetched`,
@@ -158,12 +196,28 @@ def build_run_stats(
             instead of it because the RATIO is the tunable thing: a run that discovered 4,000
             URLs and selected 24 says something about the ranking that neither number says
             alone.
+        pages_enriched: How many pages `internals/enrich.py`'s `enrich_pages` gave a
+            model-written title and description — `len(EnrichmentResult.summaries)`. `0` on
+            every run where `crawl_enrich_with_llm` is off, and see `RUN_STATS_VERSION`'s own
+            version-5 paragraph for why `0` here is not, by itself, enough to tell "the flag
+            was off" apart from "the flag was on and nothing survived."
+        enrich_failures: How many pages had a summarization request attempted and could not
+            be used — `EnrichmentResult.failures`. Does NOT include a page skipped for having
+            no text to send; see that field's own docstring and `internals/enrich.py`'s
+            module docstring for why that is a precondition rather than a failure.
+        enrich_input_tokens: Summed `response.usage.input_tokens` across every enrichment
+            request this run made — `EnrichmentResult.input_tokens`. `0` when enrichment
+            never ran.
+        enrich_output_tokens: Summed `response.usage.output_tokens` across every enrichment
+            request this run made — `EnrichmentResult.output_tokens`. `0` when enrichment
+            never ran.
 
     Returns:
         `crawl_stats` spread first, followed by `links_emitted`, `full_txt_truncated`,
-        `discovery_source`, `urls_discovered`, `urls_selected`, and `version`.
-        `crawl_stats`'s own keys come first and are never overwritten by the six added here,
-        because none of those six names is a key
+        `discovery_source`, `urls_discovered`, `urls_selected`, `pages_enriched`,
+        `enrich_failures`, `enrich_input_tokens`, `enrich_output_tokens`, and `version`.
+        `crawl_stats`'s own keys come first and are never overwritten by the ten added here,
+        because none of those ten names is a key
         `CrawlResult.stats` has ever produced.
     """
     stats = {
@@ -173,6 +227,10 @@ def build_run_stats(
         "discovery_source": discovery_source,
         "urls_discovered": urls_discovered,
         "urls_selected": urls_selected,
+        "pages_enriched": pages_enriched,
+        "enrich_failures": enrich_failures,
+        "enrich_input_tokens": enrich_input_tokens,
+        "enrich_output_tokens": enrich_output_tokens,
         "version": RUN_STATS_VERSION,
     }
     # "Generation complete, with stats" — passed as `extra=stats` rather than folded into the

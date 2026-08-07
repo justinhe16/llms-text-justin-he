@@ -237,8 +237,12 @@ in exactly one place:
 | `FLY_API_TOKEN` | GitHub Actions secrets | `fly tokens create deploy -a llms-text-justin-he`, scoped to this app alone |
 | `DIRECT_DATABASE_URL` | GitHub Actions secrets | The same string as `DATABASE_URL` |
 
-`ANTHROPIC_API_KEY` and the `CRAWL_ENRICH_WITH_LLM` switch that gates it land with PER-180; until
-then neither is set, and LLM enrichment is off.
+`CRAWL_ENRICH_WITH_LLM` defaults off, and neither it nor `ANTHROPIC_API_KEY` is set in CI or in
+production today. With it off, nothing in the worker constructs an Anthropic client and every
+run's `llms.txt` carries extraction's own titles and descriptions, unchanged from before PER-180
+landed. Turning it on requires setting BOTH: the key alone does nothing (`CrawlService` never
+reads it unless the flag is on), and the flag alone refuses to boot
+(`Settings.validate_required_secrets` demands the key the moment the flag is `true`).
 
 ### Rotating
 
