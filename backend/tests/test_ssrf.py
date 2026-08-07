@@ -333,6 +333,23 @@ async def test_non_ipv6_hosts_are_never_bracketed_in_the_host_header(
     assert target.host_header == expected
 
 
+async def test_a_hostname_resolving_to_ipv6_keeps_an_unbracketed_name_in_the_host_header() -> None:
+    """The case that decides *which* value the bracketing may key off.
+
+    `host_header` carries the NAME and `connect_url` carries the ADDRESS, so a hostname with
+    only an AAAA record is the one input where the two disagree about address family. The
+    header must stay `v6only.test` while `connect_url` brackets the address — which holds
+    only because the check reads the parsed *literal* (`None` on every DNS path) rather than
+    the resolved address that was `chosen`. Swapping it to `isinstance(chosen, IPv6Address)`
+    passes every other test in this file and fails exactly here.
+    """
+    resolver = _fake_resolver({"v6only.test": [PUBLIC_V6]})
+    target = await validate_url("http://v6only.test:443/docs", resolver=resolver)
+
+    assert target.host_header == "v6only.test:443"
+    assert target.connect_url == f"http://[{PUBLIC_V6}]:443/docs"
+
+
 async def test_explicit_default_https_port_is_allowed_and_omitted_from_the_host_header() -> None:
     resolver = _fake_resolver({"public.test": [PUBLIC_V4]})
     target = await validate_url("https://public.test:443/", resolver=resolver)
