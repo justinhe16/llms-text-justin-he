@@ -88,14 +88,14 @@ def _stats_with_diff(
     llms_txt_bytes: int = 100,
     index_diff: Any = None,
 ) -> dict[str, Any]:
-    """A `RUN_STATS_VERSION` 6-shaped `stats` dict, carrying only the keys the queries and
+    """A `RUN_STATS_VERSION` 7-shaped `stats` dict, carrying only the keys the queries and
     `_to_latest` under test actually read."""
     return {
         "pages_crawled": pages_crawled,
         "links_emitted": links_emitted,
         "llms_txt_bytes": llms_txt_bytes,
         "index_diff": index_diff,
-        "version": 6,
+        "version": 7,
     }
 
 

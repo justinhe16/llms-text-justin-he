@@ -376,7 +376,7 @@ class LatestRunSnapshot(BaseModel):
     * `"first_run"` — this run had nothing to compare against: either it is the website's
       very first run (`previous_run_completed is None`), or every earlier run failed
       (`previous_run_completed is False`).
-    * `"not_recorded"` — this row predates `RUN_STATS_VERSION` 6, or its `index_diff` could
+    * `"not_recorded"` — this row predates `RUN_STATS_VERSION` 7, or its `index_diff` could
       not be parsed. Distinct from `"first_run"` specifically so a pre-feature row never
       claims "first run of this site" about a site that has been running for years.
     """

@@ -1721,11 +1721,11 @@ async def test_an_unreadable_robots_txt_completes_the_run(websites_db: Pool) -> 
     assert stats["crawl_delay_ms"] == settings.crawl_politeness_delay_ms
 
 
-async def test_stats_version_is_six(websites_db: Pool) -> None:
-    """[Observability]. A live row lands with `RUN_STATS_VERSION` 6 — the persistence-layer
+async def test_stats_version_is_seven(websites_db: Pool) -> None:
+    """[Observability]. A live row lands with `RUN_STATS_VERSION` 7 — the persistence-layer
     companion to `tests/test_run_stats.py::test_run_stats_version_is_pinned`, which only
     checks the constant itself."""
-    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-six")
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-seven")
     storage = FakeStorage()
 
     def handler(request: httpx.Request) -> httpx.Response:

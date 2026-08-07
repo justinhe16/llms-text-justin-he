@@ -570,8 +570,9 @@ already grants `crawl_site`, the upload, and enrichment, reading the previous ru
 worker-path reasoning `claim_for_processing` gives for itself). Like enrichment, this call
 CANNOT fail the run: a read failure is caught and degrades to `index_diff: None`, because the
 diff is derived bookkeeping and the artifact already exists by the time it runs. The result —
-`llms_txt_bytes` and `index_diff` — lands in `runs.stats` at `RUN_STATS_VERSION` **6**, the
-first bump since PER-180's 5, and `GET /websites/{id}/stats` (§8.6) is what surfaces it: the
+`llms_txt_bytes` and `index_diff` — lands in `runs.stats` at `RUN_STATS_VERSION` **7**, the
+second bump since PER-180's 5 (PER-191 took 6 for `urls_robots_disallowed`/`crawl_delay_ms`
+first), and `GET /websites/{id}/stats` (§8.6) is what surfaces it: the
 per-bucket series gains `runs_compared`/`pages_added`/`pages_removed` (real zeroes) and
 `index_pages`/`index_bytes` (`null`, never `0`, for a bucket with no completed run to ask), and
 a new `latest` field carries the newest completed run's own diff, window-scoped like

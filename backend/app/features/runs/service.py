@@ -596,7 +596,7 @@ def _to_latest(row: dict[str, Any] | None) -> LatestRunSnapshot | None:
     **Defensive, mirroring `_parse_stats`.** `runs.stats` has no shape Postgres enforces
     (ARCHITECTURE.md §3.4) — a stored `index_diff` can be malformed JSON that decoded to
     something other than an object, an object with the wrong keys, or simply absent on a row
-    that predates `RUN_STATS_VERSION` 6. Every one of those degrades to `diff_state=
+    that predates `RUN_STATS_VERSION` 7. Every one of those degrades to `diff_state=
     "not_recorded"` here rather than raising, so a single bad row can never 500 this endpoint
     for every OTHER website.
     """

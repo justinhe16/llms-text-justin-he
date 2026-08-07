@@ -1,6 +1,6 @@
 """Diffing one run's `llms.txt` index against the previous completed run's — the "what changed
 in the latest run" block the Trends tab reads through `runs.stats["index_diff"]`
-(`internals/run_stats.py`, `RUN_STATS_VERSION` 6).
+(`internals/run_stats.py`, `RUN_STATS_VERSION` 7).
 
 Pure, feature-owned, no I/O — the same category `internals/run_stats.py` and
 `internals/llms_txt.py` already occupy, and for the same reason CLAUDE.md #9 states for
@@ -261,7 +261,7 @@ def build_index_diff(
     previous: PreviousIndex | None,
     previous_run_completed: bool | None,
 ) -> dict[str, Any]:
-    """Build the `index_diff` block `RUN_STATS_VERSION` 6 stores in `runs.stats`.
+    """Build the `index_diff` block `RUN_STATS_VERSION` 7 stores in `runs.stats`.
 
     `previous is None` covers both `previous_run_completed` states that carry no comparison —
     no earlier run at all (`previous_run_completed is None`) and an earlier run that exists
