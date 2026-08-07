@@ -1,12 +1,23 @@
 """THE STUB SEAM (ARCHITECTURE.md §3.4, CLAUDE.md #9): `generate_llms_txt` is the only
 function in this codebase allowed to turn fetched pages into an `llms.txt` artifact.
 
-**Nothing downstream of a fetched page has been designed yet.** No link extraction, no HTML
-parsing, no title extraction, no content ranking, no LLM call — anywhere in this feature, in
-`internals/crawler.py`, in `app.features.crawl.service`, or here. This function is a
-deterministic placeholder, not a first draft of the real thing: adding any of the above
-inside it would not be "starting the real implementation early," it would be building the
-undesigned pipeline in the one place a reviewer is least likely to look for it.
+**Nothing downstream of a fetched page has been designed yet.** No content ranking, no
+summarization, no LLM call — anywhere in this feature, in `internals/crawler.py`, in
+`app.features.crawl.service`, or here. This function is a deterministic placeholder, not a
+first draft of the real thing: adding any of the above inside it would not be "starting the
+real implementation early," it would be building the undesigned pipeline in the one place a
+reviewer is least likely to look for it.
+
+**What HAS landed upstream, and why it is not a breach of the above.** HTML parsing and title
+extraction now happen before this function is ever called: `internals/fetcher.py` runs every
+HTML response through `internals/extract.py`, so the `CrawledPage`s handed here already carry
+a `title`, a `description`, and a `markdown` body (PER-177). That is deliberately *upstream*
+of this seam — it enriches the seam's INPUT TYPE rather than deciding anything about the
+artifact — and this function still ignores all three, listing one bullet per fetched URL
+exactly as it did before. Deciding which pages belong in an `llms.txt`, how they are ranked,
+and how their content is summarized remains undesigned and remains this function's problem
+alone. URL-shape ranking exists too (`internals/url_ranking.py`), but it runs entirely before
+a fetch and is still called by nothing (PER-176).
 
 **Deterministic regardless of fetch order.** `internals/crawler.py`'s frontier fetches race
 each other, so the order pages arrive in `CrawlResult.pages` is not reproducible between two

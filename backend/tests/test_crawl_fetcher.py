@@ -10,6 +10,7 @@ line.
 """
 
 from collections.abc import AsyncIterator, Callable, Sequence
+from pathlib import Path
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ from app.features.crawl.internals.fetcher import (
     ByteBudget,
     ByteBudgetExceededError,
     FetchError,
+    _looks_like_html,
     fetch_page,
 )
 from app.features.crawl.internals.ssrf import Resolver, SsrfBlockedError
@@ -40,6 +42,13 @@ def _build_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.A
 
 
 PUBLIC_IP = "8.8.8.8"
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _load_fixture(name: str) -> str:
+    """See `tests/test_crawl_extract.py`'s helper of the same name — identical contract."""
+    return (_FIXTURES / name).read_text(encoding="utf-8")
 
 
 async def test_connects_to_the_validated_ip_and_preserves_host_and_sni() -> None:
@@ -254,3 +263,129 @@ async def test_a_lying_content_length_is_still_stopped_by_the_streamed_counter()
     async with _build_client(handler) as client:
         with pytest.raises(ByteBudgetExceededError):
             await fetch_page(client, "http://public.test/", budget=budget, resolver=resolver)
+
+
+# --- PER-177: extraction wired into fetch_page --------------------------------------------
+
+
+async def test_an_html_response_is_extracted_into_title_description_and_markdown() -> None:
+    """The happy path: a real documentation-generator fixture, served with a genuine
+    `text/html` `Content-Type`, comes back with everything `internals/extract.py` can find on
+    it — this is the end-to-end proof that `fetch_page` actually calls the extractor, not
+    just that the extractor works in isolation (`tests/test_crawl_extract.py` already covers
+    that)."""
+    fixture = _load_fixture("docusaurus_page.html")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html=fixture)
+
+    resolver = _fake_resolver({"public.test": [PUBLIC_IP]})
+    budget = ByteBudget(max_bytes=1_000_000)
+
+    async with _build_client(handler) as client:
+        page = await fetch_page(
+            client, "https://public.test/docs/config", budget=budget, resolver=resolver
+        )
+
+    assert page.title == "Configuration | Acme Docs"
+    assert page.description == (
+        "How to configure the Acme CLI, including every supported field and its default."
+    )
+    assert "# Configuration" in page.markdown
+    assert page.is_empty is False
+    # `content` stays the raw body regardless of what extraction made of it — the two fields
+    # are never the same string once extraction has run.
+    assert page.content == fixture
+
+
+async def test_a_javascript_shell_is_empty_but_keeps_its_title() -> None:
+    """The [Empty] case, driven through `fetch_page` rather than `extract_content` directly.
+
+    `markdown` is empty and `is_empty` is set, exactly as `tests/test_crawl_extract.py`
+    already asserts for this fixture in isolation. The title is asserted here too, and it is
+    NOT `None` — a JavaScript shell is real HTML with a real `<title>`, and `fetch_page`
+    deliberately does not null it just because the page carries no body. See this module's
+    own comment, right where `extracted.title` is copied onto the returned `CrawledPage`, for
+    why: nulling it would be branching on `is_empty`, which ARCHITECTURE.md §3.4 forbids.
+    """
+    fixture = _load_fixture("js_shell_page.html")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html=fixture)
+
+    resolver = _fake_resolver({"public.test": [PUBLIC_IP]})
+    budget = ByteBudget(max_bytes=1_000_000)
+
+    async with _build_client(handler) as client:
+        page = await fetch_page(client, "https://public.test/", budget=budget, resolver=resolver)
+
+    assert page.is_empty is True
+    assert page.markdown == ""
+    assert page.title == "Acme Console", "the title must survive even though the page is empty"
+    assert page.description == "The Acme Console."
+
+
+async def test_a_non_html_response_is_a_successful_fetch_with_nothing_extracted() -> None:
+    """A JSON API spec, served with an explicit non-HTML `Content-Type`, is not a failed
+    fetch — it is a page with nothing for `internals/extract.py` to have found, and the
+    extractor is never even called (see `_looks_like_html`)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"openapi": "3.1.0", "info": {"title": "Acme API"}})
+
+    resolver = _fake_resolver({"public.test": [PUBLIC_IP]})
+    budget = ByteBudget(max_bytes=1_000_000)
+
+    async with _build_client(handler) as client:
+        page = await fetch_page(
+            client, "https://public.test/openapi.json", budget=budget, resolver=resolver
+        )
+
+    assert page.status == 200
+    assert page.title is None
+    assert page.description is None
+    assert page.markdown == ""
+    assert page.is_empty is True
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        # Declared HTML, in the shapes real servers actually send it.
+        ("text/html", True),
+        ("text/html; charset=utf-8", True),
+        ("TEXT/HTML; CHARSET=UTF-8", True),
+        ("  text/html  ", True),
+        ("application/xhtml+xml", True),
+        ("application/xhtml+xml; charset=utf-8", True),
+        # An explicit non-HTML declaration is a real assertion, and is honored.
+        ("application/json", False),
+        ("application/pdf", False),
+        ("text/plain; charset=utf-8", False),
+        ("text/xml", False),
+        ("image/png", False),
+        # No media type declared at all — the permissive path.
+        (None, True),
+        ("", True),
+        ("   ", True),
+        ("; charset=utf-8", True),
+        # Malformed but non-empty is NOT "no declaration": the server said something, and
+        # nothing it said was `text/html`. See `_looks_like_html`'s docstring on why this is
+        # narrower than "unparseable".
+        ("garbage", False),
+    ],
+)
+def test_looks_like_html_classifies_content_types(content_type: str | None, expected: bool) -> None:
+    """Every branch of `_looks_like_html`, asserted directly rather than through `fetch_page`.
+
+    The permissive-on-no-declaration rows are the ones worth the parametrization: they are a
+    deliberate design decision (see the function's own docstring — an absent `Content-Type` is
+    not an assertion that the body is not HTML), and a future edit that "tightened" them into
+    returning `False` would silently start counting real HTML pages as empty in
+    `runs.stats["pages_empty_content"]`, which is exactly the measurement that counter exists
+    to keep honest.
+    """
+    headers = {} if content_type is None else {"Content-Type": content_type}
+    response = httpx.Response(200, headers=headers, content=b"<html></html>")
+
+    assert _looks_like_html(response) is expected

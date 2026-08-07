@@ -19,9 +19,10 @@ separately for exactly that reason: `payload.py` (the bytes a run's pages are st
 `run_stats.py` (the `dict` `runs.stats` persists), `extract.py` (`extract_content`, one
 page's HTML parsed into a title, a description, and a markdown body), and `url_ranking.py`
 (`select_urls`, a list of discovered URLs ranked and cut down to the ones worth spending a
-run's page budget on). Neither of the last two is called by anything today: wiring extraction
-into the crawl loop is PER-177, and wiring selection into it — so that `crawl_site`'s
-`extra_urls` stops being an empty tuple — is PER-176 (ARCHITECTURE.md §3.4).
+run's page budget on). `extract.py` is called by `fetcher.py`, once per fetched page that
+looks like HTML (PER-177). `url_ranking.py` is called by nothing today: wiring selection into
+the crawl loop — so that `crawl_site`'s `extra_urls` stops being an empty tuple — is PER-176
+(ARCHITECTURE.md §3.4).
 
 Like any other feature's `internals/`, this package is private: only
 `app.features.crawl.service` and this feature's own modules import from it. No other

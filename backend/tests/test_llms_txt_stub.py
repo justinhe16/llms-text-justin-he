@@ -14,7 +14,15 @@ from app.features.crawl.schemas import CrawledPage
 
 def _page(url: str) -> CrawledPage:
     return CrawledPage(
-        url=url, status=200, title=None, content="", fetched_at=datetime.now(UTC), content_bytes=0
+        url=url,
+        status=200,
+        title=None,
+        content="",
+        fetched_at=datetime.now(UTC),
+        content_bytes=0,
+        description=None,
+        markdown="",
+        is_empty=True,
     )
 
 

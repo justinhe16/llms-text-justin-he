@@ -18,7 +18,15 @@ from app.features.crawl.internals.payload import (
 from app.features.crawl.schemas import CrawledPage
 
 
-def _page(url: str, *, content: str = "hello world", status: int = 200) -> CrawledPage:
+def _page(
+    url: str,
+    *,
+    content: str = "hello world",
+    status: int = 200,
+    description: str | None = None,
+    markdown: str = "",
+    is_empty: bool = True,
+) -> CrawledPage:
     return CrawledPage(
         url=url,
         status=status,
@@ -26,6 +34,9 @@ def _page(url: str, *, content: str = "hello world", status: int = 200) -> Crawl
         content=content,
         fetched_at=datetime(2026, 1, 1, tzinfo=UTC),
         content_bytes=len(content.encode()),
+        description=description,
+        markdown=markdown,
+        is_empty=is_empty,
     )
 
 
@@ -38,7 +49,15 @@ def _decode_lines(payload: bytes) -> list[dict[str, object]]:
 
 
 def test_round_trips_every_page_with_its_declared_keys() -> None:
-    pages = [_page("https://example.test/a"), _page("https://example.test/b", content="second")]
+    pages = [
+        _page(
+            "https://example.test/a",
+            description="The first page's description.",
+            markdown="# First\n\nSome prose.",
+            is_empty=False,
+        ),
+        _page("https://example.test/b", content="second"),
+    ]
 
     records = _decode_lines(serialize_payload(pages))
 
@@ -48,7 +67,9 @@ def test_round_trips_every_page_with_its_declared_keys() -> None:
             "url": page.url,
             "status": page.status,
             "title": page.title,
+            "description": page.description,
             "content": page.content,
+            "markdown": page.markdown,
             "fetched_at": page.fetched_at.isoformat(),
             "bytes": page.content_bytes,
         }

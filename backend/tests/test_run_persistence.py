@@ -99,10 +99,11 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 1
+    assert stats["version"] == 2
     assert stats["links_emitted"] == 1
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
+    assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
 
 
 async def test_the_uploaded_payload_round_trips_to_the_page_the_mock_transport_served(
@@ -221,6 +222,9 @@ async def test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats(
         content="x",
         fetched_at=datetime.now(UTC),
         content_bytes=1,
+        description=None,
+        markdown="",
+        is_empty=True,
     )
     fake_result = CrawlResult(
         pages=[page],
@@ -230,6 +234,7 @@ async def test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats(
             "bytes_fetched": 1,
             "duration_ms": 1,
             "cap_hit": "pages",
+            "pages_empty_content": 0,
         },
         cap_hit="pages",
         seed_error=None,
@@ -261,7 +266,7 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 1
+    assert stats["version"] == 2
 
 
 @pytest.mark.parametrize(
