@@ -239,6 +239,7 @@ def test_a_javascript_shell_is_empty_and_keeps_the_metadata_it_does_have() -> No
     assert result.is_empty
     assert result.markdown == ""
     assert result.title == "Acme Console"
+    assert result.description == "The Acme Console."
 
 
 @pytest.mark.parametrize(

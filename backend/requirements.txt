@@ -45,11 +45,12 @@ trafilatura==2.2.0   # RUNTIME for the WORKER process only — the one entry her
                      #
                      # It arrives with a dependency tree of its own — lxml, jusText, courlan,
                      # htmldate, and those packages' own dependencies (babel, dateparser, tld,
-                     # regex, ...). The four that decide what text comes out of a page are
-                     # pinned below; the rest are left to resolve, because pinning a
-                     # dependency-of-a-dependency this file never names would freeze a graph
-                     # nobody here is reading, and fastapi and uvicorn above do not do that
-                     # either.
+                     # regex, ...). Those four are what decide the text that comes out of a
+                     # page, so each gets its own pinned line below, as does lxml_html_clean,
+                     # which reaches the image only through an extra. The rest are left to
+                     # resolve: pinning a dependency-of-a-dependency this file never names
+                     # would freeze a graph nobody here is reading, and fastapi and uvicorn
+                     # above do not do that either.
 lxml==6.1.1          # pinned on its own line even though trafilatura requires `lxml>=6.1.1`:
                      # a floor with no ceiling would let a `pip install` months apart resolve
                      # two different parsers from one commit. Same argument as redis above,
