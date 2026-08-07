@@ -22,8 +22,9 @@ method gzips the fetched pages as JSONL (`internals/payload.py`), uploads that t
 Storage, and only THEN opens the short transaction that writes `llms_txt`, `llms_full_txt`,
 `storage_path`, `stats`, and flips the row to `completed` (`RunService.record_success`).
 Artifact generation is pure and happens entirely before the upload, so it neither extends the
-time a transaction is open nor depends on one. That order, and not its reverse, is what ARCHITECTURE.md §5.1
-exists to require: uploading first means the worst case of a mid-pipeline failure is an
+time a transaction is open nor depends on one. That order, and not its reverse, is what
+ARCHITECTURE.md §5.1 exists to require: uploading first means the worst case of a
+mid-pipeline failure is an
 orphaned Storage object costing a fraction of a cent, while writing the row first would risk
 a `completed` run whose `storage_path` points at an object that was never actually written —
 a 404 in the UI on a run the database swears succeeded. Nothing about this method holds a
