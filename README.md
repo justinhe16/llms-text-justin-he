@@ -1,241 +1,229 @@
 # llms-text
 
 Generate and maintain [`llms.txt`](https://llmstxt.org) files for websites. A signed-in user
-registers a **website** by domain; the backend crawls it as a **run**; the run produces an
-`llms.txt` artifact that describes the site in the form large language models can consume.
-Runs are kept, so a website accumulates a history and you can see what changed between
-crawls.
+registers a **website** by domain, the backend crawls it as a **run**, and each run produces an
+`llms.txt` artifact describing the site in the form large language models can consume. Runs are
+kept, so a website accumulates a history.
 
-The application is deliberately small and flat. It is **not multi-tenant**: there is one pool
-of websites and runs, every signed-in user can read all of it, and only the owner of a
-resource can change it. The frontend is a Next.js App Router app on Vercel that talks to a
-FastAPI service on Fly.io; a background ARQ worker runs from the same image and does the
-crawling. Supabase provides Postgres, Auth, and Storage. Prisma manages the schema and its
-migrations, and nothing else — at runtime the backend talks to Postgres over asyncpg.
+Next.js App Router on Vercel · FastAPI + an ARQ worker on Fly.io (one image, two processes) ·
+Supabase for Postgres, Auth and Storage · Prisma for schema and migrations only, asyncpg at
+runtime.
 
-> **Status: early.** The architecture documents landed before the code did, on purpose. See
-> [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the engineering contract and
-> [`CLAUDE.md`](./CLAUDE.md) for the short list of rules that are expensive to get wrong.
-> Sections below marked _forthcoming_ are filled in by the ticket named beside them.
-
----
-
-## Architecture
-
-```
-                       ┌──────────────────────────────┐
-      Browser ───────► │  Next.js — Vercel            │
-                       │  App Router                  │
-                       │  app/api/[...path]/  (BFF)   │
-                       └──────────────┬───────────────┘
-                                      │  server-side fetch, API_URL
-                                      │  (the browser never calls Fly)
-                                      ▼
-                       ┌──────────────────────────────┐
-                       │  Fly.io — one image          │
-                       │  ┌────────────┬────────────┐ │
-                       │  │  FastAPI   │ ARQ worker │ │
-                       │  │  (app)     │ (worker)   │ │
-                       │  └────────────┴────────────┘ │
-                       └────────┬─────────────┬───────┘
-                  asyncpg/HTTP  │             │  job queue
-                                ▼             ▼
-                  ┌───────────────────┐  ┌──────────────┐
-                  │  Supabase         │  │  Redis       │
-                  │  Postgres / Auth  │  │  (ARQ)       │
-                  │  Storage          │  └──────────────┘
-                  └───────────────────┘
-```
-
-```
-llms-text-justin-he/
-├── frontend/            Next.js → Vercel (Vercel root dir = frontend/)
-├── backend/             FastAPI + ARQ worker → Fly.io (one image, two processes)
-├── db/                  schema.prisma + migrations/ (Prisma CLI lives here)
-├── supabase/            local Supabase stack config (config.toml, seed.sql)
-├── scripts/             shell helpers used by the Makefile (dev.sh, local-env.sh)
-├── docker-compose.yml   local Redis only — Supabase is managed by its own CLI
-├── Makefile             local dev commands — see "Run locally" below
-└── .github/workflows/   path-filtered CI + deploy
-```
-
-Full detail, including the authorization contract and the transaction rules, is in
-[`ARCHITECTURE.md`](./ARCHITECTURE.md).
-
-### Authorization and RLS posture
-
-FastAPI connects with the Supabase service role and therefore bypasses Row Level Security.
-Authorization is enforced in application code: reads are unrestricted for any authenticated
-user, and writes are ownership-checked in the service layer. Never expose the service key to
-a client.
-
-[`ARCHITECTURE.md` §4](./ARCHITECTURE.md#4-the-authorization-contract--public-read-owner-write)
-is the authoritative statement of that contract, and
-[§4.3](./ARCHITECTURE.md#43-where-authorization-lives) is the authoritative statement of where
-it is enforced. This section restates the posture rather than re-deriving it; if the two ever
-disagree, `ARCHITECTURE.md` governs.
-
-Authentication is the other half. Requests are authenticated by verifying the Supabase JWT
-**locally**, against the public keys the project publishes at
-`{SUPABASE_URL}/auth/v1/.well-known/jwks.json` — there is no shared HS256 secret anywhere in
-this repo, and no network round-trip per request. The key set is fetched once at startup and
-cached by `kid`; a token carrying a `kid` the cache has not seen triggers a single refetch,
-rate-limited to at most once per minute, which is what makes a Supabase key rotation a
-non-event rather than an outage. If the key set cannot be fetched at startup the API still
-boots, logs the failure, and recovers on the first request that needs a refetch. Every
-authentication failure is a `401` with one generic message; the specific reason is logged
-server-side only. See `backend/app/core/auth/jwks.py` and
-`backend/app/core/auth/dependencies.py`.
-
----
-
-## Prerequisites
-
-| Tool | Version | Used for |
-| --- | --- | --- |
-| Node | 20+ | `frontend/`, and the Prisma CLI in `db/` |
-| Python | 3.12+ | `backend/` API and worker |
-| Docker | current | local Postgres and Redis |
-| Supabase CLI | **2.111.0, pinned** | local Supabase stack, auth, storage |
-| Fly CLI (`flyctl`) | current | inspecting deployments and setting secrets |
-
-The Supabase CLI is pinned, not just "current": `supabase/config.toml` was written and
-verified against 2.111.0, and config keys and defaults have moved between CLI releases.
-Install that exact version — Homebrew (`brew install supabase/tap/supabase`),
-`npm install -g supabase@2.111.0`, or any method from the CLI's own install docs — and
-confirm with `supabase --version` before running `supabase start` or `make dev`.
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) is the engineering contract — layout, layering, the
+authorization model, transaction boundaries, migration and deploy policy, secrets hygiene. It is
+the authority on all of it, and this file does not restate it.
+[`CLAUDE.md`](./CLAUDE.md) is the short list of rules that are expensive to get wrong.
 
 ---
 
 ## Run locally
 
-### First run
+### Prerequisites
 
-1. Install the prerequisites above. In particular, pin the **Supabase CLI to 2.111.0** —
-   see the note under Prerequisites.
-2. `make setup` — creates `backend/.venv`, installs backend dependencies, installs the
-   Prisma CLI in `db/`, and installs `frontend/` dependencies. Run this once per checkout,
-   and again after pulling a dependency change.
-3. `make dev` — starts the local Supabase stack (Postgres, Auth, Storage) and Redis in
-   Docker, then the FastAPI API with autoreload, the ARQ worker, and the Next.js dev
-   server, each with its own log prefix. It prints the table of URLs below once everything
-   is up. The worker consumes from the local Redis container over plain `redis://`; TLS is
-   derived from the URL scheme, so the same configuration reaches Upstash over `rediss://`
-   in production with no local special case.
-4. `Ctrl-C` stops the API, the worker, and the frontend. Supabase and Redis keep running in
-   Docker after that — local Postgres data and the seeded test user persist across
-   `make dev` sessions. `make down` stops those containers too.
+| Tool | Version | Used for |
+| --- | --- | --- |
+| Python | 3.12+ | `backend/` API and worker |
+| Node | 20+ | `frontend/`, and the Prisma CLI in `db/` |
+| Docker | current, and **running** | local Postgres, Auth, Storage, and Redis |
+| Supabase CLI | **2.111.0, pinned** | the local Supabase stack |
+| Fly CLI (`flyctl`) | current | only for inspecting deploys and setting secrets |
 
-Every target below is documented with `make help`.
+The Supabase CLI version is pinned, not just "current": `supabase/config.toml` was written and
+verified against 2.111.0, and config keys and defaults have moved between CLI releases. Install
+that exact version — `brew install supabase/tap/supabase` or `npm install -g supabase@2.111.0` —
+and confirm with `supabase --version`.
+
+### Setup
 
 ```bash
-make help          # list every target, with its one-line purpose
-make setup         # create backend/.venv, install backend + db deps (frontend if present)
-make dev           # run Supabase, Redis, the API, worker, and frontend locally
-make migrate       # create a migration from schema.prisma (review the SQL, then commit it)
-make migrate-apply # apply pending migrations to the local database
-make test          # backend and frontend test suites
-make lint          # ruff + mypy for backend, eslint + tsc for frontend, OpenAPI drift checks
-make openapi       # regenerate the OpenAPI snapshot and the generated TS client types
-make down          # stop the Supabase and Redis containers
-make reset         # recreate the local database, reseed it, replay Prisma migrations
+make setup            # once per checkout: backend/.venv, plus backend, db and frontend deps
+supabase start        # Postgres, Auth, Storage — migrations need a live database
+make migrate-apply    # apply db/migrations/ to the local database
+make dev              # Supabase, Redis, the API, the worker, the frontend
 ```
 
-`make test` runs the backend suite either way, but its database-backed tests (a real
-asyncpg pool and transaction rollback/commit) only run if the local Supabase stack is up
-— start it with `make dev` first. Without it, those tests skip with a message saying so;
-the rest of the suite is unaffected.
+Re-run `make setup` after pulling a dependency change. Everything after it is idempotent.
 
-### URLs
+`make dev` starts Supabase itself, so on every run after the first it is the only command you
+need. `supabase start` is listed separately above only because `make migrate-apply` reads its
+connection string from a **running** stack and therefore has to come first. Supabase owns no
+migrations here — `supabase/migrations/` is deliberately empty and Prisma owns the schema
+([`ARCHITECTURE.md` §6](./ARCHITECTURE.md#6-database-and-migration-policy)) — so a database that
+has never seen `make migrate-apply` has no application tables.
 
-Printed by `make dev` once the stack is up:
+**There is no `.env` to fill in.** `make dev` derives `DATABASE_URL`, `SUPABASE_URL`,
+`SUPABASE_SECRET_KEY` and `REDIS_URL` from the running stack (`scripts/local-env.sh`) and writes
+`frontend/.env.local` for you, never putting a key in a tracked file. `backend/.env.example` and
+`frontend/.env.example` document every variable, mark which are REQUIRED, and are the reference
+for deployed environments; copy one to `backend/.env` only to override a default such as
+`LOG_LEVEL=DEBUG`. If you run `npm --prefix frontend run dev` directly instead of through
+`make dev`, run `scripts/local-env.sh write-frontend-env` first or the Supabase client throws on
+first use.
 
-| Service | URL |
-| --- | --- |
-| App (Next.js) | http://localhost:3000 |
-| API (FastAPI) | http://localhost:8000 |
-| API docs (Swagger UI) | http://localhost:8000/docs |
-| Supabase Studio | http://localhost:54323 |
+### What you should see
+
+`make dev` prints this once the stack is up:
+
+```
+llms-text dev environment is up:
+  App              http://localhost:3000
+  API              http://127.0.0.1:8000
+  API docs         http://127.0.0.1:8000/docs
+  Supabase Studio  http://localhost:54323
+```
+
+Then interleaved `[api]`, `[worker]` and `[frontend]` log lines. **All three matter.** `make dev`
+starts the ARQ worker and **fails loudly if `arq` is missing** from the virtualenv rather than
+skipping it, because a dev environment with no queue consumer looks exactly like one where
+nothing is happening: enqueued jobs sit in Redis forever and the only symptom is silence. If it
+stops that way, `make setup` refreshes the virtualenv.
+
+`Ctrl-C` stops the API, the worker and the frontend. Supabase and Redis keep running in Docker,
+so local data survives between sessions — `make down` stops those too.
 
 ### Local test user
 
-A fixed test user is seeded automatically the first time the local database initializes,
-and every time you run `make reset` (`supabase/seed.sql`):
+Seeded by `supabase/seed.sql` when the local database first initializes, and again on every
+`make reset`:
 
 | Field | Value |
 | --- | --- |
 | Email | `dev@llms-text.test` |
 | Password | `devpassword123` |
 
-This password is not a secret worth protecting — it unlocks a Postgres container running
-on your own machine, nothing reachable from outside it. **Local sign-in is email/password
-only.** GitHub OAuth is configured and verified against the production Supabase project;
-it is deliberately left disabled in `supabase/config.toml` for local development.
+Sign in with the email/password form on `/`, which renders in development builds only. That
+password unlocks a Postgres container on your own machine and nothing reachable from outside it.
+GitHub OAuth is configured and verified in production but deliberately disabled locally
+(`supabase/config.toml`), so email/password is the only local route in.
 
-The frontend reads its Supabase configuration from `frontend/.env.local`, which `make dev`
-generates from the running local stack (`scripts/local-env.sh write-frontend-env`); the
-file is gitignored, and this generation step never overwrites one you have already edited
-by hand. If you run `npm --prefix frontend run dev` directly instead of going through
-`make dev`, run `scripts/local-env.sh write-frontend-env` first, or the frontend's
-Supabase client will throw on its first use. Because GitHub OAuth is disabled locally
-(`[auth.external.github] enabled = false` above), sign in during local development with
-the email/password form rendered on `/` — it only appears in development builds, and it
-signs in as the seeded test user in the table above.
+### Everyday commands
+
+`make help` prints this list and is the source of truth for it:
+
+```bash
+make help          # show every target with its one-line purpose
+make setup         # create backend/.venv and install backend + db deps (frontend if present)
+make dev           # run Supabase, Redis, the API, worker, and frontend
+make migrate       # create a migration from schema.prisma (review the SQL, then commit it)
+make migrate-apply # apply pending migrations to the local database
+make test          # run the backend and frontend test suites
+make lint          # ruff + mypy on backend/, eslint + tsc on frontend/, OpenAPI drift checks
+make openapi       # regenerate the OpenAPI snapshot and the generated TS client types
+make down          # stop Supabase and Redis containers
+make reset         # recreate the local DB, reseed it, and replay Prisma migrations
+```
+
+`make test` runs the backend suite either way, but its database-backed tests only run when the
+local Supabase stack is up; without it they skip with a message saying so, and the rest of the
+suite is unaffected.
 
 ### Troubleshooting
 
-**A port this stack needs is already in use.** Local Supabase uses 54321 (API/Auth/
-Storage gateway), 54322 (Postgres), 54323 (Studio), and 54324 (local email testing);
-Redis uses 6379; the API uses 8000; the frontend, once it exists, uses 3000. Find what's
-holding a port with `lsof -nP -iTCP:<port> -sTCP:LISTEN`, and stop it — or see "stale
-Supabase containers" below if the culprit is a leftover container of your own. If whatever
-holds port 8000 isn't yours to stop, move the API for the session with
-`API_PORT=8001 make dev` (`API_HOST` overrides the same way). The Supabase ports are pinned
-in `supabase/config.toml` and should be changed there rather than on the command line.
+**A port is already in use.** Supabase uses 54320–54324, Redis 6379, the API 8000, the frontend
+3000. Find the holder with `lsof -nP -iTCP:<port> -sTCP:LISTEN`. For the API,
+`API_PORT=8001 make dev` moves it for the session (`API_HOST` overrides the same way); the
+Supabase ports are pinned in `supabase/config.toml` and should change there rather than on the
+command line.
 
-**Docker isn't running.** `make dev` and friends check for a live Docker daemon (not just
-the `docker` binary) before doing anything else, and fail with a message telling you to
-start Docker Desktop, rather than an opaque connection error partway through.
+**Docker isn't running.** Every target that needs it checks for a live daemon — not just the
+binary — before doing anything, and says so, rather than failing opaquely partway through.
 
-**Stale Supabase containers from a previous run.** `make down` stops both the Supabase
-and Redis containers cleanly and is the normal way to shut the stack down between
-sessions. If a container is stuck anyway, `docker ps -a` to find it and `docker rm -f
-<name>`, then `make dev` again — `supabase start` recreates whatever it needs.
+**A stale container from a previous run.** `make down` is the clean shutdown. If something is
+stuck anyway, find it with `docker ps -a`, `docker rm -f <name>`, then `make dev` again —
+`supabase start` recreates whatever it needs.
+
+**The local database is in an unknown state.** `make reset` recreates it, reseeds it, and
+replays every migration.
 
 ---
 
-## Environment variables
+## CI
 
-_Forthcoming — filled in by the settings ticket, which lands `.env.example` and the settings
-module that validates configuration at startup._
+Two workflows, one per stack, in [`.github/workflows/`](./.github/workflows). Where they overlap
+with the `Makefile` they run the same commands `make lint` and `make test` run, so a green laptop
+and a green pull request mean the same thing — change how a check is invoked in one and change it
+in the other in the same pull request. CI is path-filtered per stack: `ci-backend.yml` does the
+work for `backend/**` and `db/**`, `ci-frontend.yml` for `frontend/**`.
 
-Two rules apply now and are not negotiable later:
+**The required status checks on `main` are the `backend-ci` and `frontend-ci` gate jobs, not the
+jobs that do the work.** Both workflows start on every pull request and the path filter lives in
+a `changes` job, so the expensive jobs are *skipped* rather than never started. That indirection
+is load-bearing: a `paths:` trigger stops the workflow from starting at all, a workflow that
+never starts never reports a check, and a required check that never reports blocks the merge
+forever — which would leave every docs-only pull request permanently unmergeable. The filter is
+[`.github/scripts/changed-paths.sh`](./.github/scripts/changed-paths.sh), and it has its own test
+that both workflows run before trusting it.
 
-- **`API_URL` is server-only.** It must never be prefixed `NEXT_PUBLIC_`. Anything with that
-  prefix is compiled into the client bundle and is public forever.
-- **No real secret value is ever committed to this repository.** `.env.example` carries
-  placeholders only; `.env` and `.env.local` are gitignored. Secrets are supplied at runtime
-  through Fly secrets, Vercel environment variables, and GitHub Actions secrets. The full
-  policy — including what to do if a secret is ever committed — is
-  [ARCHITECTURE.md §9](./ARCHITECTURE.md#9-secrets-hygiene). This repository is public; read
-  it before you add an environment variable.
+`main` also requires linear history, so merge with `gh pr merge <n> --squash`, never a merge
+commit.
+
+The frontend job ends with a rendered-output smoke test, because `tsc`, eslint and `next build`
+all pass on a page that renders wrong. It loads the built page in headless Chrome and measures
+what the browser actually resolved:
+
+```bash
+cd frontend && npm run build && npm run smoke
+```
+
+---
+
+## Deploy policy
+
+**[`ARCHITECTURE.md` §7](./ARCHITECTURE.md#7-deploy-policy) is the authoritative copy — read the
+policy there.** A deploy rule must never exist only in the README, so nothing here is new: this
+is the shape of the pipeline, for an operator looking at a failure.
+
+Merging to `main` with green CI is the only path to production. There is no manual promotion
+step, and no `fly deploy` or `vercel --prod` from a laptop. A commit touching `backend/**` or
+`db/**` runs [`deploy-backend.yml`](./.github/workflows/deploy-backend.yml) as three jobs, each
+gated on the one before it:
+
+| Job | What it does | What a failure means |
+| --- | --- | --- |
+| `migrate` | `prisma migrate deploy`, on a GitHub runner because the backend image is Python-only | **Nothing deployed.** Old code on the old schema — a consistent state, and the safest place to fail. Fix the migration and merge again. |
+| `deploy` | `flyctl deploy --remote-only` from `backend/` | **The schema has already moved**: old code on the new schema. Survivable because migrations here are additive, but not a resting place. Fix forward. |
+| `smoke` | `curl`s `/health` and reads the **body** — `db` must be `"ok"`, an unhealthy `redis` only warns | The new code is live but cannot reach Postgres. `fly logs --app llms-text-justin-he`. |
+
+The `worker` process has no health check, because it has no HTTP listener — so a worker that dies
+on startup is quiet and nothing goes red. After any change to its configuration, look:
+`fly logs --app llms-text-justin-he --process worker`.
+
+Vercel builds and deploys `frontend/` from its own git integration, outside this pipeline.
+
+### Rolling back
+
+**Code rolls back; migrations do not.** Revert the commit on `main` and let the pipeline deploy
+the revert. Redeploying the previous image is break-glass — it buys availability while you
+prepare that revert, and it is the only acknowledged exception to "never deploy by hand":
+
+```bash
+fly releases --app llms-text-justin-he                        # find the previous image
+fly deploy --image <previous-image> --app llms-text-justin-he
+fly scale count app=1 worker=1 --app llms-text-justin-he      # if a process group has no machines
+```
+
+It works only because [§6.3](./ARCHITECTURE.md#63-prohibitions) requires every migration to be
+survivable by the release before it. Break that rule and the break-glass option is gone precisely
+when you need it, because the old image would query columns that no longer exist.
 
 ---
 
 ## Infrastructure
 
-One production environment; no staging. Everything below is provisioned.
+One production environment, no staging. Everything below is provisioned.
 
 | Service | Resource | Purpose |
 | --- | --- | --- |
 | Supabase | `iulfhmykutevtrgcaiec` · us-west-1 | Postgres, GitHub OAuth, private `crawl-payloads` bucket |
 | Upstash | `llms-txt-prod` · us-west-1 | Redis backing the ARQ job queue |
-| Fly.io | `llms-text-justin-he` · org `personal` | FastAPI API + ARQ worker |
+| Fly.io | `llms-text-justin-he` · org `personal` | FastAPI API + ARQ worker, one image, two process groups |
 | Vercel | `llms-text-justin-he` · scope `justinhe16s-projects` | Next.js frontend, root directory `frontend/` |
 
 ### Where each credential lives
 
-No credential is stored in this repo. Each one lives in exactly one place:
+No credential is stored in this repo, and none belongs in a pull request, an issue, a review
+comment, or a log line ([`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-secrets-hygiene)). Each lives
+in exactly one place:
 
 | Name | Stored in | Where it comes from |
 | --- | --- | --- |
@@ -243,20 +231,23 @@ No credential is stored in this repo. Each one lives in exactly one place:
 | `REDIS_URL` | Fly secrets | `upstash redis get --db-id <id>` |
 | `SUPABASE_URL` | Fly secrets, Vercel env | Supabase → Settings → API → Project URL |
 | `SUPABASE_SECRET_KEY` | Fly secrets | Supabase → Settings → API → secret key |
+| `ANTHROPIC_API_KEY` | Fly secrets | Anthropic Console → API keys. Required **only** when `CRAWL_ENRICH_WITH_LLM` is on; leave it unset otherwise |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Vercel env | Supabase → Settings → API → publishable key |
-| `API_URL` | Vercel env | `https://llms-text-justin-he.fly.dev` |
-| `FLY_API_TOKEN` | GitHub Actions secrets | `fly tokens create deploy -a llms-text-justin-he` |
+| `API_URL` | Vercel env | `https://llms-text-justin-he.fly.dev` — server-only, never `NEXT_PUBLIC_` |
+| `FLY_API_TOKEN` | GitHub Actions secrets | `fly tokens create deploy -a llms-text-justin-he`, scoped to this app alone |
 | `DIRECT_DATABASE_URL` | GitHub Actions secrets | The same string as `DATABASE_URL` |
 
-The Fly deploy token is scoped to this app alone, not the whole account.
+`ANTHROPIC_API_KEY` and the `CRAWL_ENRICH_WITH_LLM` switch that gates it land with PER-180; until
+then neither is set, and LLM enrichment is off.
 
 ### Rotating
 
 - **Supabase keys** — regenerate in the dashboard, then update Fly secrets and Vercel env
 - **Redis** — `upstash redis reset-password --db-id <id>`, then re-set `REDIS_URL`
 - **Fly token** — `fly tokens revoke <id>`, re-create, `gh secret set FLY_API_TOKEN`
+- **Anthropic key** — revoke in the console, create a replacement, `fly secrets set`
 
-Retrieve and pipe in one step so the value never lands in a file or your shell history:
+Pipe the value straight through so it never lands in a file or your shell history:
 
 ```bash
 upstash redis get --db-id <id> \
@@ -266,298 +257,40 @@ upstash redis get --db-id <id> \
 
 ### The `crawl-payloads` bucket
 
-A completed run's gzip-compressed JSONL payload is uploaded to a private Supabase Storage
-bucket named `crawl-payloads` (`app.infrastructure.storage.supabase_storage`,
-ARCHITECTURE.md §3.7). Locally, `supabase/config.toml` already declares
-`[storage.buckets.crawl-payloads] public = false`, so `make dev` provisions it automatically
-— there is nothing to do by hand on a fresh checkout.
+A completed run's gzip-compressed JSONL payload is uploaded to a private Supabase Storage bucket
+named `crawl-payloads`. Locally, `supabase/config.toml` declares it, so `make dev` provisions it
+automatically and there is nothing to do on a fresh checkout.
 
-**In production, it is not provisioned by anything automated.** Nothing in CI and nothing in
-the deploy pipeline creates it, so it is a **manual bootstrap step, once, on a new Supabase
-project**: Supabase dashboard → Storage → New bucket → name it `crawl-payloads` → **Public:
-off**. Until that bucket exists, every run's worker job fails its upload and the run ends
-`failed` with a sanitized error — nothing crashes louder than that, so verify the bucket
-exists (Storage → the bucket should be listed and marked private) after standing up a new
-environment, before assuming a failed run is a code problem.
+**In production it is not provisioned by anything automated.** Nothing in CI and nothing in the
+deploy pipeline creates it, so it is a manual bootstrap step, once, on a new Supabase project:
+dashboard → Storage → New bucket → name it `crawl-payloads` → **Public: off**. Until that bucket
+exists, every run fails its upload and ends `failed` with a sanitized error — so verify the
+bucket exists before assuming a failed run is a code problem.
 
-**Known debt: deleting a website does not delete its Storage objects.** `runs` rows cascade
-from `websites` on delete (`db/schema.prisma`), but nothing walks the corresponding
-`{website_id}/` prefix in `crawl-payloads` and removes it — a deleted website's payloads sit
-in the bucket, orphaned, indefinitely. ARCHITECTURE.md §11 records the two candidate fixes
-(a delete hook, or a periodic sweep); neither is built yet.
+Known debt: deleting a website does not delete its Storage objects. `runs` rows cascade from
+`websites`, but nothing sweeps the corresponding `{website_id}/` prefix in the bucket.
+`ARCHITECTURE.md` §11 records the two candidate fixes; neither is built.
 
 ### Three things that will trip you up
 
-1. **Use the Supabase session pooler on port 5432.** Not the direct connection (IPv6-only —
-   GitHub runners can't reach it, and it's what makes Supabase offer a paid IPv4 add-on you
-   don't need), and not port 6543 (transaction mode breaks asyncpg's prepared statements).
+1. **Use the Supabase session pooler on port 5432.** Not the direct connection (IPv6-only, so
+   GitHub runners cannot reach it) and not port 6543 (transaction mode breaks asyncpg's prepared
+   statements).
 2. **The Vercel CLI defaults to the `dori` scope on this machine.** Every `vercel` command
-   touching this project needs `--scope justinhe16s-projects`, or you'll modify the wrong team.
-3. **Fly secrets read `Staged` until the first deploy.** That's expected — they were set with
-   `--stage` and the app has no machines yet. CI's first deploy applies them.
-
----
-
-## CI
-
-Two workflows, one per stack, in [`.github/workflows/`](./.github/workflows). Where they
-overlap with the `Makefile` they run the same commands `make lint` and `make test` run, so a
-green laptop and a green pull request mean the same thing.
-
-| Workflow | Runs when a change touches | What it does |
-| --- | --- | --- |
-| `ci-backend.yml` | `backend/**`, `db/**`, `frontend/lib/api/openapi.json`, `scripts/**`, the workflow, the path filter | **lint** — `ruff check`, `ruff format --check`, `mypy`, then `scripts/export-openapi.sh --check` (the committed OpenAPI snapshot still matches `app.openapi()`)<br>**test** — a real `postgres:16` and a real `redis:7-alpine`, migrations applied with `prisma migrate deploy`, then `pytest`<br>**build-check** — boots the app under uvicorn against both containers and probes `/health` |
-| `ci-frontend.yml` | `frontend/**`, the workflow, the path filter | **verify** — `tsc --noEmit`, eslint, `next build`, an OpenAPI client drift check (the generated `lib/api/schema.d.ts` still matches the committed `lib/api/openapi.json`), then a rendered-output smoke test |
-
-`db/**` is on the backend list because a schema change must re-run the tests that depend on
-it. `frontend/lib/api/openapi.json` is on the backend list too, even though it lives under
-`frontend/`: it is the OpenAPI snapshot `scripts/export-openapi.sh --check` verifies against
-the live app, so a hand-edit of only that file still has to pass backend CI. `scripts/**` is
-there because that is where the exporter behind that check lives
-(`backend/scripts/export_openapi.py` does the work; `scripts/export-openapi.sh` is its
-wrapper — see ARCHITECTURE.md §8.6). Every job runs in parallel; the whole matrix finishes
-in a little over a minute.
-
-The `test` job applies migrations with `prisma migrate deploy` — the command the deploy runs,
-never `prisma db push` — against a throwaway Postgres container, so a migration that cannot
-be applied fails on the pull request that introduces it rather than during a deploy. The
-container's credentials are literals in the workflow. They are not secrets, and they must
-never be replaced with any, least of all `DIRECT_DATABASE_URL`, which points at production.
-
-No test opens a connection to that container yet — `backend/tests/conftest.py` deliberately
-overrides `DATABASE_URL` with its own dummy so that a developer's environment cannot reach
-the suite — so today the container proves that the migrations apply, and nothing more. The
-database layer ticket removes that override and inherits a Postgres that is already
-healthchecked, migrated, and addressable at `DATABASE_URL`.
-
-### The gate jobs
-
-Each workflow ends in a job named after it — `backend-ci` and `frontend-ci` — and **those two
-are the required status checks on `main`**, not the jobs that do the work.
-
-That indirection is the only non-obvious thing here, and it is load-bearing. GitHub's `paths:`
-trigger filter works by not starting the workflow at all, and a workflow that never starts
-never reports a check. A *required* check that never reports blocks the merge forever — so
-filtering at the trigger would leave every docs-only pull request (a README fix, an
-`ARCHITECTURE.md` edit) permanently unmergeable. Instead both workflows start on every pull
-request, the path filter lives in a `changes` job, and the expensive jobs are *skipped* rather
-than never started. The gate job always runs; it treats a skipped job as a pass, a failed or
-cancelled one as a failure, and a `changes` job that is anything but successful as a failure —
-because if the filter itself broke, the skips below it mean nothing.
-
-The cost is one ~10 second job per workflow per pull request. The alternative — a second
-workflow carrying the complementary `paths-ignore` list and a job with the same name that
-exits 0 — costs the same, duplicates every path list, and the day the two copies drift the
-required check either reports twice or not at all.
-
-The filter is [`.github/scripts/changed-paths.sh`](./.github/scripts/changed-paths.sh). It has
-its own test, which both workflows run before trusting it, because a filter that wrongly
-answers "false" skips every real job and leaves a green check on untested code:
-
-```bash
-bash .github/scripts/changed-paths.test.sh
-```
-
-### The rendered-output smoke test
-
-`tsc --noEmit`, eslint and `next build` all pass on a page that renders wrong: a font wiring
-bug that made every page fall back to Times cleared all three. So the frontend job ends by
-starting the production server and loading `/` in headless Chrome, where it measures what the
-browser actually resolved — that both Geist faces load and that `<html>` resolves to the sans
-face rather than a fallback, that the page gradient paints, that a heading is genuinely
-visible (ancestor opacity included, so a page that never hydrates fails instead of shipping
-blank), that the page ignores `prefers-color-scheme: dark`, and that nothing logged an error
-or 404ed.
-
-```bash
-cd frontend && npm run build && npm run smoke
-```
-
-It drives the Chrome already installed on the machine — `puppeteer-core` downloads no
-browser. Set `CHROME_PATH` if yours is somewhere unusual. This is a smoke test and not a
-browser test suite: one page, fifteen assertions, a few seconds. Playwright and end-to-end
-coverage remain out of scope.
-
-### Branch protection
-
-`main` requires the `backend-ci` and `frontend-ci` checks to pass, and requires linear
-history. **This is what makes auto-deploy safe**: the deploy pipeline can ship every commit
-on `main` without a second opinion precisely because nothing reaches `main` without both
-gates green.
-
-Three consequences worth knowing before your first merge:
-
-- **Merge with squash or rebase, never a merge commit.** Linear history forbids merge
-  commits, and the repository's allowed merge methods were narrowed to match — so
-  `gh pr merge <n> --squash`, not `--merge`.
-- **Review approval is deliberately not required.** Pull requests here are opened and merged
-  by automation on the one account that owns the repository, and GitHub refuses a
-  self-approval; requiring one would deadlock every pull request. Code review is a posted
-  review, not a branch protection setting.
-- **Administrators are not forced through the gates.** That is the escape hatch for the day a
-  required check is wedged by something outside this repository. Using it is a decision, not
-  a convenience.
-
----
-
-## Deploy
-
-Merging to `main` is the only thing that deploys. A commit that touches `backend/**` or
-`db/**` runs [`deploy-backend.yml`](./.github/workflows/deploy-backend.yml): three jobs,
-chained with `needs`, each one gated on the one before it.
-
-| Job | What it does | What it means when it fails |
-| --- | --- | --- |
-| `migrate` | `npm ci` in `db/`, logs `prisma migrate status`, applies `prisma migrate deploy`, logs the status again | **Nothing deployed.** Production is still old code on the old schema — a consistent state, and the safest place to fail. Fix the migration and merge again. |
-| `deploy` | `flyctl deploy --remote-only` from `backend/` | **The schema has already moved**, so production is old code on the new schema. That is survivable because migrations here are additive (below) — but it is not a resting place. Re-run from the Actions tab if the cause was infrastructure; otherwise fix forward and merge. |
-| `smoke` | `curl`s the deployed `/health` and reads the body: `db` must be `"ok"`, and a `redis` that is not `"ok"` is a warning rather than a failure | The new code is live but cannot reach Postgres. `fly logs --app llms-text-justin-he`. The usual causes are a Fly secret that was never set and a database the app cannot reach. |
-
-Migrations run on the GitHub Actions runner rather than in the container because Prisma
-needs Node and [the backend image is deliberately Python-only](./backend/Dockerfile). That
-keeps ~150MB out of the runtime and draws the failure boundary in the right place: if the
-migration fails, the deploy job never starts.
-
-`smoke` checks the response **body**, not just a 200. `/health` returns 200 for as long as
-the process is alive and reports dependency health in the body instead — see
-[`health.py`](./backend/app/api/routers/health.py) for why — so a status-code-only check
-would go green against an app that cannot reach Postgres, which is exactly what a deploy
-that just migrated is most likely to break.
-
-The body carries `db` and `redis`, and **`smoke` treats them differently on purpose**: `db`
-fails the deploy, `redis` only warns. The API cannot serve a single read without Postgres,
-and serves every read without Redis, because it only ever enqueues — the worker is the
-consumer. That is why `app/main.py` boots without a queue and why `/health` stays 200
-during an Upstash outage, and a deploy gate that contradicted it would fail a release of a
-healthy API over a dependency it does not need in order to serve. A warning annotation
-still puts a broken queue on the run.
-
-Deploys **queue and are never cancelled** (`concurrency: { group: deploy-backend,
-cancel-in-progress: false }`). Two `flyctl deploy` runs against one app produce an undefined
-result, and a run cancelled mid-migration leaves the database somewhere nobody wrote down.
-This is the one place where the CI workflows' `cancel-in-progress: true` would be actively
-harmful. `workflow_dispatch` re-runs a deploy that failed for an infrastructure reason
-without needing an empty commit.
-
-The frontend is not in this pipeline: Vercel builds and deploys `frontend/` from its own git
-integration on every push.
-
-### The two processes
-
-One image, two Fly process groups, declared in [`backend/fly.toml`](./backend/fly.toml) and
-scaled independently:
-
-| Process | Command | Serves HTTP | Health-checked |
-| --- | --- | --- | --- |
-| `app` | `uvicorn app.main:app` | yes, port 8000 | yes — `GET /health` every 10s |
-| `worker` | `arq app.worker.settings.WorkerSettings` | no | no, deliberately |
-
-The worker has **no** health check because it has no HTTP listener: a check against it
-could only ever fail, and it would restart-loop a machine that is working perfectly. The
-flip side is that a worker which dies on startup is quiet — nothing goes red — so after any
-change to its configuration, look:
-
-```bash
-fly logs --app llms-text-justin-he --process worker
-fly status --app llms-text-justin-he          # both groups, and their machine counts
-```
-
-Scaling is per group, and one `fly deploy` rolls both because they are one artifact:
-
-```bash
-fly scale count app=1 worker=1 --app llms-text-justin-he
-```
-
-### First deploy (once, and only once)
-
-The Fly app was created with `--no-deploy`, so it begins with no machines and its four
-secrets read `Staged`. The first successful `deploy` job creates the machines and applies
-them. If a deploy somehow lands with a group running nothing — which is also what to check
-the first time a *new* process group ships — the `fly scale count` above sets it right.
-
-That is a control-plane operation: it sets a machine count and ships no code, the same
-category as `fly secrets set`, so it is not the laptop deploy the policy below prohibits.
-It is a bootstrap. If you need it routinely, something else is wrong.
-
-### Rolling back
-
-**Code rolls back. Migrations do not.** Nothing in this pipeline reverses a migration, and
-nothing should: a down-migration against live data is a second, worse outage.
-
-So the answer is to roll *forward* — revert the commit on `main` and let the pipeline deploy
-the revert. That is the policy ([§7](./ARCHITECTURE.md#7-deploy-policy)) and it is the
-normal answer.
-
-Redeploying the previous image is **break-glass**: it buys availability while you prepare
-that revert, and it is the only acknowledged exception to "never deploy by hand."
-
-```bash
-fly releases --app llms-text-justin-he                        # find the previous image
-fly deploy --image <previous-image> --app llms-text-justin-he
-```
-
-It works only because of the rule that makes it possible:
-
-> **Migrations must be forward-compatible: the release before this one has to keep working
-> against the new schema.** Add columns; never rename or drop one in the same release that
-> stops using it. Drop it a release later, once nothing that could reference it is still
-> running.
-
-Break that rule and the break-glass option is gone precisely when you need it, because the
-old image would be querying columns that no longer exist.
-[§6.3](./ARCHITECTURE.md#63-prohibitions) is the authoritative copy.
-
-### Deploy Policy
-
-These are prohibitions, not preferences. They exist because the failure they prevent — a
-production database on a schema that no commit in this repo describes — is slow to notice and
-expensive to unwind. If you want an exception, talk to Justin first; do not take one
-unilaterally.
-
-This restates [`ARCHITECTURE.md` §7](./ARCHITECTURE.md#7-deploy-policy) — plus the migration
-prohibitions from [§6.3](./ARCHITECTURE.md#63-prohibitions), which reach production through
-the deploy and so belong in front of anyone reading this policy. `ARCHITECTURE.md` is the
-authoritative copy. If the two disagree, it governs. Never add a rule here without adding it
-there.
-
-- **Merging to `main` with green CI triggers the deploy. That is the only path to
-  production.** There is no manual promotion step and no alternate route.
-- **Never run `fly deploy` from a laptop.** It bypasses CI and ships an image built from
-  whatever happens to be in your working tree — which can leave production running against a
-  migration revision that does not exist in the repo. The same applies to `vercel --prod` and
-  to any other manual push of a build artifact.
-- **Never deploy from a feature branch.** Deploys come from `main`.
-- **Migrations run in a GitHub Actions job _before_ the Fly deploy.** The order is
-  `migrate → deploy → smoke`, and every job is gated on the one before it. A failed
-  migration aborts the deploy, so application code never lands ahead of the schema it
-  needs. One `fly deploy` rolls every process in the image, so the API and the worker ship
-  together rather than as separately gated steps.
-- **Never apply a schema or data change to production by hand**, through any channel —
-  `psql`, the Supabase SQL editor, a one-off script, a Python shell on a Fly machine. The
-  only way a change reaches the production database is a reviewed migration committed to this
-  repo and applied by `prisma migrate deploy` in CI. Read-only inspection (`SELECT`, reading
-  logs and config) is fine.
-- **Never run `prisma db push`.** Anywhere. It mutates a database without producing a
-  migration, which desynchronizes the schema from its recorded history.
-- **Never ship a migration the release before it cannot survive.** Additive changes only:
-  add a column, never rename or drop one in the same release that stops using it. There is
-  always a window where the old image runs against the new schema, and after a failed
-  deploy that window stays open. See "Rolling back" above.
-- **Roll forward, not back.** To undo a bad deploy, revert the commit on `main` and let CI
-  deploy the revert. Do not re-run an old workflow to redeploy an old image — the schema has
-  already moved, and an old image against a new schema is a second outage. A bad migration is
-  corrected by a new migration. Redeploying the previous image with `fly deploy --image` is
-  break-glass only, to restore availability while the revert is prepared — it is a decision,
-  not a shortcut, and it does not replace the revert.
+   touching this project needs `--scope justinhe16s-projects`, or you will modify the wrong team.
+3. **Fly secrets read `Staged` until the first deploy.** Expected — they were set with `--stage`
+   and the app had no machines yet. CI's first deploy applies them.
 
 ---
 
 ## Documentation
 
+Three documents at the repo root and no `docs/` directory
+([`ARCHITECTURE.md` §2](./ARCHITECTURE.md#2-repo-layout)). Adding a fourth means deleting or
+folding in another.
+
 | Document | What it is |
 | --- | --- |
-| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | The engineering contract — layout, layering, authorization, transactions, migration and deploy policy, secrets hygiene, naming |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | The engineering contract — layout, layering, authorization, transactions, migration and deploy policy, secrets hygiene, naming. It governs wherever this file and it disagree |
 | [`CLAUDE.md`](./CLAUDE.md) | Rules for agents and humans working in this repo — the short list, plus a per-feature checklist |
-| `README.md` | This file — what this is, how to run it, and the deploy policy |
-
-Every ticket in this project references `ARCHITECTURE.md`. If a ticket contradicts it, the
-document wins and the ticket should be corrected.
+| `README.md` | This file — what this is, how to run it, deploy policy |
