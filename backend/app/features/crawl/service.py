@@ -34,7 +34,7 @@ its own transaction only after `await self._storage.upload(...)` has already ret
 
 import asyncio
 import logging
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID
 
 import httpx
@@ -44,6 +44,7 @@ from fastapi import HTTPException
 from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, CrawlResult, crawl_site
 from app.features.crawl.internals.fetcher import ByteBudget, ByteBudgetExceededError, FetchError
+from app.features.crawl.internals.links import extract_links
 from app.features.crawl.internals.llms_txt import (
     count_full_txt_truncations,
     count_indexed_pages,
@@ -58,14 +59,30 @@ from app.features.crawl.internals.payload import (
 from app.features.crawl.internals.run_stats import build_run_stats
 from app.features.crawl.internals.sitemap import DiscoverySource, discover_sitemap_urls
 from app.features.crawl.internals.ssrf import SsrfBlockedError
-from app.features.crawl.internals.url_ranking import select_urls
-from app.features.crawl.schemas import CrawlOutcome
+from app.features.crawl.internals.url_ranking import DiscoveredUrl, SelectionResult, select_urls
+from app.features.crawl.schemas import CrawledPage, CrawlOutcome
 from app.features.runs.service import RunService
 from app.features.websites.service import WebsiteService
 from app.infrastructure.storage.supabase_storage import StorageUploadError, SupabaseStorage
 
 
 logger = logging.getLogger(__name__)
+
+RunDiscoverySource = DiscoverySource | Literal["links"]
+"""Where one run's frontier came from — `internals/sitemap.py`'s four entry points, plus the
+one this service adds on top of them.
+
+`"links"` is not a fifth SITEMAP entry point and deliberately does not live in that module's
+own `DiscoverySource`: nothing in `internals/sitemap.py` can produce it, and widening that
+type would make every `match` over it in that module have to answer for a value it never
+emits. This service is the one place that runs both discovery paths and therefore the one
+place that can name all five outcomes, so the union is declared here.
+
+`internals/run_stats.py`'s `build_run_stats` takes this as a plain `str`, on purpose and for
+a reason its own docstring gives — it is a pure module and may not import an I/O one. That
+makes this alias the only type-checked spelling of the vocabulary, which is exactly why it is
+a `Literal` union rather than a second `str`: a typo in `"sitemap_index"` or `"links"` is
+caught here or nowhere."""
 
 # `runs.error` is readable by every signed-in user (ARCHITECTURE.md §4.1) and rendered in
 # the UI. 500 characters is generous for any of the fixed strings below — including
@@ -352,8 +369,10 @@ class CrawlService:
         # Same hoisting reasoning as the three locals above: a seed failure never reaches the
         # `discover_sitemap_urls`/`select_urls` call below, so `build_run_stats` in that path
         # needs values to report rather than a `NameError`. "None" / 0 / 0 is exactly what a
-        # run that discovered nothing (or never got to discover) looks like.
-        discovery_source: DiscoverySource = "none"
+        # run that discovered nothing (or never got to discover) looks like — and it is also
+        # what a run whose seed failed reports for the LINK fallback below, which never runs
+        # at all without a fetched seed page to read.
+        discovery_source: RunDiscoverySource = "none"
         urls_discovered = 0
         urls_selected = 0
         # Set by the failure paths below when the attempt should be retried, and raised
@@ -400,13 +419,52 @@ class CrawlService:
             urls_discovered = len(discovery.urls)
             urls_selected = len(selection.selected)
 
+            # THE DEPTH-1 LINK FALLBACK (PER-178), and its one trigger condition.
+            #
+            # A site with no sitemap has no frontier to hand `crawl_site` up front, and the
+            # only place its links exist is in the seed page's own HTML — which does not
+            # exist until `crawl_site` has fetched it. So the fallback is passed IN, as a
+            # synchronous callback `crawl_site` invokes once on the fetched seed page. Sync,
+            # not async, deliberately: a function that cannot `await` cannot make an HTTP
+            # request, so "this costs no extra fetch" is a property of the type rather than
+            # a rule someone has to remember (the ticket's [Cost] criterion).
+            #
+            # `not discovery.urls` — not `not selection.selected` — is the condition, and the
+            # difference is the whole "sitemap wins" ordering. A sitemap that lists only
+            # `/tag/` pages leaves `selection.selected` empty while `discovery.urls` is not;
+            # that site HAS a sitemap and its operator's answer to "which pages matter" was
+            # "these, and ranking dropped them all". Falling back to scraped links there
+            # would quietly overrule a statement the site actually made.
+            link_selection: SelectionResult | None = None
+
+            def frontier_from_seed(seed_page: CrawledPage) -> list[str]:
+                """Rank the seed page's own links into a frontier. Called at most once, by
+                `crawl_site`, and only after the seed fetch has already succeeded."""
+                nonlocal link_selection
+                link_selection = self._select_seed_links(seed_page, limit=limits.max_pages - 1)
+                return link_selection.selected
+
             result = await crawl_site(
                 self._client,
                 website.url,
                 limits=limits,
                 extra_urls=selection.selected,
+                frontier_from_seed=None if discovery.urls else frontier_from_seed,
                 budget=budget,
             )
+
+            if link_selection is not None and link_selection.discovered_count > 0:
+                # The same rule `internals/sitemap.py` applies to its own four entry points:
+                # a source is named only when it actually YIELDED at least one candidate, and
+                # a path that ran and found nothing reports `"none"`. That keeps one reading
+                # true across all five values — `discovery_source == "none"` means this run
+                # found no frontier anywhere, rather than meaning "no sitemap specifically" —
+                # and it is why the check is on `discovered_count` (what extraction found)
+                # rather than on `selected` (what ranking then kept), exactly as a sitemap
+                # whose every URL is dropped by ranking still reports `"sitemap"`.
+                discovery_source = "links"
+                urls_discovered = link_selection.discovered_count
+                urls_selected = len(link_selection.selected)
 
             if result.seed_error is not None:
                 # WARNING, not ERROR, and a message of its own: a site that is down is an
@@ -528,6 +586,78 @@ class CrawlService:
         if pending_retry is not None:
             raise pending_retry
         return outcome
+
+    def _select_seed_links(self, seed_page: CrawledPage, *, limit: int) -> SelectionResult:
+        """Turn the SEED page's own links into a ranked frontier — the depth-1 fallback for a
+        site with no sitemap (PER-178).
+
+        Pure and synchronous: `internals/links.py`'s `extract_links` parses HTML that is
+        already in hand (`CrawledPage.content`, the body `crawl_site` just fetched) and
+        `select_urls` ranks it, so this makes no request of any kind. It is called once per
+        run, on the seed page alone, by `crawl_site` via `frontier_from_seed`; the pages
+        fetched from the frontier it returns are never passed back to it, which is the entire
+        depth-1 rule.
+
+        **It does re-parse the seed's HTML, and that is the one real cost here.** trafilatura
+        already parsed this same body once, inside `fetch_page`, to produce
+        `CrawledPage.markdown` — but what that produces is extracted PROSE, with the navigation
+        carrying most of a documentation site's links deliberately stripped out, so there is no
+        parsed artifact on `CrawledPage` this could read instead. The cost is one extra lxml
+        parse, of one page, on the exception path only (a site with a sitemap never reaches
+        this method), bounded by the same `crawl_max_bytes` that bounds the body itself.
+        Threading a parsed tree out of `extract_content` to avoid it would widen that module's
+        return type for one caller on one page — a worse trade than the parse. It is
+        `duration_ms`, not `bytes_fetched` or a request count, that would show this if it ever
+        matters.
+
+        **Every candidate carries `source="links"`, `lastmod=None`, `priority=None`** — a
+        page's own markup declares neither of the two signals a sitemap does. That is not a
+        degraded input to `select_urls`: that module ranks a candidate with no metadata on
+        path shape alone (`SITEMAP_DEFAULT_PRIORITY` centers `priority`, and `_recency_term`
+        is neutral without a `lastmod`), which is exactly the case PER-172 built it to handle.
+
+        `seed_page.url` is used as the ranking seed, not `website.url`: it is the final,
+        post-redirect URL the links were actually found on and resolved against, so it is the
+        origin `select_urls`'s `"off_origin"` rule must compare them to. Using the configured
+        URL instead would drop a redirecting site's entire frontier.
+
+        **Never raises**, matching `discover_sitemap_urls`'s own contract and for the same
+        reason: this runs inside `execute_run`'s `try`, whose `except Exception` turns
+        anything that escapes into a failed run. A site whose HTML this codebase cannot cope
+        with should produce a single-page run, exactly as a site with no sitemap does —
+        "hitting a cap is a success, not a failure" (ARCHITECTURE.md §3.4), one layer up.
+
+        Returns:
+            The `SelectionResult` — carried out whole rather than reduced to its `selected`
+            list, because `runs.stats` records both how many links were found
+            (`urls_discovered`) and how many survived ranking (`urls_selected`), and the
+            ratio between them is the tunable thing (`internals/run_stats.py`).
+        """
+        try:
+            urls = extract_links(seed_page.content, base_url=seed_page.url)
+            selection = select_urls(
+                [
+                    DiscoveredUrl(url=url, lastmod=None, priority=None, source="links")
+                    for url in urls
+                ],
+                seed_url=seed_page.url,
+                limit=limit,
+            )
+        except Exception:
+            logger.warning(
+                "crawl: link extraction failed; continuing on the seed alone", exc_info=True
+            )
+            return SelectionResult(selected=[], discovered_count=0, dropped={})
+
+        logger.info(
+            "crawl: no sitemap; filled the frontier from the seed page's links",
+            extra={
+                "urls_discovered": selection.discovered_count,
+                "urls_selected": len(selection.selected),
+                "dropped": selection.dropped,
+            },
+        )
+        return selection
 
     async def _finish_failed_attempt(
         self,
