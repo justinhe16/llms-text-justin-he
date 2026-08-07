@@ -19,7 +19,7 @@ business rule about runs either, only how a `RunArtifact` becomes an HTTP respon
 `websites.py`.** Every handler takes `CurrentUserId`, so every endpoint is `401` without a
 valid token. `trigger_run` is the one handler that passes that id on to its service, because
 it is the one WRITE in this router and writes are ownership-checked — `RunService.trigger_run`
-hands it straight to `require_owner` (ARCHITECTURE.md §4.2). The four reads — `list_runs`,
+hands it straight to `require_owner` (ARCHITECTURE.md §4.2). The five reads — `list_runs`,
 `get_run`, `get_run_llms_txt`, `get_run_llms_full_txt`, and `get_website_stats` — all still
 take `CurrentUserId` purely to require a token and deliberately never thread it any further,
 because reads in this codebase are unscoped by caller (ARCHITECTURE.md §4.1): any signed-in

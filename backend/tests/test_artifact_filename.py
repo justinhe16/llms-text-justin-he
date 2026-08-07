@@ -122,11 +122,58 @@ def test_the_result_contains_only_characters_a_header_cannot_be_injected_through
 ) -> None:
     """`_artifact_response` (`app.api.routers.runs`) interpolates this value into a quoted
     `Content-Disposition` header with no escaping — safe only because the result can never
-    contain a quote, a semicolon, a CR, or an LF. Asserted over the whole parity table,
-    including its adversarial rows (`example.com`, non-ASCII, empty)."""
+    contain a quote, a semicolon, a CR, or an LF. Asserted over the whole parity table, which
+    establishes the guarantee for every input the two implementations are pinned against;
+    `test_a_hostile_origin_cannot_break_out_of_the_header` below establishes it for inputs
+    chosen to attack the header itself."""
     for kind in _KINDS:
         result = artifact_filename(origin, kind)
         assert re.fullmatch(r"[a-z0-9-]+\.txt", result), result
+
+
+# Origins written to break out of `attachment; filename="..."` rather than to exercise the
+# sanitizer's normal shape. None of these can reach the header intact, but that is a property
+# worth asserting against inputs that actually try: the table above is a *parity* fixture and
+# every row of it is a plausible origin, so on its own it demonstrates the guarantee only for
+# values that were never hostile to begin with.
+#
+# `websites.origin` is a normalized scheme + host and cannot realistically hold a newline
+# today. That is a fact about a different module (`websites/internals/url_normalize.py`), and
+# this function's safety must not depend on it — the whole reason the filename is sanitized
+# here is so the header stays safe no matter what a `websites` row comes to contain.
+_HOSTILE_ORIGINS = [
+    pytest.param('https://example.com"; filename="evil.sh', id="quote-and-semicolon"),
+    pytest.param("https://example.com\r\nSet-Cookie: session=stolen", id="crlf-header-split"),
+    pytest.param("https://example.com\nX-Injected: yes", id="bare-lf"),
+    pytest.param("https://example.com\r", id="bare-cr"),
+    pytest.param("../../../../etc/passwd", id="path-traversal"),
+    pytest.param("https://example.com/../../secret.txt", id="traversal-after-host"),
+    pytest.param("https://example.com\x00.txt", id="nul-byte"),
+    pytest.param("https://example.com; rm -rf /", id="shell-metacharacters"),
+]
+
+
+@pytest.mark.parametrize("origin", _HOSTILE_ORIGINS)
+def test_a_hostile_origin_cannot_break_out_of_the_header(origin: str) -> None:
+    """The security claim in `artifact_filename`'s docstring, asserted against inputs written
+    to defeat it rather than against plausible origins.
+
+    Checks the guarantee two ways, because the second does not follow from the first by
+    inspection: the result matches `[a-z0-9-]+\\.txt`, AND the header `_artifact_response`
+    would actually build stays one line naming one filename — two quotes, one semicolon, no
+    control characters.
+    """
+    for kind in _KINDS:
+        result = artifact_filename(origin, kind)
+
+        assert re.fullmatch(r"[a-z0-9-]+\.txt", result), result
+
+        header = f'attachment; filename="{result}"'
+        assert header.count('"') == 2, header
+        assert header.count(";") == 1, header
+        assert "\r" not in header
+        assert "\n" not in header
+        assert "\x00" not in header
 
 
 # -----------------------------------------------------------------------------------------
