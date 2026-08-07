@@ -3,7 +3,7 @@ frontier from raw discovered URLs.
 
 No database, no network, no clock: `select_urls` is pure, and every test here calls it
 directly with hand-built or fixture-loaded `DiscoveredUrl` lists. `tests/test_url_normalize.py`
-and `tests/test_llms_txt_stub.py` are the two closest siblings in shape — this suite follows
+and `tests/test_llms_txt.py` are the two closest siblings in shape — this suite follows
 the same pattern: one test (or a parametrized group) per named behaviour, named for what it
 asserts rather than how.
 """

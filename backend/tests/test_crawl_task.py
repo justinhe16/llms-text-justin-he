@@ -45,7 +45,7 @@ def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.As
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
 
 
-async def test_a_pending_run_is_claimed_and_the_task_returns_stub_output(
+async def test_a_pending_run_is_claimed_and_the_task_records_both_artifacts(
     websites_db: Pool,
 ) -> None:
     website_id = await seed_website(websites_db, TEST_USER_A_ID, f"http://{_SEED_IP}/claim-ok")
@@ -61,11 +61,12 @@ async def test_a_pending_run_is_claimed_and_the_task_returns_stub_output(
     assert result == "ok"
 
     row = await websites_db.fetchrow(
-        "SELECT status, llms_txt, storage_path FROM runs WHERE id = $1", run_id
+        "SELECT status, llms_txt, llms_full_txt, storage_path FROM runs WHERE id = $1", run_id
     )
     assert row is not None
     assert row["status"] == "completed"
     assert row["llms_txt"] is not None
+    assert row["llms_full_txt"] is not None
     assert row["storage_path"] is not None
 
 

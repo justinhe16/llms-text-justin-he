@@ -4,8 +4,8 @@
 and undo it if enqueueing the job afterwards fails. The crawl worker
 (`app.worker.jobs.crawl_task`, by way of `app.features.crawl.service.CrawlService`) owns
 three: `claim_pending` takes a `pending` run atomically; `mark_processing_completed` records
-a successful crawl's artifact, Storage location, and stats; `mark_processing_failed` records
-a terminal failure for a crawl that never produces one. The cron tick
+a successful crawl's two artifacts, Storage location, and stats; `mark_processing_failed`
+records a terminal failure for a crawl that never produces one. The cron tick
 (`ScheduleService.run_due_schedules`, reached only through `RunService.create_scheduled_run`
 — ARCHITECTURE.md §3.1) owns `insert_scheduled`: the same shape as `insert_manual`, with the
 two differences `_INSERT_SCHEDULED`'s comment names. The stuck-run reaper
@@ -186,12 +186,20 @@ _RETURN_PROCESSING_TO_PENDING: Final = """
 # unpredictable, unmeasured wall-clock time, so there is no earlier Python `datetime.now(UTC)`
 # that could describe "when this row actually finished" any better than the database's own
 # clock at the moment of the UPDATE.
+#
+# `llms_full_txt` was added by PER-179 and shifted `storage_path` and `stats` to `$4` and
+# `$5`. The column sits next to `llms_txt` because the two are one run's two artifacts, and
+# asyncpg binds positionally with no names to check: a transposed pair here would write a
+# storage path into a stats column and fail only at the jsonb cast, or worse, not fail at
+# all. `tests/test_run_persistence.py` asserts on `storage_path` as well as the artifacts for
+# exactly that reason.
 _MARK_PROCESSING_COMPLETED: Final = """
     UPDATE runs
     SET status = 'completed'::run_status,
         llms_txt = $2,
-        storage_path = $3,
-        stats = $4::jsonb,
+        llms_full_txt = $3,
+        storage_path = $4,
+        stats = $5::jsonb,
         completed_at = now()
     WHERE id = $1 AND status = 'processing'::run_status
     RETURNING id
@@ -338,7 +346,13 @@ class RunsWriter(Writer):
         return row is not None
 
     async def mark_processing_completed(
-        self, run_id: UUID, *, llms_txt: str, storage_path: str, stats: dict[str, Any]
+        self,
+        run_id: UUID,
+        *,
+        llms_txt: str,
+        llms_full_txt: str,
+        storage_path: str,
+        stats: dict[str, Any],
     ) -> bool:
         """Record a successful crawl for a run this worker had already claimed.
 
@@ -349,10 +363,14 @@ class RunsWriter(Writer):
         Args:
             run_id: The run being completed. Must have been claimed by `claim_pending` first
                 — this statement matches only a `processing` row.
-            llms_txt: The generated artifact — `generate_llms_txt(pages)`'s return value,
+            llms_txt: The generated index — `generate_llms_txt(pages)`'s return value,
                 unmodified.
-            storage_path: The bucket-qualified path the payload landed at
-                (`SupabaseStorage.upload`'s return value).
+            llms_full_txt: The generated expansion — `generate_llms_full_txt(pages)`'s return
+                value, unmodified (PER-179). `str`, not `str | None`, even though the column
+                is nullable: the column is nullable because rows written before that migration
+                and rows for runs that failed have no artifact, and this statement runs on
+                neither path. A parameter that can only ever be a string should not be typed
+                as if callers may omit it.
             stats: The shape `internals/run_stats.py`'s `build_run_stats` produces. Serialized
                 with `json.dumps` HERE, in the writer, not by the caller: asyncpg has no jsonb
                 codec registered in this project (see `RunService._parse_stats`, which
@@ -372,7 +390,12 @@ class RunsWriter(Writer):
             needs to escalate.
         """
         row = await self.fetch_one(
-            _MARK_PROCESSING_COMPLETED, run_id, llms_txt, storage_path, json.dumps(stats)
+            _MARK_PROCESSING_COMPLETED,
+            run_id,
+            llms_txt,
+            llms_full_txt,
+            storage_path,
+            json.dumps(stats),
         )
         return row is not None
 

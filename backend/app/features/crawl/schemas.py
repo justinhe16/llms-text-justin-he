@@ -30,9 +30,9 @@ class CrawledPage:
 
     url: str
     """The final, host-based URL — after every redirect hop, never the IP address
-    `internals/ssrf.py` actually dialed. This is what `generate_llms_txt` (a later phase)
-    lists, and what a caller resolving a relative link found on this page would resolve it
-    against."""
+    `internals/ssrf.py` actually dialed. This is what `generate_llms_txt` lists, what it
+    derives a page's section and its fallback label from, and what a caller resolving a
+    relative link found on this page would resolve it against."""
 
     status: int
     """The HTTP status code of the final, non-redirect response."""
@@ -120,11 +120,19 @@ class CrawledPage:
     """Whether this page yielded no extractable content — `internals/extract.py`'s
     `ExtractedContent.is_empty`, copied across unchanged by `fetch_page`. Counted, once per
     run, as `runs.stats["pages_empty_content"]` (`internals/crawler.py`, at
-    `RUN_STATS_VERSION` 2) and otherwise inert: ARCHITECTURE.md §3.4 and CLAUDE.md #9 both
-    hold that this flag is instrumentation, not a branch, and nothing on this dataclass or
-    downstream of it may decide what to do with a page BECAUSE it is set. In particular,
-    `title` above is never nulled when this is `True` — see `internals/fetcher.py`'s own
-    comment on that decision.
+    `RUN_STATS_VERSION` 3).
+
+    **Exactly one thing branches on it, and it is not upstream of the seam.**
+    `internals/llms_txt.py`'s `generate_llms_txt` omits an empty page from the index it builds
+    (PER-179): a bullet carrying a URL, no title and no description is not worth a line in a
+    curated index. An earlier revision of this docstring said the flag was "otherwise inert"
+    and that nothing downstream of this dataclass could act on it — true while the artifact
+    was a stub, and no longer. What survives unchanged is the rule that actually mattered:
+    nothing UPSTREAM of that seam may decide what to fetch, what to keep, or how to crawl
+    because a page is empty. The page is still fetched, still written to the run's payload,
+    and still counted. In particular, `title` above is never nulled when this is `True` — see
+    `internals/fetcher.py`'s own comment on that decision, and note that `generate_llms_txt`
+    now depends on it: an empty homepage's `<title>` is what names the whole artifact.
 
     Appended at the end of this dataclass alongside `description` and `markdown`, for the
     same positional-construction reason `description`'s own docstring gives."""
@@ -133,7 +141,7 @@ class CrawledPage:
 @dataclass(frozen=True, slots=True)
 class CrawlOutcome:
     """What `CrawlService.execute_run` hands back to the worker job once a run has already
-    been persisted: the artifact, the numbers `runs.stats` stores, and where the raw payload
+    been persisted: both artifacts, the numbers `runs.stats` stores, and where the raw payload
     landed in Storage.
 
     **No longer "deliberately does not persist anything itself."** An earlier revision of
@@ -147,13 +155,21 @@ class CrawlOutcome:
     """
 
     llms_txt: str
-    """The generated artifact — `generate_llms_txt(pages)`'s return value, unmodified. The
-    same value already written to `runs.llms_txt`."""
+    """The generated index — `generate_llms_txt(pages)`'s return value, unmodified. The same
+    value already written to `runs.llms_txt`."""
+
+    llms_full_txt: str
+    """The generated expansion — `generate_llms_full_txt(pages)`'s return value, unmodified,
+    and the same value already written to `runs.llms_full_txt` (PER-179). Placed after
+    `llms_txt` because the two are one run's pair of artifacts and reading them apart would
+    be reading them wrong; every construction of this dataclass is keyword-based, so the
+    position is documentation rather than a compatibility constraint."""
 
     stats: dict[str, Any]
     """The same shape `runs.stats` stores as jsonb — built by `internals/run_stats.py`'s
     `build_run_stats`: `pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`,
-    `cap_hit`, `pages_empty_content`, `links_emitted`, and `version`. Typed loosely
+    `cap_hit`, `pages_empty_content`, `links_emitted`, `full_txt_truncated`, and `version`.
+    Typed loosely
     (`dict[str, Any]`) to match `app.features.runs.schemas.RunListItemResponse.stats`, which
     reads this same column back out with the same justification — the shape belongs to this
     feature, which is why it is built here rather than validated against a model owned by
