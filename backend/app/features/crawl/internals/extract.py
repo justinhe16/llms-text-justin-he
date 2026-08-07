@@ -55,7 +55,8 @@ after a browser runs the JavaScript. Whether it is worth paying for a headless b
 render those pages is a real decision with a real cost, and this constant exists to *measure*
 how often it would matter, not to make that decision. That counting is implemented: every run
 records how many of its fetched pages came back empty as `runs.stats["pages_empty_content"]`
-(`internals/crawler.py`, at `RUN_STATS_VERSION` 3). Exactly one thing branches on `is_empty`
+(`internals/crawler.py`, on every row from `RUN_STATS_VERSION` 2 onwards). Exactly one thing
+branches on `is_empty`
 beyond counting it, and that "later" has since arrived: `internals/llms_txt.py`'s
 `generate_llms_txt` declines to list a page with no content (PER-179). Nothing UPSTREAM of
 that seam branches on it — such a page is still fetched, still stored in the run's payload,

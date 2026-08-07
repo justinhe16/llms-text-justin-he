@@ -30,6 +30,7 @@ from conftest import TEST_USER_A_ID, FakeStorage, seed_run, seed_website
 from app.core.settings import settings
 from app.features.crawl.internals.crawler import CrawlResult
 from app.features.crawl.internals.payload import PAYLOAD_CONTENT_TYPE
+from app.features.crawl.internals.sitemap import DiscoveryResult
 from app.features.crawl.schemas import CrawledPage
 from app.features.crawl.service import TransientCrawlError, build_crawl_service
 from app.features.runs.internals.runs_writer import RunsWriter
@@ -47,6 +48,23 @@ def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.As
 
 async def _seed_pending(pool: Pool, suffix: str) -> tuple[UUID, UUID]:
     website_id = await seed_website(pool, TEST_USER_A_ID, f"http://{_SEED_IP}/{suffix}")
+    run_id = await seed_run(pool, website_id, started_at=_NOW, status="pending")
+    return website_id, run_id
+
+
+async def _seed_pending_clean_origin(pool: Pool, suffix: str) -> tuple[UUID, UUID]:
+    """Like `_seed_pending`, but with an `origin` that carries no path component.
+
+    `_seed_pending`'s own origin (`f"http://{_SEED_IP}/{suffix}"`) already has a path — fine
+    for tests that never look past `crawl_site`, but `discover_sitemap_urls` builds its probe
+    URLs as `website.origin + "/sitemap.xml"`, so a path-bearing origin would put those probes
+    at `/{suffix}/sitemap.xml` instead of the clean `/sitemap.xml` this file's PER-176 tests
+    below assert against. `website.url` still gets its own distinct path (`suffix`), so the
+    seed fetch and the three discovery probes never collide.
+    """
+    website_id = await seed_website(
+        pool, TEST_USER_A_ID, f"http://{_SEED_IP}", url=f"http://{_SEED_IP}/{suffix}"
+    )
     run_id = await seed_run(pool, website_id, started_at=_NOW, status="pending")
     return website_id, run_id
 
@@ -100,7 +118,7 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 3
+    assert stats["version"] == 4
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
     assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
@@ -226,7 +244,18 @@ async def test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats(
     websites_db: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`CrawlService` always calls `crawl_site` with an empty frontier, so monkeypatching
-    `crawl_site` itself is the only deterministic way to exercise a cap end to end."""
+    `crawl_site` itself is the only deterministic way to exercise a cap end to end.
+
+    PER-176 added a second network call ahead of `crawl_site` — sitemap discovery — that
+    monkeypatching `crawl_site` alone does not stop: `discover_sitemap_urls` would make three
+    real requests through this test's own transport before `crawl_site` is ever reached, and
+    every one of them would hit `handler`'s `AssertionError` below. Left unmonkeypatched, that
+    `AssertionError` is not even a visible test failure — it is an ordinary `Exception` from
+    `discover_sitemap_urls`'s point of view, caught and logged at WARNING like any other
+    fetch failure (`internals/sitemap.py`), so the assertion this test's `handler` exists to
+    make would silently stop proving anything. `discover_sitemap_urls` is therefore
+    monkeypatched too, returning an empty result, so `handler`'s assertion stays load-bearing.
+    """
     _website_id, run_id = await _seed_pending(websites_db, "cap-hit")
     storage = FakeStorage()
 
@@ -258,7 +287,13 @@ async def test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats(
     async def fake_crawl_site(*args: object, **kwargs: object) -> CrawlResult:
         return fake_result
 
+    async def fake_discover_sitemap_urls(*args: object, **kwargs: object) -> DiscoveryResult:
+        return DiscoveryResult([], "none")
+
     monkeypatch.setattr("app.features.crawl.service.crawl_site", fake_crawl_site)
+    monkeypatch.setattr(
+        "app.features.crawl.service.discover_sitemap_urls", fake_discover_sitemap_urls
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("crawl_site is mocked; no HTTP request should be made")
@@ -353,7 +388,7 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 3
+    assert stats["version"] == 4
     # A failure row carries the same KEYS as a success row, at their hoisted defaults — the
     # shape `runs.stats` stores must not depend on how far a run got before it failed.
     assert stats["links_emitted"] == 0
@@ -471,3 +506,106 @@ async def test_the_upload_never_happens_inside_a_database_transaction(
             assert depth == 0, f"upload {phase!r} happened while a transaction was open"
     assert saw_an_upload_event
     assert depth == 0, "a transaction was left open"
+
+
+# -----------------------------------------------------------------------------------------
+# PER-176: sitemap discovery, wired ahead of `crawl_site` in `execute_run`. Each test below
+# drives the real `discover_sitemap_urls` (unlike `test_cap_hit_...` above, which
+# monkeypatches it out) through the same `httpx.MockTransport` the seed fetch shares, and
+# asserts on the run row PERSISTENCE end of it — `tests/test_crawl_sitemap.py` is where
+# discovery's own algorithm is pinned down in isolation.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_a_site_with_no_sitemap_still_completes_a_single_page_run(
+    websites_db: Pool,
+) -> None:
+    """Criterion 8: a site with no sitemap at all still produces a successful single-page
+    run. All three discovery probes — `/sitemap.xml`, `/sitemap_index.xml`, `/robots.txt` —
+    404, `discover_sitemap_urls` returns `DiscoveryResult([], "none")`, and the seed alone is
+    enough to complete the run — hitting a discovery "cap" (here, finding nothing at all) is
+    a success, never a failure (ARCHITECTURE.md §3.4)."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "no-sitemap")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
+            return httpx.Response(404)
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["pages_crawled"] == 1
+    assert stats["discovery_source"] == "none"
+
+
+async def test_an_ssrf_refused_sitemap_target_does_not_fail_the_run(websites_db: Pool) -> None:
+    """Criterion 6: a `robots.txt`-declared `Sitemap:` target that the SSRF guard refuses
+    (here, one carrying credentials — `internals/ssrf.py`'s check 3) never fails the RUN, only
+    discovery. `/sitemap.xml` and `/sitemap_index.xml` both 404, `robots.txt` declares a
+    same-origin-but-credentialed target so the refusal is the guard's, not the same-origin
+    pre-filter's (see `tests/test_crawl_sitemap.py`'s SSRF suite for the module-level version
+    of this same shape), and the run still completes on the seed alone.
+    """
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "ssrf-robots")
+    storage = FakeStorage()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/sitemap.xml", "/sitemap_index.xml"):
+            return httpx.Response(404)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(
+                200, text=f"Sitemap: http://user:pass@{_SEED_IP}/sitemap-target.xml\n"
+            )
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["discovery_source"] == "none"
+
+
+async def test_discovery_counters_and_the_selected_frontier_land_in_the_stored_stats(
+    websites_db: Pool,
+) -> None:
+    """Criterion 10, end to end: a real sitemap served at the seeded origin's `/sitemap.xml`
+    is discovered, ranked, and actually fetched — the only test in this file that proves
+    `select_urls`' output reaches `crawl_site(extra_urls=...)` for real, via `pages_crawled`
+    counting the seed AND all three sitemap-derived pages."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "e2e")
+    storage = FakeStorage()
+
+    sitemap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://{_SEED_IP}/e2e/page-1</loc></url>
+  <url><loc>http://{_SEED_IP}/e2e/page-2</loc></url>
+  <url><loc>http://{_SEED_IP}/e2e/page-3</loc></url>
+</urlset>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sitemap.xml":
+            return httpx.Response(
+                200, text=sitemap_body, headers={"Content-Type": "application/xml"}
+            )
+        return httpx.Response(200, text="hello world")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT status, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    stats = json.loads(row["stats"])
+    assert stats["discovery_source"] == "sitemap"
+    assert stats["urls_discovered"] == 3
+    assert stats["urls_selected"] == 3
+    assert stats["pages_crawled"] == 4

@@ -119,8 +119,8 @@ class CrawledPage:
     is_empty: bool
     """Whether this page yielded no extractable content — `internals/extract.py`'s
     `ExtractedContent.is_empty`, copied across unchanged by `fetch_page`. Counted, once per
-    run, as `runs.stats["pages_empty_content"]` (`internals/crawler.py`, at
-    `RUN_STATS_VERSION` 3).
+    run, as `runs.stats["pages_empty_content"]` (`internals/crawler.py`, on every row from
+    `RUN_STATS_VERSION` 2 onwards).
 
     **Exactly one thing branches on it, and it is not upstream of the seam.**
     `internals/llms_txt.py`'s `generate_llms_txt` omits an empty page from the index it builds

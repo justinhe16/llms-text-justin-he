@@ -1,26 +1,36 @@
 """Building the `dict` `runs.stats` stores — one owner, so the persisted shape never drifts.
 
 Pure, feature-owned, no I/O, the same category as `internals/payload.py` beside it.
-`CrawlService.execute_run` is the only caller: it has both a `CrawlResult` (from
-`internals/crawler.py`) and two facts the crawl loop cannot know about itself — how many
-links the generated artifact actually lists, and how many page bodies the full-text artifact
-had to cut — and this module is where the three are combined into the one `dict`
-`RunService.record_success`/`record_failure` persist as jsonb.
+`CrawlService.execute_run` is the only caller, because it is the one place that holds all
+three kinds of fact this dict is made of: a `CrawlResult` (from `internals/crawler.py`); two
+facts about the ARTIFACTS the crawl loop cannot know about itself — how many links the
+generated index actually lists, and how many page bodies the full-text expansion had to cut;
+and three facts about what happened BEFORE the crawl loop ran at all — which discovery entry
+point produced the frontier, how many URLs it found, and how many survived ranking
+(`internals/sitemap.py`, `internals/url_ranking.py`). This module is where all three are
+combined into the one `dict` `RunService.record_success`/`record_failure` persist as jsonb.
 
 **Why this lives here and not inside `internals/crawler.py`.** `CrawlResult.stats` is the
 crawl loop's own concern: pages fetched, pages failed, bytes moved, how long it took, which
 cap (if any) stopped it, and how many of the fetched pages carried no extractable content
 (`pages_empty_content`, added by PER-177). None of that is specific to *persistence* — a
 caller that only wanted to log a crawl's numbers would want exactly that dict and nothing
-more. `links_emitted`, `full_txt_truncated` and `version` are persistence-shaped concerns
-instead: the first two only exist because `runs.stats` is a place a UI reads from, and are
-facts about the ARTIFACTS rather than about the crawl — `internals/llms_txt.py` is what
-decides both, and the crawl loop has finished by the time either is knowable. `version` only
-exists because a stored jsonb value outlives the code that wrote it. Building the persisted
-shape here, one
-call site away from the write path, keeps `crawler.py`'s dict exactly as wide as the crawl
-loop's own job and gives PER-159's crawl loop nothing new to keep in sync with this ticket's
-writer.
+more. Everything else this module adds is a persistence-shaped concern instead, and each is
+something the crawl loop is structurally incapable of reporting:
+
+* `links_emitted` and `full_txt_truncated` are facts about the ARTIFACTS rather than about
+  the crawl — `internals/llms_txt.py` is what decides both, and the crawl loop has finished
+  by the time either is knowable.
+* `discovery_source`, `urls_discovered` and `urls_selected` are facts about the frontier the
+  crawl loop was HANDED. `crawl_site` receives `extra_urls` as a plain sequence and has no
+  idea whether it came from a sitemap, a `robots.txt` directive, or nowhere at all — that is
+  exactly the seam its own module docstring describes, and keeping these three out of
+  `CrawlResult.stats` is what preserves it.
+* `version` only exists because a stored jsonb value outlives the code that wrote it.
+
+Building the persisted shape here, one call site away from the write path, keeps
+`crawler.py`'s dict exactly as wide as the crawl loop's own job and gives PER-159's crawl
+loop nothing new to keep in sync with this ticket's writer.
 """
 
 import logging
@@ -30,7 +40,7 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
-RUN_STATS_VERSION: Final = 3
+RUN_STATS_VERSION: Final = 4
 """Which definition of this whole dict's shape a stored row was written under — not just
 `links_emitted`'s meaning, but which KEYS a row of this version even has.
 
@@ -64,14 +74,44 @@ The redefinition is why a reader cannot interpret this key without `version`.
 the artifact; the same equality on a version-3 row is a real measurement that happened to
 come out equal, and means every fetched page had extractable content. No row carries
 anything else a reader could infer this from — a row's age is not a fact about the code that
-wrote it — which is what keeps this a stored field rather than a derivation."""
+wrote it — which is what keeps this a stored field rather than a derivation.
+
+**Version 4** rows add three keys and redefine nothing (PER-176): `discovery_source`,
+`urls_discovered` and `urls_selected` describe the frontier the crawl loop was HANDED, before
+it fetched anything — which of `internals/sitemap.py`'s entry points produced it
+(`"sitemap"`, `"sitemap_index"`, `"robots"`, or `"none"`), how many same-origin candidates
+that produced, and how many `url_ranking.select_urls` kept. Every version-3 key keeps its
+version-3 meaning here.
+
+**Why this is version 4 and not three more keys folded into version 3.** PER-179 and PER-176
+are separate merges, so they are separate deploys, and version 3 was already live and writing
+rows by the time discovery landed. Folding these keys into 3 would have left two genuinely
+different shapes both stamped `version: 3`, distinguishable only by a reader who happened to
+know the deploy order — which is precisely the knowledge this field exists so that nobody
+needs. Two bumps in one release is cosmetically odd and semantically honest, and for a value
+stored permanently in jsonb, honest wins.
+
+The bump is what makes the shapes unambiguous rather than merely documented: `build_run_stats`
+writes the three discovery keys and `version` into the SAME dict in the same call, so no build
+of this module can emit one without the other. A version-3 row therefore never carries the
+discovery keys, and a version-4 row always does — there is no window, and no defensive read
+of a possibly-absent key is required. Read `discovery_source: "none"` (an explicit value, and
+the honest answer for a site with no sitemap) as different in kind from a version-3 row's
+silence on the subject."""
 
 
 def build_run_stats(
-    crawl_stats: Mapping[str, Any], *, links_emitted: int, full_txt_truncated: int
+    crawl_stats: Mapping[str, Any],
+    *,
+    links_emitted: int,
+    full_txt_truncated: int,
+    discovery_source: str,
+    urls_discovered: int,
+    urls_selected: int,
 ) -> dict[str, Any]:
     """Combine `crawl_stats` (from `CrawlResult.stats`) with the two numbers only the
-    artifact knows, plus `version`, into the exact `dict` `runs.stats` stores.
+    artifacts know, the three only the discovery step knows, and `version`, into the exact
+    `dict` `runs.stats` stores.
 
     Args:
         crawl_stats: `CrawlResult.stats` — `pages_crawled`, `pages_failed`, `bytes_fetched`,
@@ -102,17 +142,37 @@ def build_run_stats(
             one that fetched exactly what it published are otherwise indistinguishable in this
             row, and the caps are the sort of limit whose value is only revisited if someone
             can see how often it binds.
+        discovery_source: Which of `internals/sitemap.py`'s four discovery entry points
+            actually produced this run's frontier — `"sitemap"`, `"sitemap_index"`,
+            `"robots"`, or `"none"`. Typed as a plain `str`, not that module's
+            `DiscoverySource` literal: this is a pure, I/O-free module, and importing a type
+            from `internals/sitemap.py` would make it depend on an I/O module for the first
+            time. The vocabulary those four strings are drawn from is owned by
+            `internals/sitemap.py`, not here.
+        urls_discovered: How many same-origin candidates `internals/sitemap.py`'s discovery
+            step handed to `url_ranking.select_urls` — not every `<loc>` in whatever document
+            it read, which may have listed more before off-origin entries were dropped.
+        urls_selected: How many of those candidates `select_urls` actually chose, i.e.
+            `len(SelectionResult.selected)` — the size of the frontier `crawl_site` was
+            actually given via `extra_urls`. Recorded next to `urls_discovered` rather than
+            instead of it because the RATIO is the tunable thing: a run that discovered 4,000
+            URLs and selected 24 says something about the ranking that neither number says
+            alone.
 
     Returns:
-        `{**crawl_stats, "links_emitted": …, "full_txt_truncated": …, "version": …}`.
-        `crawl_stats`'s own keys come first and are never overwritten by the three added here,
-        because none of `"links_emitted"`, `"full_txt_truncated"` or `"version"` is a key
+        `crawl_stats` spread first, followed by `links_emitted`, `full_txt_truncated`,
+        `discovery_source`, `urls_discovered`, `urls_selected`, and `version`.
+        `crawl_stats`'s own keys come first and are never overwritten by the six added here,
+        because none of those six names is a key
         `CrawlResult.stats` has ever produced.
     """
     stats = {
         **crawl_stats,
         "links_emitted": links_emitted,
         "full_txt_truncated": full_txt_truncated,
+        "discovery_source": discovery_source,
+        "urls_discovered": urls_discovered,
+        "urls_selected": urls_selected,
         "version": RUN_STATS_VERSION,
     }
     # "Generation complete, with stats" — passed as `extra=stats` rather than folded into the

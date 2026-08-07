@@ -1,0 +1,8 @@
+# robots.txt for docs.test
+User-agent: *
+Disallow: /admin/
+Crawl-delay: 10
+
+Sitemap: https://docs.test/sitemaps/docs.xml
+sitemap: /sitemaps/guides.xml
+Sitemap: https://cdn.other.test/sitemaps/assets.xml   # off-origin, never fetched

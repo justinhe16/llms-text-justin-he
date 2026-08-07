@@ -1,19 +1,21 @@
 """Ranking and selecting a crawl's frontier from raw discovered URLs.
 
-**What this module is for.** A sitemap, a `robots.txt` `Sitemap:` line, and (once PER-176
-lands) links found on already-fetched pages all surface far more URLs than any run should
-ever fetch — a documentation site's sitemap alone can list thousands. `select_urls` takes
-whatever was discovered, in whatever order it was discovered in, and decides which subset
-`internals/crawler.py`'s `crawl_site(seed_url, extra_urls=...)` should actually spend its
-page budget on. It does not discover anything itself — that is PER-176's job — and it does
-not fetch, parse HTML, or call an LLM, so it stays on the right side of CLAUDE.md #9 and
-ARCHITECTURE.md §3.4: nothing here is "real crawling logic," only a decision over metadata
-a discovery step will have already collected.
+**What this module is for.** A sitemap, a `robots.txt` `Sitemap:` line, and (once link
+extraction lands) links found on already-fetched pages all surface far more URLs than any run
+should ever fetch — a documentation site's sitemap alone can list thousands. `select_urls`
+takes whatever was discovered, in whatever order it was discovered in, and decides which
+subset `internals/crawler.py`'s `crawl_site(seed_url, extra_urls=...)` should actually spend
+its page budget on. It does not discover anything itself — that is `internals/sitemap.py`'s
+job — and it does not fetch, parse HTML, or call an LLM, so it stays on the right side of
+CLAUDE.md #9 and ARCHITECTURE.md §3.4: nothing here is "real crawling logic," only a decision
+over metadata a discovery step has already collected.
 
-**Not wired into `crawler.py` by this ticket.** Exactly like `internals/llms_txt.py` was
-built as a standalone, fully-tested seam before anything called it for real, this module is
-built and proven here; the ticket that makes `extra_urls` come from `select_urls` instead of
-an empty tuple is a later one.
+**Wired as of PER-176.** This module landed standalone and fully tested one ticket before
+anything called it for real — the same way `internals/extract.py` did — and PER-176 supplied
+the discovery step it was waiting for: `service.py` now runs `internals/sitemap.py`'s
+`discover_sitemap_urls` output through `select_urls` and hands `SelectionResult.selected` to
+`crawl_site` as `extra_urls`, where an empty tuple used to be. Nothing in this module had to
+change for that to work, which was the point of building it in isolation first.
 
 **Why `DiscoveredUrl` lives here and not in `schemas.py`.** `schemas.py`'s own docstring
 gives the reason for `CrawledPage`: a shape that never crosses the HTTP boundary and exists

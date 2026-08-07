@@ -11,11 +11,14 @@ own). Only the SEED failing to fetch at all is a failure — `CrawlResult.seed_e
 `app.features.crawl.service.CrawlService.execute_run` checks to decide that.
 
 **The frontier is a parameter, not something this module discovers.** `extra_urls` is
-whatever the caller already knows about beyond the seed — today, always empty, because link
-extraction does not exist yet (ARCHITECTURE.md §3.4, CLAUDE.md #9). That is deliberate: it is
-what makes the page cap testable without a link extractor, and it is exactly the seam the
-real frontier-discovery pipeline will plug into later. This module does not parse a single
-byte of any page's content to find one.
+whatever the caller already knows about beyond the seed — since PER-176, that is
+`internals/url_ranking.py`'s `select_urls` output over whatever `internals/sitemap.py`'s
+`discover_sitemap_urls` found, wired together one layer up in `service.py`. This module still
+does not discover anything itself: it does not parse a single byte of any page's content to
+find a link, and link extraction (finding URLs ON already-fetched pages, as opposed to a
+sitemap) remains out of scope (ARCHITECTURE.md §3.4, CLAUDE.md #9). `extra_urls` staying a
+plain parameter is what let the page cap be tested without either pipeline existing yet, and
+it is exactly the seam PER-176's discovery-and-selection pipeline plugs into now.
 
 **Two independent timeout mechanisms, not one.** A monotonic deadline (`clock() +
 limits.max_wall_clock_s`) is checked before every non-seed fetch is even attempted — cheap,
@@ -65,7 +68,12 @@ class CrawlLimits:
 
     max_bytes: int
     """The run-wide response-body budget, shared by every page via one `ByteBudget`
-    (`internals/fetcher.py`)."""
+    (`internals/fetcher.py`) — **unless the caller passes its own `budget` to `crawl_site`**,
+    in which case this field is never consulted at all. `service.py` always does: it builds
+    one `ByteBudget(limits.max_bytes)` before sitemap discovery runs and hands the same
+    object to both `discover_sitemap_urls` and `crawl_site`, so the run-wide cap this field
+    names is enforced either way — just not by reading `max_bytes` a second time here. See
+    `crawl_site`'s `budget` parameter for the full reasoning."""
 
     request_timeout_s: float
     """Not read by this module. Already baked into the shared `httpx.AsyncClient` by
@@ -167,6 +175,7 @@ async def crawl_site(
     *,
     limits: CrawlLimits,
     extra_urls: Sequence[str] = (),
+    budget: ByteBudget | None = None,
     resolver: Resolver | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> CrawlResult:
@@ -174,19 +183,35 @@ async def crawl_site(
 
     Fetches the seed first and alone. If it fails, this returns immediately with
     `seed_error` set and an empty `pages` — there is nothing else to attempt. Otherwise the
-    rest of `extra_urls` (today, always empty — see the module docstring) is fetched with
-    bounded concurrency, a politeness gate on request starts, a page cap, and a run-wide
-    byte cap; a non-seed page failing for any reason (an `httpx` error, `SsrfBlockedError`
-    on a redirect, a malformed response) is logged at WARNING, counted in
-    `stats["pages_failed"]`, and never fails the run.
+    rest of `extra_urls` is fetched with bounded concurrency, a politeness gate on request
+    starts, a page cap, and a run-wide byte cap; a non-seed page failing for any reason (an
+    `httpx` error, `SsrfBlockedError` on a redirect, a malformed response) is logged at
+    WARNING, counted in `stats["pages_failed"]`, and never fails the run.
 
     Args:
         client: The shared crawl client (`build_crawl_client`). Every fetch goes through it.
         seed_url: The one URL this run is guaranteed to attempt.
         limits: The six caps for this run — see `CrawlLimits`.
-        extra_urls: The rest of the frontier, already known to the caller. Truncated to
+        extra_urls: The rest of the frontier, already known to the caller — since PER-176,
+            `service.py`'s `select_urls(discover_sitemap_urls(...))` pipeline. Truncated to
             `limits.max_pages - 1` up front, and re-checked against the live page count
             before each fetch (the frontier becomes dynamic once link extraction lands).
+        budget: A caller-supplied `ByteBudget` to spend from, instead of a fresh one built
+            from `limits.max_bytes`. Both caller-supplied production values, alongside
+            `extra_urls` — `resolver`/`clock` below are the test-injection pair instead.
+            `service.py` always passes one: it builds a single `ByteBudget(limits.max_bytes)`
+            BEFORE calling `crawl_site` at all, so that `internals/sitemap.py`'s
+            `discover_sitemap_urls` can spend from it first and this run-wide cap is honored
+            across both phases rather than resetting between them. **When a budget is
+            injected, `limits.max_bytes` is never consulted** — see `CrawlLimits.max_bytes`'s
+            own docstring. `stats["bytes_fetched"]` (== `budget.used`) then includes whatever
+            the caller already spent before this function was ever called, which is correct
+            — `bytes_fetched` and `cap_hit == "bytes"` must always agree on the same counter
+            (`internals/sitemap.py`'s module docstring makes the same argument in more
+            detail) — but it does mean `bytes_fetched / pages_crawled` is no longer a page's
+            average size once any pre-crawl discovery ran. Defaults to
+            `ByteBudget(limits.max_bytes)`, matching every call site before this parameter
+            existed.
         resolver: Forwarded to every `fetch_page` call. Tests inject a fake one; production
             code never does.
         clock: The monotonic clock the wall-clock deadline and the politeness gate are
@@ -198,7 +223,7 @@ async def crawl_site(
         is deliberately allowed to propagate unchanged; catching it here would hide a
         worker shutdown from the reaper that is meant to notice it later.
     """
-    budget = ByteBudget(limits.max_bytes)
+    budget = budget if budget is not None else ByteBudget(limits.max_bytes)
     pages: list[CrawledPage] = []
     pages_failed = 0
     cap_hit: str | None = None

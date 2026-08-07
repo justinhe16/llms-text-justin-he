@@ -100,6 +100,28 @@ class Settings(BaseSettings):
     crawl_concurrency: int = Field(default=5, ge=1)
     crawl_politeness_delay_ms: int = Field(default=200, ge=0)
 
+    # Sitemap discovery (app.features.crawl.internals.sitemap), which fills the crawl
+    # frontier before the loop above runs. Both caps bound what ONE run may spend on
+    # discovery, and hitting either is a SUCCESS in the same sense the caps above are: the
+    # crawl proceeds with whatever URLs were found, and a site with no sitemap at all still
+    # produces a successful single-page run.
+    #
+    # `crawl_sitemap_max_documents` counts every sitemap-document fetch ATTEMPT — the two
+    # well-known probes, every `Sitemap:` target robots.txt declares, and every child of a
+    # sitemap index — regardless of whether it 404s, is refused by the SSRF guard, or
+    # parses. Counting only successes would let a hostile robots.txt listing ten thousand
+    # dead `Sitemap:` lines cost ten thousand requests. robots.txt itself is not counted:
+    # it is not a sitemap document and is fetched at most once. Five leaves three documents
+    # for a site that falls through both probes to robots.txt.
+    crawl_sitemap_max_documents: int = Field(default=5, ge=1)
+
+    # A defensive cap on how many URLs one run's discovery will accumulate, not a tuning
+    # knob: the byte budget usually binds first (discovery may spend at most
+    # SITEMAP_BYTE_SHARE of crawl_max_bytes, and 12.5 MiB of sitemap XML holds far fewer
+    # than 50,000 entries). It exists so that a pathological document cannot turn into an
+    # unbounded list in memory even if that arithmetic ever changes.
+    crawl_sitemap_max_urls: int = Field(default=50_000, ge=1)
+
     # Abuse protection for `POST /websites/{id}/runs` (`app.features.runs.service.
     # RunService.trigger_run`). Both caps are per-USER, not per-website — a user with ten
     # websites gets ten websites' worth of manual triggers, not ten independent budgets —
