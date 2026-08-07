@@ -263,7 +263,7 @@ class DiscoveryResult:
 
 
 class _DiscoveryBudget(ByteBudget):
-    """A `ByteBudget` that spends against `parent` before its own, tighter cap.
+    """A `ByteBudget` that checks its own, tighter cap BEFORE spending against `parent`.
 
     Sitemap discovery runs BEFORE `crawl_site`'s own seed fetch, sharing one `ByteBudget` for
     the whole run (`service.py`). If discovery alone could exhaust that shared budget, the
@@ -273,22 +273,31 @@ class _DiscoveryBudget(ByteBudget):
     tighter ceiling — `SITEMAP_BYTE_SHARE` of the run's total — layered on top of, never
     instead of, the run's own budget.
 
-    `take()` charges `parent` first: the bytes genuinely crossed the wire, so charging the
-    run's real counter first is the honest accounting, and it is also what keeps
-    `bytes_fetched` (== `budget.used`) equal to what `cap_hit == "bytes"` actually enforced
-    (see the module docstring's "bytes_fetched includes sitemap bytes" section). Charging
-    `parent` first, rather than only on success, also means `parent`'s own cap ALWAYS binds
-    even when a caller hands this class a `max_bytes` bigger than `settings.crawl_max_bytes`
-    — the share is a second, tighter ceiling, never a licence to spend more than the run's
-    own budget allows.
+    **The order of the two `take()` calls below is the whole guarantee, and the obvious
+    ordering is the wrong one.** Charging `parent` first looks like the honest accounting —
+    the bytes did cross the wire — but it hands `parent` every byte of a chunk BEFORE this
+    object's tighter cap has had any chance to refuse it. A chunk is not bounded in size:
+    `fetch_page` streams with `response.aiter_bytes()`, whose chunking is decided by the
+    transport, and a transport that hands back a whole 40 MB body in one piece would charge
+    all 40 MB to the run before the 12.5 MB share ever fired. That is not a hypothetical — it
+    is exactly what `httpx.MockTransport` does with a plain `content=` response, and it is
+    what `tests/test_crawler_caps.py`'s
+    `test_a_huge_sitemap_does_not_starve_the_page_crawl` pins down. Under that ordering the
+    share is decorative: discovery could spend the entire run budget and starve the seed,
+    which is the one failure this class exists to prevent.
 
-    The one place this over-charges `parent`: when a chunk trips THIS budget's own cap
-    (`super().take()` raises), `parent` has already accepted that one chunk, but this
-    object's own counter has not — and `fetch_page` discards the whole partial body on a
-    `ByteBudgetExceededError` (`internals/fetcher.py`'s own docstring), so no chunk this
-    budget ultimately rejected is ever kept anyway. The over-charge is therefore bounded by
-    exactly one chunk, on the one fetch that trips the share — it does not compound across a
-    run.
+    So the share is checked FIRST, and `parent` is only charged for a chunk this budget has
+    already accepted. The cost is that the final, refused chunk is never charged to `parent`
+    even though it did arrive — `budget.used` under-counts the wire by at most one chunk on
+    the one fetch that trips the share. That is the safe direction to be wrong in, and it is
+    invisible downstream anyway: `fetch_page` discards the whole partial body on a
+    `ByteBudgetExceededError` (`internals/fetcher.py`), so nothing that chunk paid for is
+    ever kept.
+
+    `parent`'s own cap still ALWAYS binds — the second call can refuse a chunk this one
+    accepted, which is what keeps a caller-supplied budget smaller than
+    `settings.crawl_max_bytes` authoritative. The share is a second, tighter ceiling, never a
+    licence to spend more than the run's own budget allows.
     """
 
     def __init__(self, parent: ByteBudget, max_bytes: int) -> None:
@@ -296,8 +305,11 @@ class _DiscoveryBudget(ByteBudget):
         self._parent = parent
 
     def take(self, num_bytes: int) -> None:
-        self._parent.take(num_bytes)
+        # Discovery's own tighter ceiling FIRST — see the class docstring. `ByteBudget.take`
+        # raises without mutating its counter when a chunk would exceed the cap, so a refused
+        # chunk leaves BOTH budgets untouched rather than half-charged.
         super().take(num_bytes)
+        self._parent.take(num_bytes)
 
 
 @dataclass(slots=True)

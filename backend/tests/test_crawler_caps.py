@@ -16,7 +16,7 @@ import httpx
 from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, crawl_site
 from app.features.crawl.internals.fetcher import ByteBudget
-from app.features.crawl.internals.sitemap import discover_sitemap_urls
+from app.features.crawl.internals.sitemap import SITEMAP_BYTE_SHARE, discover_sitemap_urls
 from app.features.crawl.internals.ssrf import Resolver
 
 
@@ -380,17 +380,30 @@ async def test_a_huge_sitemap_does_not_starve_the_page_crawl() -> None:
     the oversized sitemap would consume nearly all of it, and the seed fetch below would
     raise `ByteBudgetExceededError` — turning a site with a huge sitemap and a perfectly
     reachable seed into a FAILED run (`crawler.py` catches that into `seed_error`, and
-    `CrawlService` turns a `seed_error` into a failed run). Deleting `_DiscoveryBudget` (or
-    having discovery spend directly from `budget` with no share of its own) turns this test
-    red: the seed fetch below would come back with `seed_error` set instead of `None`.
+    `CrawlService` turns a `seed_error` into a failed run).
+
+    **The seed page here is deliberately 300 KB, not two bytes, and that is what gives this
+    test its teeth.** The oversized sitemap is 800 KB of a 1 MB run budget, so an
+    implementation that let discovery spend from the full shared budget would leave only
+    ~200 KB — enough for a token-sized seed, and NOT enough for this one. A 2-byte seed would
+    survive that broken implementation and the test would pass while the bug it is named
+    after was live. Sizing the seed above the leftover is what makes "the page crawl was not
+    starved" an assertion rather than a hope.
+
+    Two independent things are pinned below, and both go red under a regression:
+    `budget.used` staying inside discovery's share catches the charge-ordering bug in
+    `_DiscoveryBudget.take` directly, and `seed_error is None` catches its consequence.
     """
     settings = _settings(crawl_max_bytes=1_000_000)
     huge_sitemap = b"a" * int(settings.crawl_max_bytes * 0.8)
+    # Larger than what a starved run would have left over (1 MB - 800 KB), so the seed fetch
+    # can only succeed if discovery genuinely stayed inside its own share.
+    seed_body = "s" * 300_000
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/sitemap.xml":
             return httpx.Response(200, content=huge_sitemap)
-        return httpx.Response(200, text="ok")
+        return httpx.Response(200, text=seed_body)
 
     budget = ByteBudget(settings.crawl_max_bytes)
 
@@ -402,6 +415,7 @@ async def test_a_huge_sitemap_does_not_starve_the_page_crawl() -> None:
             settings=settings,
             resolver=_fake_resolver(),
         )
+        spent_by_discovery = budget.used
         result = await crawl_site(
             client,
             "http://seed.test/",
@@ -410,12 +424,14 @@ async def test_a_huge_sitemap_does_not_starve_the_page_crawl() -> None:
             resolver=_fake_resolver(),
         )
 
-    # Discovery genuinely spent most of the shared budget on the oversized document — the
-    # premise of this test, not merely its setup — and still harvested nothing (the fixture
-    # is `"a" * N`, not valid XML, so even if it had fit it would not have parsed).
+    # Discovery harvested nothing (the fixture is `"a" * N`, not valid XML) and — the point
+    # of this test — never charged the run for more than its share, even though the document
+    # it tried to read arrived as one chunk far larger than that share.
     assert discovery.urls == []
-    assert budget.used > 0
+    assert spent_by_discovery <= int(settings.crawl_max_bytes * SITEMAP_BYTE_SHARE)
 
+    # The consequence: the seed still had the budget it needed.
     assert result.seed_error is None
     assert len(result.pages) == 1
     assert result.pages[0].url == "http://seed.test/"
+    assert result.pages[0].content_bytes == len(seed_body)

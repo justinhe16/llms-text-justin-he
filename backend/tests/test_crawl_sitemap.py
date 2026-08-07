@@ -38,7 +38,11 @@ from conftest import _JsonLogCapture
 from app.core.settings import Settings
 from app.features.crawl.internals import sitemap
 from app.features.crawl.internals.fetcher import ByteBudget
-from app.features.crawl.internals.sitemap import DiscoveryResult, discover_sitemap_urls
+from app.features.crawl.internals.sitemap import (
+    SITEMAP_BYTE_SHARE,
+    DiscoveryResult,
+    discover_sitemap_urls,
+)
 from app.features.crawl.internals.ssrf import Resolver
 
 
@@ -802,9 +806,13 @@ async def test_discovery_cannot_spend_more_than_its_share_of_the_run_budget() ->
     settings = _settings(crawl_max_bytes=10_000)  # share = 2,500 bytes
 
     async def huge_body() -> AsyncIterator[bytes]:
-        # Streamed in small chunks, not one giant `MockTransport` chunk, so the one-chunk
-        # overcharge `_DiscoveryBudget` accepts (its own docstring) stays small relative to
-        # the cap rather than swallowing most of the run's whole budget in a single "chunk".
+        # Streamed in many small chunks, which is the shape a real transport produces. The
+        # complementary case — a whole oversized body arriving as ONE chunk, which is what
+        # `httpx.MockTransport` does with a plain `content=` response — is covered by
+        # `tests/test_crawler_caps.py::test_a_huge_sitemap_does_not_starve_the_page_crawl`.
+        # `_DiscoveryBudget` has to hold the share in both shapes, and it holds them by
+        # different halves of `take()`: here it stops partway through the stream, there it
+        # refuses the single chunk before the run's budget is charged at all.
         for _ in range(200):
             yield b"a" * 256  # 51,200 bytes total — far more than the 2,500-byte share
 
@@ -826,7 +834,10 @@ async def test_discovery_cannot_spend_more_than_its_share_of_the_run_budget() ->
         )
 
     assert result == DiscoveryResult([], "none")
-    assert budget.used <= settings.crawl_max_bytes // 2
+    # Pinned against the SHARE itself, not a loose `crawl_max_bytes // 2`: the share is the
+    # number `_DiscoveryBudget` actually enforces, and asserting the looser bound would stay
+    # green under a charge-ordering regression that let discovery spend up to half the run.
+    assert budget.used <= int(settings.crawl_max_bytes * SITEMAP_BYTE_SHARE)
 
 
 async def test_exhausting_the_share_mid_index_keeps_the_children_already_parsed() -> None:
