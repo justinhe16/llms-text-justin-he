@@ -38,15 +38,27 @@ class CrawledPage:
     """The HTTP status code of the final, non-redirect response."""
 
     title: str | None
-    """Always `None` in this milestone. Extraction — reading a `<title>` out of `content`
-    — lives behind the `generate_llms_txt` seam (ARCHITECTURE.md §3.4, CLAUDE.md #9), and
-    there is nothing upstream of that seam that parses HTML yet. The field exists now so
-    that seam's signature does not have to widen the day extraction is designed."""
+    """The page's extracted title, or `None` when the document carried nothing usable as
+    one — because the response was not HTML at all, or because it was HTML and extraction
+    still found no JSON-LD title, no `og:title`, no lone `<h1>`, and no `<title>` element to
+    fall back to. Set by `internals/fetcher.py`'s `fetch_page`, which hands the decoded body
+    to `internals/extract.py`'s `extract_content` and copies its `ExtractedContent.title`
+    straight across.
+
+    **Not always the `<title>` element.** trafilatura prefers, in order, JSON-LD and
+    OpenGraph metadata (`og:title`), then a lone `<h1>`, before it falls back to `<title>`
+    itself — see `extract_content`'s own docstring for the full precedence order. On a
+    documentation page that usually means the site-suffixed social title
+    ("Configuration | Acme Docs") when the generator emits `og:title`, and the bare heading
+    ("Configuration") when it does not; both are the page's real title."""
 
     content: str
     """The response body, decoded at the transport level (`response.encoding or "utf-8"`,
-    `errors="replace"`) and nothing more — not parsed, not stripped of markup. Parsing is
-    the crawler milestone's problem, not this feature's."""
+    `errors="replace"`) and nothing more — not parsed, not stripped of markup. Parsing now
+    happens in this feature (`internals/extract.py`, wired in by `internals/fetcher.py`), but
+    its output lands on `markdown` below, not here — `content` stays the raw decoded body
+    regardless of what extraction made of it. See `markdown`'s own docstring for why both are
+    kept rather than just the parsed form."""
 
     fetched_at: datetime
     """When this page's final response was received, in UTC."""
@@ -70,6 +82,52 @@ class CrawledPage:
     `serialize_payload` writes this value out as the payload's `bytes` field for exactly this
     reason — it is the honest answer to "how large was this page," not a derived
     approximation of it."""
+
+    description: str | None
+    """The page's extracted meta description, or `None` when it has none —
+    `internals/extract.py`'s `ExtractedContent.description`, copied across unchanged by
+    `fetch_page`. `None` rather than `""` for the same reason `title` is: plenty of real
+    documentation pages omit a description entirely, and that is the normal case, not an
+    error one.
+
+    Appended here, after `content_bytes`, along with `markdown` and `is_empty` below, for
+    the same reason `content_bytes` documents its own position: a field inserted anywhere
+    but the end of this dataclass would silently reorder every positional `CrawledPage(...)`
+    construction already in this codebase into the wrong parameters, rather than raising.
+    Required, not defaulted, for the same reason too — a caller that forgot to wire
+    extraction through should get a `TypeError` on construction, not a `CrawledPage` that
+    quietly claims every page has no description."""
+
+    markdown: str
+    """The page's main content as markdown — `internals/extract.py`'s
+    `ExtractedContent.markdown`, copied across unchanged by `fetch_page`. Empty (`""`)
+    whenever extraction produced nothing, which is the condition `is_empty` below reports.
+
+    **Why this field exists alongside `content` rather than replacing it.** `content` is
+    this run's archival record of what the server actually sent — the payload
+    `internals/payload.py` writes to Storage is meant to outlive today's extractor, and
+    re-extracting from the original markup later (a trafilatura upgrade, a bug fix in
+    `internals/extract.py`, a wider extraction pass) is only possible if that markup was
+    kept rather than discarded the moment this feature's own pass over it finished.
+    `markdown` is that pass's answer for today's callers, most directly the
+    `generate_llms_txt` seam (ARCHITECTURE.md §3.4); the two fields serve different readers,
+    and neither is a derived form of the other that could be dropped to save space.
+
+    Appended at the end of this dataclass alongside `description` and `is_empty`, for the
+    same positional-construction reason `description`'s own docstring gives."""
+
+    is_empty: bool
+    """Whether this page yielded no extractable content — `internals/extract.py`'s
+    `ExtractedContent.is_empty`, copied across unchanged by `fetch_page`. Counted, once per
+    run, as `runs.stats["pages_empty_content"]` (`internals/crawler.py`, at
+    `RUN_STATS_VERSION` 2) and otherwise inert: ARCHITECTURE.md §3.4 and CLAUDE.md #9 both
+    hold that this flag is instrumentation, not a branch, and nothing on this dataclass or
+    downstream of it may decide what to do with a page BECAUSE it is set. In particular,
+    `title` above is never nulled when this is `True` — see `internals/fetcher.py`'s own
+    comment on that decision.
+
+    Appended at the end of this dataclass alongside `description` and `markdown`, for the
+    same positional-construction reason `description`'s own docstring gives."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,10 +153,11 @@ class CrawlOutcome:
     stats: dict[str, Any]
     """The same shape `runs.stats` stores as jsonb — built by `internals/run_stats.py`'s
     `build_run_stats`: `pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`,
-    `cap_hit`, `links_emitted`, and `version`. Typed loosely (`dict[str, Any]`) to match
-    `app.features.runs.schemas.RunListItemResponse.stats`, which reads this same column back
-    out with the same justification — the shape belongs to this feature, which is why it is
-    built here rather than validated against a model owned by `runs`."""
+    `cap_hit`, `pages_empty_content`, `links_emitted`, and `version`. Typed loosely
+    (`dict[str, Any]`) to match `app.features.runs.schemas.RunListItemResponse.stats`, which
+    reads this same column back out with the same justification — the shape belongs to this
+    feature, which is why it is built here rather than validated against a model owned by
+    `runs`."""
 
     storage_path: str
     """The bucket-qualified path the payload landed at, e.g.

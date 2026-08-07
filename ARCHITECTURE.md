@@ -269,8 +269,12 @@ pattern in use, not merely anticipated by it.
 
 ### 3.4 The crawler seam
 
-Real crawling and extraction logic is **out of scope for this milestone** and has not been
-designed yet. Until it is, everything downstream of a fetched page sits behind one function:
+Real crawling logic — deciding what to do with a fetched, now-parsed page: which to keep,
+how to rank or summarize them, anything that calls a model — is **out of scope for this
+milestone** and has not been designed yet. Extraction is not: `internals/extract.py` parses
+every fetched page's HTML now (PER-177), and `CrawledPage` carries its output. What remains
+out of scope, and sits behind one function, is everything downstream of a fetched, parsed
+page:
 
 ```python
 def generate_llms_txt(pages: list[CrawledPage]) -> str:
@@ -287,40 +291,56 @@ Build against that signature. Do not scatter crawling, parsing, or LLM-calling l
 through the services in anticipation of a design that does not exist yet, and do not widen
 the signature without a ticket that redesigns this seam.
 
-**One exception now exists, and it is deliberately not wired to anything.**
+**Extraction is wired into the fetch path, and `CrawledPage` carries its output.**
 `internals/extract.py` parses a page's HTML into a title, a description, and a markdown body
 (`extract_content(html, *, url) -> ExtractedContent`, built on trafilatura). It is a pure
 function in the same category as `internals/payload.py` and `internals/run_stats.py` — no
-I/O, no clock, no network — and **nothing calls it**: `CrawledPage.title` is still always
-`None`, `CrawledPage.content` is still the undecoded-beyond-transport response body, and
-`generate_llms_txt` is still the stub described above. Wiring extraction into the crawl loop
-is a separate ticket (PER-177).
+I/O, no clock, no network — and it landed unwired, reviewed and tested as a pure module in
+its own right, before PER-177 called it: `internals/fetcher.py`'s `fetch_page` now calls
+`extract_content` once, inline, right after a response's body is read within budget, whenever
+the response's `Content-Type` looks like HTML (`_looks_like_html` — permissive on an absent
+or unparseable header, because `extract_content` never raises and an absent header is not
+evidence the body is not HTML; an explicit non-HTML type still skips the parse). `CrawledPage`
+gains three fields — `description`, `markdown`, and `is_empty`, appended in that order after
+`content_bytes` so no positional construction is silently reordered — and its long-reserved
+`title` is finally populated rather than always `None`; all four are copied straight across
+from `ExtractedContent`. `content` is unchanged, still the undecoded-beyond-transport response
+body, kept alongside `markdown` as the run's archival record of what the server actually
+sent, distinct from what this feature's own pass made of it. `generate_llms_txt` is still the
+stub described above: extraction feeds the seam's input type, it is not the seam.
 
-That ordering is the point rather than an accident of scheduling. Extraction is the one part
-of the undesigned pipeline whose quality can be judged on its own — against fixtures from
-the documentation generators this crawler actually meets (Docusaurus, Mintlify, VitePress,
+Landing extraction as an unwired module first, and wiring it in a second, separate ticket,
+was deliberate rather than an accident of scheduling. Extraction was the one part of the
+undesigned pipeline whose quality could be judged on its own — against fixtures from the
+documentation generators this crawler actually meets (Docusaurus, Mintlify, VitePress,
 Nextra), asserting that a page's prose survives and its navbar, sidebar, table of contents,
-pagination and footer do not. Landing it as an unwired module keeps that judgement reviewable
-in isolation instead of buried inside a behaviour change to the fetch path, and it leaves the
-seam above exactly as narrow as it was. Summarization and anything that calls a model remain
-undesigned and out of scope; ranking now exists too, but only the kind that happens *before*
-a fetch — see the next exception.
+pagination and footer do not — reviewable in isolation instead of buried inside a behaviour
+change to the fetch path. Summarization and anything that calls a model remain undesigned and
+out of scope; ranking now exists too, but only the kind that happens *before* a fetch — see
+the next exception.
 
-`ExtractedContent.is_empty` is instrumentation, not a branch. It is set when a page yields
-less than `MIN_BODY_CHARS` of body — the signature of a JavaScript-rendered shell that
-returned a mount div and a bundle. Whether to pay for headless rendering is an open question
-with a real cost attached, and this flag exists to measure how often it would matter (counted
-by PER-176), not to decide it. Nothing branches on it.
+`CrawledPage.is_empty` — `ExtractedContent.is_empty`, copied across unchanged — is
+instrumentation, not a branch. It is set when a page yields less than `MIN_BODY_CHARS` of
+body — the signature of a JavaScript-rendered shell that returned a mount div and a bundle.
+Whether to pay for headless rendering is an open question with a real cost attached, and this
+flag exists to measure how often it would matter, not to decide it: it is counted once per
+run, as `runs.stats["pages_empty_content"]` at `RUN_STATS_VERSION` 2
+(`internals/crawler.py`, `internals/run_stats.py`). Nothing branches on it — in particular,
+`CrawledPage.title` is never nulled because a page's `is_empty` is `True`, even for the
+JavaScript-shell case that flag exists to measure: a shell is real HTML with a real
+`<title>`, `extract_content` deliberately keeps it, and discarding it here would be exactly
+the branch this paragraph forbids.
 
-**A second exception, the same shape: `internals/url_ranking.py`.** `select_urls(candidates,
-*, seed_url, limit) -> SelectionResult` turns the URLs a discovery step found into the subset
-worth spending a run's page budget on. It normalizes every candidate, drops the ones
-structurally not worth fetching under named, individually-counted rules (dated archives,
-`/tag/` and `/author/` taxonomies, pagination, feeds, changelogs, off-origin links, and
-localized duplicates of a page already chosen), scores the rest on path shape plus the
-sitemap's own `<priority>` and `<lastmod>`, and takes the top `limit`. Pure and clock-free
-like the two modules above, and **called by nothing today**: `crawl_site`'s `extra_urls` is
-still an empty tuple, and wiring discovery and selection into it is PER-176.
+**A second exception, still unwired: `internals/url_ranking.py`.** Unlike `extract.py` above,
+nothing calls this one yet. `select_urls(candidates, *, seed_url, limit) -> SelectionResult`
+turns the URLs a discovery step found into the subset worth spending a run's page budget on.
+It normalizes every candidate, drops the ones structurally not worth fetching under named,
+individually-counted rules (dated archives, `/tag/` and `/author/` taxonomies, pagination,
+feeds, changelogs, off-origin links, and localized duplicates of a page already chosen),
+scores the rest on path shape plus the sitemap's own `<priority>` and `<lastmod>`, and takes
+the top `limit`. Pure and clock-free like `extract.py`, `payload.py`, and `run_stats.py`, and
+**called by nothing today**: `crawl_site`'s `extra_urls` is still an empty tuple, and wiring
+discovery and selection into it is PER-176.
 
 The distinction that matters is *where* that ranking sits. It runs entirely **before** any
 page is fetched, so it ranks on URL shape and sitemap metadata only — "fetch it and see

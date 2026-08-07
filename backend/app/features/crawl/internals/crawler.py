@@ -106,10 +106,17 @@ class CrawlResult:
 
     stats: dict[str, Any]
     """The exact shape `runs.stats` stores: `pages_crawled`, `pages_failed`,
-    `bytes_fetched`, `duration_ms`, `cap_hit`. `pages_crawled` is the key name the websites
-    feature's reader already reads out of this column — see
+    `bytes_fetched`, `duration_ms`, `cap_hit`, and `pages_empty_content`. `pages_crawled` is
+    the key name the websites feature's reader already reads out of this column — see
     `app.features.websites.internals.websites_reader` — so it is spelled exactly that way
-    here, not `len(pages)` renamed to something more natural in isolation."""
+    here, not `len(pages)` renamed to something more natural in isolation.
+
+    `pages_empty_content` is counted here, alongside the other five, rather than in
+    `internals/run_stats.py` — see that module's own docstring for the line it draws between
+    the crawl loop's concerns and persistence-shaped ones. How many of the pages THIS LOOP
+    fetched came back with no extractable content is a fact about the fetch, not about how
+    the result gets stored, so it belongs on this dict the same way `pages_failed` and
+    `bytes_fetched` do."""
 
     cap_hit: str | None
     """`"pages"`, `"bytes"`, `"wall_clock"`, or `None` if the crawl exhausted its frontier
@@ -298,5 +305,14 @@ async def crawl_site(
         "bytes_fetched": budget.used,
         "duration_ms": int((clock() - start) * 1000),
         "cap_hit": cap_hit,
+        # A fact about the pages THIS LOOP fetched, not a persistence-shaped concern —
+        # `internals/run_stats.py`'s module docstring draws that line for `links_emitted` and
+        # `version`, and how many fetched pages carried no extractable content belongs on this
+        # side of it. Counting it here, rather than downstream in `build_run_stats`, also
+        # means the seed-failure path in `service.py`
+        # (`build_run_stats(result.stats, links_emitted=links_emitted)`) gets this key for
+        # free, with no extra plumbing — the persisted shape stays uniform across a
+        # successful run's stats and a failed one's partial stats.
+        "pages_empty_content": sum(1 for page in pages if page.is_empty),
     }
     return CrawlResult(pages=pages, stats=stats, cap_hit=cap_hit, seed_error=seed_error)

@@ -64,8 +64,17 @@ def payload_object_path(website_id: UUID, run_id: UUID) -> str:
 
 
 def _page_to_json_line(page: CrawledPage) -> str:
-    """One page, as one line of JSONL: exactly the six keys the ticket specifies, and
+    """One page, as one line of JSONL: exactly the eight keys the ticket specifies, and
     nothing computed that is not already sitting on `page`.
+
+    `description` and `markdown` — PER-177's extracted title's counterpart and the parsed
+    body — sit alongside `title` and `content` respectively, because the payload is the run's
+    archival record and both the raw and the parsed form belong in it (see
+    `CrawledPage.markdown`'s own docstring for why neither is dropped in favor of the other).
+    `is_empty` is deliberately NOT one of the eight: the ticket that added it asked only for
+    `description` and `markdown` here, and `is_empty` already has a home of its own — counted
+    once per run, in `runs.stats["pages_empty_content"]` (`internals/crawler.py`) — so nothing
+    downstream needs it repeated on every line of every payload this feature writes.
 
     `ensure_ascii=False` so non-Latin page content survives as UTF-8 rather than being
     escaped into `\\uXXXX` sequences that would triple the size of a payload that is about
@@ -76,7 +85,9 @@ def _page_to_json_line(page: CrawledPage) -> str:
         "url": page.url,
         "status": page.status,
         "title": page.title,
+        "description": page.description,
         "content": page.content,
+        "markdown": page.markdown,
         "fetched_at": page.fetched_at.isoformat(),
         "bytes": page.content_bytes,
     }

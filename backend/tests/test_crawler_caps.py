@@ -9,6 +9,7 @@ name.
 import asyncio
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 
 import httpx
 
@@ -21,6 +22,13 @@ _AsyncHandler = Callable[[httpx.Request], Awaitable[httpx.Response]]
 
 
 PUBLIC_IP = "8.8.8.8"
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _load_fixture(name: str) -> str:
+    """See `tests/test_crawl_extract.py`'s helper of the same name — identical contract."""
+    return (_FIXTURES / name).read_text(encoding="utf-8")
 
 
 def _fake_resolver(mapping: dict[str, Sequence[str]] | None = None) -> Resolver:
@@ -246,6 +254,37 @@ async def test_a_non_seed_page_failing_lands_in_pages_failed_and_does_not_fail_t
     assert result.pages[0].url == "http://seed.test/"
     assert result.stats["pages_failed"] == 1
     assert result.cap_hit is None
+
+
+async def test_pages_empty_content_counts_pages_the_extractor_found_nothing_on() -> None:
+    """`stats["pages_empty_content"]` (PER-177) is a fact about the pages THIS LOOP
+    fetched — see `CrawlResult.stats`'s own docstring for why it lives here rather than in
+    `internals/run_stats.py`. The seed here carries real documentation prose; the one
+    frontier page is a JavaScript shell that `internals/extract.py` finds nothing on — so of
+    the two pages this crawl collects, exactly one should count."""
+    docusaurus = _load_fixture("docusaurus_page.html")
+    js_shell = _load_fixture("js_shell_page.html")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "seed" in _host(request):
+            return httpx.Response(200, html=docusaurus)
+        return httpx.Response(200, html=js_shell)
+
+    seed = "http://seed.test/"
+    extra = ["http://shell.test/"]
+
+    async with _client(handler) as client:
+        result = await crawl_site(
+            client, seed, limits=_limits(), extra_urls=extra, resolver=_fake_resolver()
+        )
+
+    assert len(result.pages) == 2
+    assert result.stats["pages_empty_content"] == 1
+    # The seed's own page is not the empty one — pin down WHICH page counts, not just how many.
+    seed_page = next(page for page in result.pages if page.url == seed)
+    shell_page = next(page for page in result.pages if page.url != seed)
+    assert seed_page.is_empty is False
+    assert shell_page.is_empty is True
 
 
 async def test_a_seed_that_hangs_past_the_wall_clock_budget_is_a_seed_failure() -> None:

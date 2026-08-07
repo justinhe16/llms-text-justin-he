@@ -408,10 +408,10 @@ class CrawlService:
                     run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
                 )
 
-                # `result.stats` already has exactly the five keys `runs.stats` wants named
-                # (`pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`,
-                # `cap_hit`) — spread rather than restated by hand, so this line can never
-                # drift from the shape `internals/crawler.py` actually produces.
+                # `result.stats` already has exactly the six keys `runs.stats` wants named
+                # (`pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`, `cap_hit`,
+                # `pages_empty_content`) — spread rather than restated by hand, so this line
+                # can never drift from the shape `internals/crawler.py` actually produces.
                 # `storage_path` is the one field that is not already on it.
                 logger.info(
                     "crawl: completed", extra={**result.stats, "storage_path": storage_path}
