@@ -143,6 +143,37 @@ def test_an_exact_length_tie_resolves_to_allow() -> None:
 @pytest.mark.parametrize(
     ("pattern", "url", "expected"),
     [
+        # The plain-prefix shape: `/private` must anchor at position 0, not merely appear
+        # somewhere in the target -- `/public/private` is a genuinely different path.
+        ("/private", "https://docs.test/private", False),
+        ("/private", "https://docs.test/public/private", True),
+        # The same anchoring, with a `*` in the pattern: `_matches`'s FIRST segment is still
+        # `str.startswith` at position 0, even though every later segment is only `str.find`
+        # from wherever the previous one ended. "/private/" appears in the second URL -- just
+        # not at the start -- and must not match.
+        ("/private/*.pdf", "https://docs.test/private/guide.pdf", False),
+        ("/private/*.pdf", "https://docs.test/public/private/guide.pdf", True),
+    ],
+)
+def test_disallow_is_a_prefix_match_anchored_at_position_zero_not_a_substring_match(
+    pattern: str, url: str, expected: bool
+) -> None:
+    """Robots.txt paths are PREFIX matches anchored at the start of the target, never a
+    substring test -- `Disallow: /private` must not block `/public/private`. `_matches` gets
+    this right by checking its first segment with `target.startswith(first)`; mutating that
+    check to `first in target` would let all four cases above match (nothing after it corrects
+    for the wrong start position), so this is what pins the check to `startswith` rather than
+    membership."""
+    text = f"User-agent: *\nDisallow: {pattern}\n"
+
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+
+    assert rules.is_allowed(url) is expected
+
+
+@pytest.mark.parametrize(
+    ("pattern", "url", "expected"),
+    [
         ("/*.pdf$", "https://docs.test/guide.pdf", False),
         ("/*.pdf$", "https://docs.test/guide.pdf.html", True),
         ("/a/*/b", "https://docs.test/a/x/b", False),
@@ -158,6 +189,28 @@ def test_star_and_dollar_wildcards(pattern: str, url: str, expected: bool) -> No
     rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
 
     assert rules.is_allowed(url) is expected
+
+
+def test_dollar_anchor_accepts_a_zero_width_wildcard_at_the_match_boundary() -> None:
+    """Pins `_matches`'s anchored branch at its exact boundary. `start` is where the final
+    `$`-anchored segment would have to begin; `pos` is where the previous segment's match
+    ended; the guard is `start < pos`. `start == pos` is a LEGITIMATE match -- the `*` between
+    the two segments consumed zero characters -- and the guard must let it through; mutating
+    `<` to `<=` would turn this exact case into a false rejection.
+
+    Pattern `/aaa*a$` (segments `("/aaa", "a")`, anchored) against target `/aaaa`: the first
+    segment matches `/aaa` at position 0-4, so `pos == 4`; the anchored last segment `a` must
+    then start at `len(target) - 1 == 4`, i.e. `start == pos == 4` -- the `*` contributed
+    nothing between them. Its near-neighbour, target `/aaa` (one character shorter), is where
+    the segments genuinely WOULD have to overlap: the anchored `a` would have to start at
+    position 3, one character before the first segment's own match ends, and must not match
+    either way -- this is not the boundary the mutant moves.
+    """
+    text = "User-agent: *\nDisallow: /aaa*a$\n"
+    rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
+
+    assert rules.is_allowed("https://docs.test/aaaa") is False  # start == pos: a real match
+    assert rules.is_allowed("https://docs.test/aaa") is True  # start == pos - 1: a real overlap
 
 
 def test_an_empty_disallow_allows_everything() -> None:
@@ -261,20 +314,32 @@ def test_a_hostile_dollar_anchored_pattern_that_cannot_match_returns_promptly() 
 
 
 def test_many_consecutive_wildcards_against_a_long_target_return_promptly() -> None:
-    """`****...*` collapses to a single `*` (the "glob edge cases" section above), and this
-    pins that the collapse is genuinely O(n) rather than, say, a `_matches` call that still
-    walks fifty empty segments against a long target quadratically."""
-    pattern = "/" + "*" * 50
+    """`****...*` collapses to a single `*` (the "glob edge cases" section above) -- but a
+    pattern of bare consecutive wildcards with nothing else is not, on its own, a ReDoS shape:
+    matching fifty empty segments in a row against a target that satisfies every one of them
+    (what an earlier version of this test did, with an unanchored `/` + `"*" * 50`) is cheap
+    under EITHER matcher, old or new, because nothing ever forces a search for a split point
+    that does not exist -- the match just succeeds. What makes many consecutive wildcards
+    genuinely hostile is pairing them with a `$`-anchored literal the target can never reach:
+    under the OLD regex-based `_compile` this ticket replaced (`".*".join(re.escape(p) for p
+    in body.split("*"))` -- module docstring's "wildcards" section), fifty consecutive `.*`
+    groups failing to find a trailing "Z" is exactly the catastrophic-backtracking shape, and
+    hangs for seconds against a target only a few thousand characters long (confirmed against a
+    scratch reconstruction of that old translation: this exact pattern/target pair had still
+    not returned after a 5-second budget). The new segment-based `_matches` walks the same
+    input in one linear pass instead, and this pins that it keeps doing so.
+    """
+    pattern = "/" + "*" * 50 + "Z$"
     text = f"User-agent: *\nDisallow: {pattern}\n"
     rules = parse_robots(text, user_agent=CRAWL_USER_AGENT)
-    url = "http://example.com/" + "a" * 5000
+    url = "http://example.com/" + "a" * 5000  # satisfies every "*", never reaches the "Z"
 
     start = time.monotonic()
     result = rules.is_allowed(url)
     elapsed = time.monotonic() - start
 
-    assert result is False  # "/" followed by any run of "*" matches everything under the root
-    assert elapsed < 0.5, f"is_allowed took {elapsed:.3f}s"
+    assert result is True  # the trailing "Z" is never found -> not disallowed
+    assert elapsed < 0.5, f"is_allowed took {elapsed:.3f}s -- the matcher is backtracking again"
 
 
 # --- Percent-encoding --------------------------------------------------------------------------
