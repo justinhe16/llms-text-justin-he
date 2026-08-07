@@ -288,7 +288,80 @@ async def test_a_zone_id_on_a_public_ipv6_literal_survives_into_a_well_formed_co
 
     assert target.ip == f"{PUBLIC_V6}%25eth0"
     assert target.connect_url == f"http://[{PUBLIC_V6}%25eth0]/"
-    assert target.host_header == f"{PUBLIC_V6}%25eth0"
+    assert target.host_header == f"[{PUBLIC_V6}%25eth0]"
+
+
+async def test_an_ipv6_literal_is_bracketed_in_the_host_header_on_a_non_default_port() -> None:
+    """RFC 7230 §5.4 is `Host = uri-host [ ":" port ]`, and `uri-host` for an IPv6 address
+    is an `IP-literal` — brackets included. `urlsplit().hostname` strips them, so the header
+    has to put them back: without the brackets, `<address>` glued to `:443` is just one more
+    colon in a string of them, and no server can tell where the address ends.
+    """
+    target = await validate_url(f"http://[{PUBLIC_V6}]:443/docs")
+    assert target.host_header == f"[{PUBLIC_V6}]:443"
+    assert target.connect_url == f"http://[{PUBLIC_V6}]:443/docs"
+
+
+async def test_an_ipv6_literal_is_bracketed_in_the_host_header_on_the_default_port() -> None:
+    """The branch a fix that only touches the `f"{host}:{port}"` half would miss.
+
+    There is no port to disambiguate here, but `uri-host` is still `IP-literal`, so a bare
+    `Host: 2001:4860:4860::8888` is malformed on its own and not merely ambiguous.
+    """
+    target = await validate_url(f"https://[{PUBLIC_V6}]/docs")
+    assert target.host_header == f"[{PUBLIC_V6}]"
+    assert target.connect_url == f"https://[{PUBLIC_V6}]/docs"
+
+
+async def test_a_zoned_ipv6_literal_on_a_non_default_port_brackets_before_the_colon() -> None:
+    """The two IPv6 complications stacked: a `%`-bearing zone id AND an explicit port.
+
+    Worth pinning separately because neither half above covers it — the zone-id test carries
+    no port and the port test carries no zone — and this is where getting the order wrong
+    stays invisible. The closing bracket must land between the zone and the colon, so the
+    port sits outside the `IP-literal` instead of being swallowed into it.
+    """
+    target = await validate_url(f"http://[{PUBLIC_V6}%25eth0]:443/docs")
+
+    assert target.host_header == f"[{PUBLIC_V6}%25eth0]:443"
+    assert target.connect_url == f"http://[{PUBLIC_V6}%25eth0]:443/docs"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://example.test/docs", "example.test"),
+        ("http://example.test:443/docs", "example.test:443"),
+        (f"https://{PUBLIC_V4}/docs", PUBLIC_V4),
+        (f"http://{PUBLIC_V4}:443/docs", f"{PUBLIC_V4}:443"),
+    ],
+)
+async def test_non_ipv6_hosts_are_never_bracketed_in_the_host_header(
+    url: str, expected: str
+) -> None:
+    """The other side of the case above: bracketing keys off the parsed address family, not
+    off a colon in the string, so neither a name nor an IPv4 literal picks up brackets from
+    the `:port` that follows it."""
+    resolver = _fake_resolver({"example.test": [PUBLIC_V4]})
+    target = await validate_url(url, resolver=resolver)
+    assert target.host_header == expected
+
+
+async def test_a_hostname_resolving_to_ipv6_keeps_an_unbracketed_name_in_the_host_header() -> None:
+    """The case that decides *which* value the bracketing may key off.
+
+    `host_header` carries the NAME and `connect_url` carries the ADDRESS, so a hostname with
+    only an AAAA record is the one input where the two disagree about address family. The
+    header must stay `v6only.test` while `connect_url` brackets the address — which holds
+    only because the check reads the parsed *literal* (`None` on every DNS path) rather than
+    the resolved address that was `chosen`. Swapping it to `isinstance(chosen, IPv6Address)`
+    passes every other test in this file and fails exactly here.
+    """
+    resolver = _fake_resolver({"v6only.test": [PUBLIC_V6]})
+    target = await validate_url("http://v6only.test:443/docs", resolver=resolver)
+
+    assert target.host_header == "v6only.test:443"
+    assert target.connect_url == f"http://[{PUBLIC_V6}]:443/docs"
 
 
 async def test_explicit_default_https_port_is_allowed_and_omitted_from_the_host_header() -> None:
