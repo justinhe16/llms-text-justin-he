@@ -158,12 +158,26 @@ model Run {
   /// outcome the reaper's threshold exists to avoid.
   claimedAt DateTime? @map("claimed_at") @db.Timestamptz(6)
 
-  /// The generated artifact. Null until the run completes.
+  /// The generated index — the `llms.txt` artifact. Null until the run completes.
   llmsTxt String? @map("llms_txt")
 
-  /// `pages_crawled`, `links_emitted`, `tokens`, `duration_ms`. Jsonb rather than
-  /// columns because this shape belongs to the crawler milestone, which is not designed
-  /// yet (ARCHITECTURE.md §3.4).
+  /// The generated expansion — the `llms-full.txt` artifact, every indexed page's markdown
+  /// inlined. Null until the run completes, and null forever on rows written before PER-179
+  /// added the column. Nullable and additive precisely so the release running at migration
+  /// time survives it, which is what keeps the migrate-then-deploy window safe
+  /// (ARCHITECTURE.md §6.3).
+  ///
+  /// Bounded independently of the crawl's own byte cap — 50 KB per page and 5 MB per run, in
+  /// `internals/llms_txt.py` — because `crawl_max_bytes` limits what comes off the WIRE and
+  /// says nothing about how large the extracted text inlined here will be.
+  llmsFullTxt String? @map("llms_full_txt")
+
+  /// `pages_crawled`, `pages_failed`, `bytes_fetched`, `duration_ms`, `cap_hit`,
+  /// `pages_empty_content`, `links_emitted`, `full_txt_truncated`, and `version` — the shape
+  /// `internals/run_stats.py` builds and owns, at `RUN_STATS_VERSION` 3. Jsonb rather than
+  /// columns because the set of keys has changed three times already and belongs to the
+  /// crawler feature rather than to this schema; `version` is what lets a reader tell which
+  /// definition a stored row was written under (ARCHITECTURE.md §3.4).
   stats Json? @db.JsonB
 
   /// Set when `status` is `failed`.

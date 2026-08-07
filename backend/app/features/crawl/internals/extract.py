@@ -55,11 +55,14 @@ after a browser runs the JavaScript. Whether it is worth paying for a headless b
 render those pages is a real decision with a real cost, and this constant exists to *measure*
 how often it would matter, not to make that decision. That counting is implemented: every run
 records how many of its fetched pages came back empty as `runs.stats["pages_empty_content"]`
-(`internals/crawler.py`, at `RUN_STATS_VERSION` 2 — PER-177). Nothing branches on `is_empty`
-beyond counting it, and — later — declining to list a page with no content. In particular,
-`CrawledPage.title` is never nulled because a page is empty: a JavaScript shell is real HTML
-with a real `<title>`, which is exactly why `extract_content` below reads metadata even when
-the body came back empty.
+(`internals/crawler.py`, at `RUN_STATS_VERSION` 3). Exactly one thing branches on `is_empty`
+beyond counting it, and that "later" has since arrived: `internals/llms_txt.py`'s
+`generate_llms_txt` declines to list a page with no content (PER-179). Nothing UPSTREAM of
+that seam branches on it — such a page is still fetched, still stored in the run's payload,
+and still counted. In particular, `CrawledPage.title` is never nulled because a page is
+empty: a JavaScript shell is real HTML with a real `<title>`, which is exactly why
+`extract_content` below reads metadata even when the body came back empty — and why an empty
+homepage can still be what names the whole artifact.
 
 200 characters, and deliberately generous. The strings these shells actually ship are short —
 "You need to enable JavaScript to run this app." is 46 characters, and the longest common

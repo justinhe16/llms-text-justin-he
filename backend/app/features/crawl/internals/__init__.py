@@ -12,12 +12,13 @@ private, table-free I/O:
   `ByteBudget` that caps how many response bytes one run may accept in total.
 * `crawler.py` — `crawl_site`, the bounded loop that turns one `fetch_page` call into a run:
   the seed fetch, the frontier, and the six caps from `Settings`.
-* `llms_txt.py` — `generate_llms_txt`, the stub seam (ARCHITECTURE.md §3.4, CLAUDE.md #9).
 
 Beside those sit this feature's **pure** modules, which do no I/O at all and are listed
 separately for exactly that reason: `payload.py` (the bytes a run's pages are stored as),
 `run_stats.py` (the `dict` `runs.stats` persists), `extract.py` (`extract_content`, one
-page's HTML parsed into a title, a description, and a markdown body), and `url_ranking.py`
+page's HTML parsed into a title, a description, and a markdown body), `llms_txt.py`
+(`generate_llms_txt` and `generate_llms_full_txt`, the two artifacts a run publishes, plus
+the two counts `runs.stats` records about them — ARCHITECTURE.md §3.4), and `url_ranking.py`
 (`select_urls`, a list of discovered URLs ranked and cut down to the ones worth spending a
 run's page budget on). `extract.py` is called by `fetcher.py`, once per fetched page that
 looks like HTML (PER-177). `url_ranking.py` is called by nothing today: wiring selection into

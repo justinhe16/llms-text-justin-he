@@ -21,8 +21,10 @@ Layout:
   feature's service (`RunService`, `WebsiteService`) instead of a reader or writer.
 * `internals/` — see that package's own docstring.
 
-Real crawling and extraction logic beyond "fetch this URL" stays out of scope for this
-milestone (ARCHITECTURE.md §3.4, CLAUDE.md #9): everything downstream of a fetched page is
-behind `generate_llms_txt(pages: list[CrawledPage]) -> str` (`internals/llms_txt.py`), a
-deterministic placeholder and nothing more.
+Everything downstream of a fetched page lives behind one pair of functions in
+`internals/llms_txt.py` — `generate_llms_txt(pages: list[CrawledPage]) -> str` and its
+`generate_llms_full_txt` sibling — and both are pure, deterministic and model-free
+(ARCHITECTURE.md §3.4, CLAUDE.md #9). Calling a model remains out of scope for this
+milestone, and not merely unimplemented: that pass is a layer ABOVE these functions, which
+stay the fallback it degrades to when its flag is off or its API call fails.
 """

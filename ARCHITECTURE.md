@@ -10,8 +10,10 @@ here turns out to be wrong, change it here first — in its own PR — and then 
 code. Do not let the two drift.
 
 **Vocabulary.** A **website** is a domain a user has registered for crawling. A **run** is
-one crawl of a website. A run produces an **llms.txt** artifact, stored as the `llms_txt`
-field. Those three nouns are used consistently in the database, the API, and the backend —
+one crawl of a website. A run produces two artifacts: an **llms.txt** index, stored as the
+`llms_txt` field, and an **llms-full.txt** expansion carrying the indexed pages' text, stored
+as `llms_full_txt`. Those three nouns are used consistently in the database, the API, and the
+backend —
 tables, columns, routes, services, readers, and writers all say `website` and `run`, never
 `crawl`.
 
@@ -269,17 +271,24 @@ pattern in use, not merely anticipated by it.
 
 ### 3.4 The crawler seam
 
-Real crawling logic — deciding what to do with a fetched, now-parsed page: which to keep,
-how to rank or summarize them, anything that calls a model — is **out of scope for this
-milestone** and has not been designed yet. Extraction is not: `internals/extract.py` parses
-every fetched page's HTML now (PER-177), and `CrawledPage` carries its output. What remains
-out of scope, and sits behind one function, is everything downstream of a fetched, parsed
-page:
+Everything downstream of a fetched, parsed page lives behind one pair of functions, in one
+module (`internals/llms_txt.py`):
 
 ```python
-def generate_llms_txt(pages: list[CrawledPage]) -> str:
+def generate_llms_txt(pages: list[CrawledPage]) -> str:      # the llms.txt index
+    ...
+
+def generate_llms_full_txt(pages: list[CrawledPage]) -> str: # the llms-full.txt expansion
     ...
 ```
+
+**This was a stub seam until PER-179, and is now an implementation.** The paragraph that
+stood here said the pipeline "has not been designed yet" and that the function behind it was
+a deterministic stand-in. That is no longer true, and the boundary it drew moved rather than
+disappeared. What is now decided, and decided *here*: which fetched pages the artifact lists,
+how they are grouped and ordered, what each is called, and what the expansion contains. What
+is still out of scope, and out of scope for a reason rather than for want of a ticket:
+**anything that calls a model.** See §11.
 
 `CrawledPage`, not `Page`: `app.core.pagination.Page` already names the generic pagination
 envelope returned by `GET /websites/{id}/runs`, and a second, unrelated `Page` in the same
@@ -287,9 +296,56 @@ codebase is an import collision waiting to happen. The rename changes nothing ab
 seam's shape — one argument, a list of fetched pages, returns `str` — only the element
 type's name.
 
-Build against that signature. Do not scatter crawling, parsing, or LLM-calling logic
-through the services in anticipation of a design that does not exist yet, and do not widen
-the signature without a ticket that redesigns this seam.
+Build against those signatures. PER-179 added the sibling; the element type and the return
+type are still fixed, and neither may be widened without a ticket that redesigns this seam.
+Do not scatter crawling, parsing, or LLM-calling logic through the services.
+
+**The format.** `llms.txt` follows llmstxt.org: exactly one H1 naming the project, exactly
+one blockquote summarizing it, then an H2 per section holding
+`- [title](url): description` bullets.
+
+* **Project name** — the title of the page at the origin's root, else the origin itself. A
+  deep page's title describes that page, not the site, so it is never promoted to the H1.
+  The root page is consulted even when it is `is_empty`, because a JavaScript shell keeps a
+  real `<title>` and a documentation SPA's homepage is exactly that.
+* **Blockquote** — the indexed page count and the origin, plus what was excluded. Factual and
+  countable; it makes no claim about quality and no longer disclaims itself.
+* **Sections** — the page's leading path segment, made readable. A small curated table fixes
+  what humanizing gets wrong (`api` → API) and merges synonyms (`doc`/`docs`/`documentation`
+  → Docs); every other segment becomes its own title-cased section, so a site using `/blog/`
+  or `/getting-started/` gets a real heading rather than a bucket. `Other` catches pages with
+  no leading segment and segments that yield no readable name. Order is fixed: curated
+  sections first, then the rest alphabetically, then `Other`.
+* **Skipped pages** — a page whose extraction came back empty (`CrawledPage.is_empty`) is
+  omitted. This is the ONE place in the codebase that branches on that flag.
+
+`llms-full.txt` carries the same H1 and a blockquote of its own, then `## {title}` and that
+page's markdown per page, **in the index's order** — section order, then URL order within a
+section — so the two files can be read side by side. It deliberately does not copy
+Firecrawl's `<|firecrawl-page-N-lllmstxt|>` separators, which that implementation emits and
+then strips out again with a regex before anything consumes them.
+
+**The caps, and why they are not `crawl_max_bytes`.** The expansion is inlined into a
+Postgres column, so it is bounded in its own right: **50 KiB per page** (trimmed, and marked
+as trimmed in the text) and **5 MiB per run** (stopped at a page boundary, never mid-page,
+with a closing line naming how many pages were dropped). Both are measured in UTF-8 bytes,
+because what is being bounded is a column rather than a character count. `crawl_max_bytes`
+does not stand in for either: it bounds what comes off the wire, and a document's extracted
+markdown can be larger or far smaller than its own compressed transfer. A third bound covers
+what those two miss — a title and a description are chosen by the crawled site and bounded by
+nothing in `extract.py`, so both are cut at 500 characters. Without it a single page with an
+eight-megabyte `<title>` produces an eight-megabyte artifact header before the per-run cap is
+consulted at all. URLs are deliberately left unbounded: a truncated URL is a broken link, and
+the place to decline an over-long one is the frontier, before it is fetched.
+`runs.stats["full_txt_truncated"]` counts the pages that lost content either way, and
+`links_emitted` counts the bullets actually emitted — which is why it diverges from
+`pages_crawled` from `RUN_STATS_VERSION` 3 onwards (§6.4).
+
+**Both functions are pure**: no network, no clock, no I/O, no settings read. They sort by URL
+before deriving anything, and every ordering decision ends in a total tie-break, so a
+shuffled `pages` list produces byte-identical output — which matters because `crawl_site`'s
+frontier fetches race each other and the order pages arrive in is not reproducible between
+two runs of the same crawl.
 
 **Extraction is wired into the fetch path, and `CrawledPage` carries its output.**
 `internals/extract.py` parses a page's HTML into a title, a description, and a markdown body
@@ -306,8 +362,10 @@ gains three fields — `description`, `markdown`, and `is_empty`, appended in th
 `title` is finally populated rather than always `None`; all four are copied straight across
 from `ExtractedContent`. `content` is unchanged, still the undecoded-beyond-transport response
 body, kept alongside `markdown` as the run's archival record of what the server actually
-sent, distinct from what this feature's own pass made of it. `generate_llms_txt` is still the
-stub described above: extraction feeds the seam's input type, it is not the seam.
+sent, distinct from what this feature's own pass made of it. Extraction feeds the seam's input
+type; it is not the seam. Those four fields are precisely what the artifacts described above
+consume — `title` and `description` become a bullet, `markdown` becomes the expansion's body,
+and `is_empty` decides whether the page is listed at all.
 
 Landing extraction as an unwired module first, and wiring it in a second, separate ticket,
 was deliberate rather than an accident of scheduling. Extraction was the one part of the
@@ -319,17 +377,26 @@ change to the fetch path. Summarization and anything that calls a model remain u
 out of scope; ranking now exists too, but only the kind that happens *before* a fetch — see
 the next exception.
 
-`CrawledPage.is_empty` — `ExtractedContent.is_empty`, copied across unchanged — is
-instrumentation, not a branch. It is set when a page yields less than `MIN_BODY_CHARS` of
-body — the signature of a JavaScript-rendered shell that returned a mount div and a bundle.
-Whether to pay for headless rendering is an open question with a real cost attached, and this
-flag exists to measure how often it would matter, not to decide it: it is counted once per
-run, as `runs.stats["pages_empty_content"]` at `RUN_STATS_VERSION` 2
-(`internals/crawler.py`, `internals/run_stats.py`). Nothing branches on it — in particular,
-`CrawledPage.title` is never nulled because a page's `is_empty` is `True`, even for the
-JavaScript-shell case that flag exists to measure: a shell is real HTML with a real
-`<title>`, `extract_content` deliberately keeps it, and discarding it here would be exactly
-the branch this paragraph forbids.
+`CrawledPage.is_empty` — `ExtractedContent.is_empty`, copied across unchanged — is set when a
+page yields less than `MIN_BODY_CHARS` of body: the signature of a JavaScript-rendered shell
+that returned a mount div and a bundle. Whether to pay for headless rendering is an open
+question with a real cost attached, and this flag exists to measure how often it would matter,
+not to decide it. It is counted once per run, as `runs.stats["pages_empty_content"]` at
+`RUN_STATS_VERSION` 3 (`internals/crawler.py`, `internals/run_stats.py`).
+
+**Exactly one thing branches on it, and it is downstream of the seam.** `generate_llms_txt`
+omits an empty page from the index (PER-179) — a bullet with no title and no description is
+not worth a line. An earlier revision of this paragraph said nothing branched on it at all;
+that held while the artifact was a stand-in and does not now. The rule that survives, and the
+one that was always doing the work, is that nothing **upstream** of the seam may decide what
+to fetch, what to keep, or how to crawl because a page is empty. Such a page is still fetched,
+still written to the run's payload, and still counted.
+
+In particular, `CrawledPage.title` is never nulled because a page's `is_empty` is `True`, even
+for the JavaScript-shell case the flag exists to measure: a shell is real HTML with a real
+`<title>`, `extract_content` deliberately keeps it, and discarding it would still be exactly
+the branch this paragraph forbids. `generate_llms_txt` now depends on that — an empty
+homepage's title is what names the whole artifact.
 
 **A second exception, still unwired: `internals/url_ranking.py`.** Unlike `extract.py` above,
 nothing calls this one yet. `select_urls(candidates, *, seed_url, limit) -> SelectionResult`
@@ -635,7 +702,8 @@ This is no longer only illustrative. `app.features.crawl.service.CrawlService.ex
 is the real implementation of the CORRECT shape above: it uploads a run's gzip-compressed
 JSONL payload to Supabase Storage (`app.infrastructure.storage.supabase_storage`), and only
 after that upload has returned does it call `RunService.record_success`, which opens the one
-short `transaction()` that writes `llms_txt`, `storage_path`, `stats`, and `completed_at`.
+short `transaction()` that writes `llms_txt`, `llms_full_txt`, `storage_path`, `stats`, and
+`completed_at`.
 Read that method for what this section looks like once a ticket actually builds it, rather
 than treating the snippet above as a hypothetical.
 
@@ -723,11 +791,12 @@ Three tables, and they are the whole application state:
    │ next_run_at  timestamptz?  │ 0..n  status     run_status      │
    │ last_run_at  timestamptz?  │   │ started_at   timestamptz     │
    │ auto_publish bool          │   │ completed_at timestamptz?    │
-   │              (reserved)    │   │ llms_txt     text?           │
-   └────────────────────────────┘   │ stats        jsonb?          │
-        ON DELETE SET NULL ─────────│ error        text?           │
-        (run history outlives       │ storage_path text?           │
-         the schedule)              └──────────────────────────────┘
+   │              (reserved)    │   │ llms_txt      text?          │
+   └────────────────────────────┘   │ llms_full_txt text?          │
+        ON DELETE SET NULL ─────────│ stats         jsonb?         │
+        (run history outlives       │ error         text?          │
+         the schedule)              │ storage_path  text?          │
+                                    └──────────────────────────────┘
 ```
 
 **`websites`** — a site a user added. `url` is what they typed; `origin` is the normalized
@@ -766,10 +835,20 @@ reap such a run moments after it was finally claimed, producing a duplicate craw
 one outcome the threshold exists to avoid. The scan reads `COALESCE(claimed_at, started_at)` so
 that rows claimed before the column existed stay reachable.
 
-`llms_txt`, `storage_path`, `stats`, and `completed_at` are no longer merely reserved columns
-waiting for a later ticket — `RunService.record_success` writes all four on every successful
-run (§5.1), and `record_failure` writes `completed_at`, `error`, and whatever partial `stats`
-a crawl produced on every unsuccessful one. `ON DELETE CASCADE` from `websites` reclaims a
+`llms_txt`, `llms_full_txt`, `storage_path`, `stats`, and `completed_at` are no longer merely
+reserved columns waiting for a later ticket — `RunService.record_success` writes all five on
+every successful run (§5.1), and `record_failure` writes `completed_at`, `error`, and whatever
+partial `stats` a crawl produced on every unsuccessful one.
+
+`llms_full_txt` (PER-179) is nullable and was added additively, with no default and no
+backfill, which is what let the release running at migration time survive it — §6.3's rule,
+and the reason the `migrate → deploy` window is safe. Rows written before it stay `NULL`
+forever, and so do rows for runs that failed; `NULL` here means "this run has no expansion",
+never "this run has an empty one". It is written but not yet read by any endpoint:
+`_DETAIL_COLUMNS` in `runs/internals/runs_reader.py` names its columns explicitly, so adding
+the column did not silently widen the API (§11).
+
+`ON DELETE CASCADE` from `websites` reclaims a
 website's `runs` rows the moment the website is deleted, but it reclaims nothing in Storage:
 the payload each completed row's `storage_path` names keeps existing in the `crawl-payloads`
 bucket, orphaned, until something else removes it. Nothing in this milestone does — see §11.
@@ -1243,16 +1322,23 @@ PUT    /websites/{id}/schedule
 
 Deliberately not decided here, and not to be decided by accident in an implementation PR:
 
-- **The crawler pipeline design.** That milestone has not been designed. Until it is,
-  everything sits behind `generate_llms_txt(pages) -> str` (§3.4). Two pieces have landed,
-  both pure (§3.4): `internals/extract.py`, which turns one page's HTML into a title, a
-  description and a markdown body, and `internals/url_ranking.py`, which decides which
-  discovered URLs are worth fetching at all. The first is now **wired** — `internals/
-  fetcher.py` runs every HTML response through it, so a `CrawledPage` arrives at the seam
-  already parsed; the second is still called by nothing. Neither changes what remains
-  undecided, because both sit *upstream* of the seam: how *fetched* pages are ranked, what a
-  generated artifact selects and summarizes, and whether a model is involved at all are all
-  still open.
+- **Model-assisted summarization.** Artifact generation itself is no longer open: PER-179
+  filled the seam, and `internals/llms_txt.py` now builds both real artifacts from the pages
+  a run fetched (§3.4). What remains undesigned is the pass that would *improve* them with a
+  model — a written per-page summary in place of the page's own meta description, a written
+  site overview in place of the counted blockquote. Two constraints on whoever designs it,
+  both load-bearing rather than stylistic: it is a layer **above** `generate_llms_txt`, never
+  inside it, and the deterministic path must survive as the fallback it degrades to when the
+  feature's flag is off or its API call fails. A generator that only works when an external
+  service answers is not a fallback, which is why `internals/llms_txt.py` may not grow a
+  network call and may not become conditional on one having happened.
+- **Serving either artifact over HTTP.** `GET /runs/{id}` returns `llms_txt` today;
+  `llms_full_txt` is written but read by no endpoint. `_DETAIL_COLUMNS`
+  (`runs/internals/runs_reader.py`) names its columns explicitly, which is why adding the
+  column did not silently widen the API. Serving both at stable, cacheable URLs is its own
+  ticket.
+- **Wiring discovery into the frontier.** `internals/url_ranking.py`'s `select_urls` is pure,
+  tested, and still called by nothing: `crawl_site`'s `extra_urls` is an empty tuple.
 - **Multi-tenancy.** This project has per-user ownership and nothing more (§4).
 - **Dark mode** (§8.5) and **API versioning** (§10.3).
 - **Rate limiting, quotas, and billing.**

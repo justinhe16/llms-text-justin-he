@@ -16,11 +16,15 @@ its own short transaction) and whatever happens after them (`RunService.record_s
 `RunService`.
 
 **A successful run uploads its payload, then writes the row — never the other order.** Once
-`generate_llms_txt` has produced an artifact, this method gzips the fetched pages as JSONL
-(`internals/payload.py`), uploads that to Supabase Storage, and only THEN opens the short
-transaction that writes `llms_txt`, `storage_path`, `stats`, and flips the row to `completed`
-(`RunService.record_success`). That order, and not its reverse, is what ARCHITECTURE.md §5.1
-exists to require: uploading first means the worst case of a mid-pipeline failure is an
+`internals/llms_txt.py` has produced both artifacts — the `llms.txt` index and its
+`llms-full.txt` expansion, along with the two counts `runs.stats` records about them — this
+method gzips the fetched pages as JSONL (`internals/payload.py`), uploads that to Supabase
+Storage, and only THEN opens the short transaction that writes `llms_txt`, `llms_full_txt`,
+`storage_path`, `stats`, and flips the row to `completed` (`RunService.record_success`).
+Artifact generation is pure and happens entirely before the upload, so it neither extends the
+time a transaction is open nor depends on one. That order, and not its reverse, is what
+ARCHITECTURE.md §5.1 exists to require: uploading first means the worst case of a
+mid-pipeline failure is an
 orphaned Storage object costing a fraction of a cent, while writing the row first would risk
 a `completed` run whose `storage_path` points at an object that was never actually written —
 a 404 in the UI on a run the database swears succeeded. Nothing about this method holds a
@@ -40,7 +44,12 @@ from fastapi import HTTPException
 from app.core.settings import Settings
 from app.features.crawl.internals.crawler import CrawlLimits, CrawlResult, crawl_site
 from app.features.crawl.internals.fetcher import ByteBudgetExceededError, FetchError
-from app.features.crawl.internals.llms_txt import generate_llms_txt
+from app.features.crawl.internals.llms_txt import (
+    count_full_txt_truncations,
+    count_indexed_pages,
+    generate_llms_full_txt,
+    generate_llms_txt,
+)
 from app.features.crawl.internals.payload import (
     PAYLOAD_CONTENT_TYPE,
     payload_object_path,
@@ -328,10 +337,15 @@ class CrawlService:
         # Hoisted above the `try` so the `except` below can build a partial `stats` dict from
         # whatever this run actually managed before it failed, rather than reporting nothing
         # at all. `result` stays `None` for a failure that never got as far as `crawl_site`
-        # returning (e.g. `get_website` raising); `links_emitted` stays 0 for a seed failure,
-        # where `result.stats["pages_crawled"]` is 0 anyway.
+        # returning (e.g. `get_website` raising); `links_emitted` and `full_txt_truncated`
+        # stay 0 for a seed failure, where `result.stats["pages_crawled"]` is 0 anyway, and
+        # for any failure that happened before the artifacts were generated. They are hoisted
+        # rather than defaulted inside `build_run_stats` so that a partial-failure row carries
+        # the same KEYS as a success row — the shape `runs.stats` stores must not depend on
+        # how far a run got (`internals/run_stats.py`, `RUN_STATS_VERSION`).
         result: CrawlResult | None = None
         links_emitted = 0
+        full_txt_truncated = 0
         outcome: CrawlOutcome | None = None
         # Set by the failure paths below when the attempt should be retried, and raised
         # AFTER the `try` rather than from inside it. Raising `TransientCrawlError` from within the
@@ -378,11 +392,24 @@ class CrawlService:
                     result.seed_error,
                     attempts=attempts,
                     max_attempts=max_attempts,
-                    stats=build_run_stats(result.stats, links_emitted=links_emitted),
+                    stats=build_run_stats(
+                        result.stats,
+                        links_emitted=links_emitted,
+                        full_txt_truncated=full_txt_truncated,
+                    ),
                 )
             else:
+                # All four calls are pure and none touches the network, so generating the
+                # artifacts here — before the upload, and long before any transaction — costs
+                # the run nothing it was not already going to spend. `links_emitted` is asked
+                # of the artifact rather than derived from `len(result.pages)`, which is what
+                # it used to be: the index omits pages with no extractable content, and the
+                # only component that knows how many it omitted is the one that built it
+                # (`internals/llms_txt.py`, and `RUN_STATS_VERSION` 3 for what that changed).
                 llms_txt = generate_llms_txt(result.pages)
-                links_emitted = len(result.pages)
+                llms_full_txt = generate_llms_full_txt(result.pages)
+                links_emitted = count_indexed_pages(result.pages)
+                full_txt_truncated = count_full_txt_truncations(result.pages)
 
                 payload = serialize_payload(result.pages)
                 object_path = payload_object_path(run.website_id, run_id)
@@ -403,9 +430,17 @@ class CrawlService:
                     extra={"bytes": len(payload), "storage_path": storage_path},
                 )
 
-                stats = build_run_stats(result.stats, links_emitted=links_emitted)
+                stats = build_run_stats(
+                    result.stats,
+                    links_emitted=links_emitted,
+                    full_txt_truncated=full_txt_truncated,
+                )
                 await self._runs.record_success(
-                    run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
+                    run_id,
+                    llms_txt=llms_txt,
+                    llms_full_txt=llms_full_txt,
+                    storage_path=storage_path,
+                    stats=stats,
                 )
 
                 # `result.stats` already has exactly the six keys `runs.stats` wants named
@@ -416,7 +451,12 @@ class CrawlService:
                 logger.info(
                     "crawl: completed", extra={**result.stats, "storage_path": storage_path}
                 )
-                outcome = CrawlOutcome(llms_txt=llms_txt, stats=stats, storage_path=storage_path)
+                outcome = CrawlOutcome(
+                    llms_txt=llms_txt,
+                    llms_full_txt=llms_full_txt,
+                    stats=stats,
+                    storage_path=storage_path,
+                )
         except asyncio.CancelledError:
             # arq's `job_timeout`, or SIGTERM after the drain budget expired. Handled and
             # RE-RAISED — see the method docstring. `_recover_cancelled_attempt` never
@@ -433,7 +473,11 @@ class CrawlService:
             # line carries is the only record of the failure that will ever exist.
             logger.error("crawl: failed unexpectedly", exc_info=True)
             partial_stats = (
-                build_run_stats(result.stats, links_emitted=links_emitted)
+                build_run_stats(
+                    result.stats,
+                    links_emitted=links_emitted,
+                    full_txt_truncated=full_txt_truncated,
+                )
                 if result is not None
                 else None
             )

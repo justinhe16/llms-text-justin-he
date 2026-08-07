@@ -14,10 +14,11 @@ retrofit one into `list_runs` or `get_run`." That is exactly what happened, twic
   from `app.worker.jobs.crawl_task` by way of `app.features.crawl.service.CrawlService`.
   `claim_for_processing` wraps `RunsWriter.claim_pending`, the atomic `pending -> processing`
   guard the crawl takes before it fetches a single byte. `record_success` wraps
-  `RunsWriter.mark_processing_completed`, for a crawl whose payload has already been uploaded
-  to Storage. `record_failure` wraps `RunsWriter.mark_processing_failed`, for a crawl that
-  never produces an artifact — whether because the seed never fetched, the crawl itself
-  raised, or the Storage upload after a successful crawl failed. All three are independent
+  `RunsWriter.mark_processing_completed`, writing both generated artifacts for a crawl whose
+  payload has already been uploaded to Storage. `record_failure` wraps
+  `RunsWriter.mark_processing_failed`, for a crawl that never produces an artifact — whether
+  because the seed never fetched, the crawl itself raised, or the Storage upload after a
+  successful crawl failed. All three are independent
   transactions on purpose — the crawl, and the Storage upload `record_success` requires to
   have already happened, both happen BETWEEN them, and a network call must never run inside a
   transaction (ARCHITECTURE.md §5.1).
@@ -1015,9 +1016,23 @@ class RunService:
         return enqueued, already_queued, failures
 
     async def record_success(
-        self, run_id: UUID, *, llms_txt: str, storage_path: str, stats: dict[str, Any]
+        self,
+        run_id: UUID,
+        *,
+        llms_txt: str,
+        llms_full_txt: str,
+        storage_path: str,
+        stats: dict[str, Any],
     ) -> None:
-        """Record a completed crawl for a run this worker had already claimed.
+        """Record a completed crawl for a run this worker had already claimed: both generated
+        artifacts (`llms.txt` and its `llms-full.txt` expansion), where the payload landed,
+        and the run's stats.
+
+        Both artifacts arrive already generated — `internals/llms_txt.py` produced them from
+        the fetched pages before the upload below, and this method neither inspects nor
+        reshapes either one. Adding `llms_full_txt` (PER-179) changed nothing about the
+        ordering argument that follows: it is one more column in the same single UPDATE,
+        inside the same single transaction, opened at the same moment.
 
         **The Storage upload has ALREADY HAPPENED by the time this is called.**
         `storage_path` is `SupabaseStorage.upload`'s return value, not a location this method
@@ -1043,7 +1058,11 @@ class RunService:
         """
         async with transaction(self._pool) as tx:
             completed = await RunsWriter(tx).mark_processing_completed(
-                run_id, llms_txt=llms_txt, storage_path=storage_path, stats=stats
+                run_id,
+                llms_txt=llms_txt,
+                llms_full_txt=llms_full_txt,
+                storage_path=storage_path,
+                stats=stats,
             )
         if not completed:
             logger.warning(

@@ -95,15 +95,23 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row is not None
     assert row["status"] == "completed"
     assert row["llms_txt"]
+    assert row["llms_full_txt"], "both artifacts are written by the same UPDATE (PER-179)"
     assert row["storage_path"] == f"crawl-payloads/{website_id}/{run_id}.jsonl.gz"
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 2
-    assert stats["links_emitted"] == 1
+    assert stats["version"] == 3
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
     assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
+    # `links_emitted` is 0 while `pages_crawled` is 1, and that is the point rather than a
+    # regression: `_ok_handler` serves "hello world", which is far short of `MIN_BODY_CHARS`,
+    # so extraction marks the single fetched page `is_empty` and the real `generate_llms_txt`
+    # omits it from the index. Under the version-2 stub this assertion read `== 1`, because
+    # the stub emitted one bullet per fetched page no matter what was on it. This is exactly
+    # the divergence `RUN_STATS_VERSION` 3 exists to record.
+    assert stats["links_emitted"] == 0
+    assert stats["full_txt_truncated"] == 0
 
 
 async def test_the_uploaded_payload_round_trips_to_the_page_the_mock_transport_served(
@@ -140,13 +148,15 @@ async def test_upload_failure_leaves_the_run_failed_with_llms_txt_and_storage_pa
     assert outcome is None
 
     row = await websites_db.fetchrow(
-        "SELECT status, llms_txt, storage_path, completed_at, error FROM runs WHERE id = $1",
+        "SELECT status, llms_txt, llms_full_txt, storage_path, completed_at, error "
+        "FROM runs WHERE id = $1",
         run_id,
     )
     assert row is not None
     assert row["status"] == "failed"
     assert row["storage_path"] is None
     assert row["llms_txt"] is None
+    assert row["llms_full_txt"] is None
     assert row["completed_at"] is not None
     assert row["error"] == "Could not store this run's output."
 
@@ -160,11 +170,16 @@ async def test_a_db_write_failure_after_a_successful_upload_still_ends_failed(
     _website_id, run_id = await _seed_pending(websites_db, "db-write-fails")
     storage = FakeStorage()
 
+    # Mirrors `RunsWriter.mark_processing_completed`'s real signature, `llms_full_txt`
+    # included. Not cosmetic: a fake missing a parameter the caller now passes would raise
+    # `TypeError` instead of this `RuntimeError`, and because `execute_run` catches both the
+    # same way, the test would still go green while no longer exercising the failure it names.
     async def _raise(
         self: RunsWriter,
         run_id: UUID,
         *,
         llms_txt: str,
+        llms_full_txt: str,
         storage_path: str,
         stats: dict[str, object],
     ) -> bool:
@@ -256,6 +271,78 @@ async def test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats(
     assert json.loads(row["stats"])["cap_hit"] == "pages"
 
 
+async def test_links_emitted_counts_the_indexed_pages_and_the_full_text_is_persisted(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The version-3 divergence, end to end against a real row: two pages fetched, one of them
+    with no extractable content, so `pages_crawled` is 2 and `links_emitted` is 1. Monkeypatches
+    `crawl_site` for the same reason the cap test above does — it is the only deterministic way
+    to hand `execute_run` a page whose markdown is real."""
+    _website_id, run_id = await _seed_pending(websites_db, "links-emitted")
+    storage = FakeStorage()
+
+    body = (
+        "This page carries a body long enough that extraction would not have called it empty, "
+        "which is what makes it the one page of the two below that earns a place in the index "
+        "and a section in the expansion beside it."
+    )
+
+    def _page(path: str, *, markdown: str, is_empty: bool) -> CrawledPage:
+        return CrawledPage(
+            url=f"http://{_SEED_IP}{path}",
+            status=200,
+            title="Indexed Page" if not is_empty else None,
+            content="x",
+            fetched_at=datetime.now(UTC),
+            content_bytes=1,
+            description=None,
+            markdown=markdown,
+            is_empty=is_empty,
+        )
+
+    fake_result = CrawlResult(
+        pages=[
+            _page("/docs/real", markdown=body, is_empty=False),
+            _page("/docs/shell", markdown="", is_empty=True),
+        ],
+        stats={
+            "pages_crawled": 2,
+            "pages_failed": 0,
+            "bytes_fetched": 2,
+            "duration_ms": 1,
+            "cap_hit": None,
+            "pages_empty_content": 1,
+        },
+        cap_hit=None,
+        seed_error=None,
+    )
+
+    async def fake_crawl_site(*args: object, **kwargs: object) -> CrawlResult:
+        return fake_result
+
+    monkeypatch.setattr("app.features.crawl.service.crawl_site", fake_crawl_site)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("crawl_site is mocked; no HTTP request should be made")
+
+    outcome = await _execute(websites_db, storage, run_id, handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow(
+        "SELECT llms_txt, llms_full_txt, stats FROM runs WHERE id = $1", run_id
+    )
+    assert row is not None
+
+    stats = json.loads(row["stats"])
+    assert stats["pages_crawled"] == 2
+    assert stats["links_emitted"] == 1, "the empty page is fetched and counted, but not listed"
+    assert stats["full_txt_truncated"] == 0
+
+    assert "Indexed Page" in row["llms_txt"]
+    assert "/docs/shell" not in row["llms_txt"]
+    assert body in row["llms_full_txt"], "the expansion inlines the indexed page's markdown"
+
+
 async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> None:
     _website_id, run_id = await _seed_pending(websites_db, "partial-stats")
     storage = FakeStorage(fail=StorageUploadError("boom"))
@@ -266,7 +353,11 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 2
+    assert stats["version"] == 3
+    # A failure row carries the same KEYS as a success row, at their hoisted defaults — the
+    # shape `runs.stats` stores must not depend on how far a run got before it failed.
+    assert stats["links_emitted"] == 0
+    assert stats["full_txt_truncated"] == 0
 
 
 @pytest.mark.parametrize(
