@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 
 # The four values of the `run_status` Postgres enum. See the module docstring for why this
@@ -63,9 +63,14 @@ class RunListItemResponse(BaseModel):
     against the index this feature's pagination depends on."""
 
     stats: dict[str, Any] | None
-    """Raw `runs.stats` jsonb, decoded from the `str` asyncpg hands back for a jsonb
-    column. Typed loosely (`dict[str, Any]`) because its shape belongs to the crawler
-    milestone, which is not designed yet (ARCHITECTURE.md §3.4) — deliberately not
+    """`runs.stats` jsonb, decoded from the `str` asyncpg hands back for a jsonb column, WITH
+    ONE KEY WITHHELD: `content_hashes` (PER-194) never reaches this field —
+    `runs/service.py`'s `_public_stats` strips it before `_shared_fields` builds this model,
+    because it is a `{normalized_url: content_hash}` map bounded by `Settings.crawl_max_pages`
+    that can run to tens of kilobytes per row, and this endpoint is polled every three seconds
+    while a run is active. Every other key `internals/run_stats.py`'s `build_run_stats` writes
+    is present unchanged. Typed loosely (`dict[str, Any]`) because its shape belongs to the
+    crawler milestone, which is not designed yet (ARCHITECTURE.md §3.4) — deliberately not
     modeled, the same choice `websites.schemas.LatestRunSummary` makes for this column."""
 
     error: str | None
@@ -299,6 +304,16 @@ class RunIndexDiff(BaseModel):
     Present on `LatestRunSnapshot.diff` if and only if `diff_state == "compared"`; see that
     field's own docstring for why every other state carries `diff: None` instead of this
     model with its numeric fields zeroed out.
+
+    **`AliasChoices` on the two renamed fields is what keeps a version-7 row (written before
+    PER-194 renamed `pages_changed` -> `metadata_changed`) validating cleanly.** Those rows
+    are permanent — `RUN_STATS_VERSION` never rewrites history — and without the alias every
+    one of them would fail `model_validate` and silently degrade `LatestRunSnapshot.diff_state`
+    to `"not_recorded"`, with a WARNING logged per row (`runs/service.py`'s `_to_latest`).
+    Each `AliasChoices` includes the field's OWN new name first and its old name second, so no
+    `populate_by_name` is needed and serialization (what a client actually receives) always
+    uses the new name — the wire contract is the new one; only deserialization of an
+    already-stored row is bilingual.
     """
 
     compared_to_run_id: UUID
@@ -309,17 +324,62 @@ class RunIndexDiff(BaseModel):
 
     pages_added: int
     pages_removed: int
-    pages_changed: int
+
+    metadata_changed: int | None = Field(
+        validation_alias=AliasChoices("metadata_changed", "pages_changed")
+    )
     """Same URL (by `internals/index_diff.py`'s normalized `key`) on both sides, with a
-    different title or a different description — see `build_index_diff`'s own docstring for
-    the exact rule."""
+    different title or a different description. `None` — never `0` for this case — when the
+    comparison spans an enrichment mode change (PER-194): `metadata_not_comparable_reason`
+    below names which direction. Renamed from `pages_changed` (version 7 and earlier) because
+    title and description are the only thing enrichment ever rewrites, so this is the one
+    field a mode flip can contaminate — see `build_index_diff`'s own docstring for the exact
+    rule and for why every other field on this model is NOT nullable for this reason and
+    reports normally regardless."""
+
+    metadata_changed_sample: list[IndexPageRef] = Field(
+        validation_alias=AliasChoices("metadata_changed_sample", "changed_sample")
+    )
+    """`[]` — never `null` — when `metadata_changed` is `None`, so a client needs no separate
+    guard for the sample beyond the one it already needs for the count. Renamed from
+    `changed_sample` for the same reason `metadata_changed` was."""
+
+    metadata_not_comparable_reason: Literal["enrichment_enabled", "enrichment_disabled"] | None = (
+        None
+    )
+    """Why `metadata_changed` is `None`, or `None` when it is not (i.e. whenever
+    `metadata_changed` is a real count). `"enrichment_enabled"` when THIS run enriched and the
+    previous one did not; `"enrichment_disabled"` for the mirror case — two values, not one,
+    because the ticket's own copy for the toggle ("first run after a toggle") is factually
+    wrong when read for the opposite direction, and this field is the discriminator a client
+    renders the right sentence from (`internals/index_diff.py`'s `build_index_diff` decides
+    which). Absent on every version-7-and-earlier row, which is why this field defaults to
+    `None` rather than requiring a value `AliasChoices` would have nothing to alias it from."""
 
     added_sample: list[IndexPageRef]
     removed_sample: list[IndexPageRef]
-    changed_sample: list[IndexPageRef]
     """Each capped at `internals/index_diff.py`'s `SAMPLE_LIMIT` (10) — the corresponding
     `pages_*` count above is the TRUE total, always present beside a sample that may be
     shorter than it, so a client never has to say "and more" without a number."""
+
+    content_changed: int | None = None
+    """An entry present in both runs' indexes whose page BODY hash differs (PER-194) — see
+    `internals/index_diff.py`'s `build_content_hashes` and `build_index_diff`. Independent of
+    `metadata_changed`: computed from a fingerprint of `CrawledPage.markdown`, which
+    enrichment never touches, so this field reports normally across an enrichment mode
+    change where `metadata_changed` cannot. `None` — never `0` — when the previous run
+    recorded no content hashes at all (it predates `RUN_STATS_VERSION` 8, or its hashes were
+    otherwise unreadable) — the same null rule `urls_discovered_delta` below already holds
+    for its own predecessor field, and the reason this needs no accompanying "reason" field
+    the way `metadata_changed` does: `content_changed`'s `None` always means the same single
+    thing, where `metadata_changed`'s could mean either direction of a mode flip. Defaults to
+    `None` so a version-7-and-earlier row — which never recorded a content hash at all —
+    validates without a value to alias it from."""
+
+    content_changed_sample: list[IndexPageRef] = Field(default_factory=list)
+    """`[]` — never `null` — whether `content_changed` is `None` or a real `0`, so a client
+    needs no separate guard for this sample. Defaults to `[]` for the same version-7
+    compatibility reason `content_changed` defaults to `None`."""
 
     urls_discovered_delta: int | None
     """`None` — never a number computed against a value that was not really there — when the
@@ -340,8 +400,10 @@ class RunIndexDiff(BaseModel):
     pages at all; a ratio over zero pages describes nothing)."""
 
     llms_txt_bytes_delta: int
-    """This run's `llms_txt_bytes` minus the previous run's, in UTF-8 bytes. Can be
-    negative."""
+    """This run's `llms_txt_bytes` minus the previous run's, in UTF-8 bytes. Can be negative.
+    Left reported and UNLABELLED across an enrichment mode change — see `build_index_diff`'s
+    own docstring for why this field was already a coarse, whole-artifact number before
+    PER-194 and stays exactly that coarse after it."""
 
 
 class LatestRunSnapshot(BaseModel):

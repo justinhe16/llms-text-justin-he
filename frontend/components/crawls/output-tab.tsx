@@ -21,6 +21,7 @@ import { CrawlsError } from "./crawls-error";
 import { DownloadFullButton } from "./download-full-button";
 import { LlmsTxtViewer } from "./llms-txt-viewer";
 import { RelativeTime } from "./relative-time";
+import { RunEnrichmentBadge } from "./run-enrichment-badge";
 import { RunStatusIndicator } from "./run-status-indicator";
 
 type OutputTabProps = {
@@ -149,6 +150,7 @@ function RunPicker({
                 <>
                   <RelativeTime iso={selected.started_at} className="text-sm" />
                   <RunStatusIndicator status={rowStatusFromRunStatus(selected.status)} />
+                  <RunEnrichmentBadge run={selected} />
                 </>
               ) : (
                 "Selected run"

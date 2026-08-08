@@ -14,6 +14,7 @@ import { useWebsite } from "@/lib/query/use-website";
 
 import { CrawlOwner } from "./crawl-owner";
 import { CrawlsError } from "./crawls-error";
+import { EnrichmentPanel } from "./enrichment-panel";
 import { OutputTab } from "./output-tab";
 import { RunNowButton } from "./run-now-button";
 import { RunStatusIndicator } from "./run-status-indicator";
@@ -195,7 +196,7 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
               />
             </TabsContent>
 
-            <TabsContent value="schedule" className="mt-6 min-w-0">
+            <TabsContent value="schedule" className="mt-6 min-w-0 space-y-6">
               <ScheduleTab
                 websiteId={websiteId}
                 ownerUserId={website?.user_id ?? null}
@@ -205,6 +206,13 @@ export function WebsiteDetail({ websiteId }: { websiteId: string }) {
                 // history this page has already fetched — which also keeps the panel and the
                 // header from ever disagreeing about how the last run went.
                 latestRun={runs[0] ?? null}
+              />
+              {/* PER-194's opt-in toggle. No fifth tab — see EnrichmentPanel's own docstring
+                  for why this lives here, beside the schedule, rather than on its own tab. */}
+              <EnrichmentPanel
+                websiteId={websiteId}
+                ownerUserId={website?.user_id ?? null}
+                isOwner={isOwner}
               />
             </TabsContent>
 

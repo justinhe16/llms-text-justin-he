@@ -4,6 +4,12 @@
       "CreateWebsiteRequest": {
         "description": "Body of `POST /websites`.",
         "properties": {
+          "enrich_with_llm": {
+            "default": false,
+            "description": "Whether this website's runs ask for model-assisted summarization — a written title and description per page, in place of what is extracted from the page's own markup. This records INTENT, not capability: a run actually enriches only when this is true AND model-assisted summarization is enabled for this deployment (an operator-level setting this API never exposes — see ARCHITECTURE.md §11). A run that asked for enrichment and could not get it still completes, using extracted titles and descriptions, and records why in that run's stats. Mechanism and cost: one Claude Haiku 4.5 call per page, on the first 4,000 characters of its extracted text — on the order of cents for a 100-page run.",
+            "title": "Enrich With Llm",
+            "type": "boolean"
+          },
           "url": {
             "description": "An absolute http:// or https:// URL. Stored as submitted; its normalized origin (lowercased scheme and host, default port and path removed) is what deduplicates it against your existing websites.",
             "examples": [
@@ -438,20 +444,13 @@
         "type": "object"
       },
       "RunIndexDiff": {
-        "description": "What changed in the latest run's index, compared with the previous completed run's —\nthe API shape of `internals/index_diff.py`'s `build_index_diff`'s `\"compared\"` dict.\nPresent on `LatestRunSnapshot.diff` if and only if `diff_state == \"compared\"`; see that\nfield's own docstring for why every other state carries `diff: None` instead of this\nmodel with its numeric fields zeroed out.",
+        "description": "What changed in the latest run's index, compared with the previous completed run's —\nthe API shape of `internals/index_diff.py`'s `build_index_diff`'s `\"compared\"` dict.\nPresent on `LatestRunSnapshot.diff` if and only if `diff_state == \"compared\"`; see that\nfield's own docstring for why every other state carries `diff: None` instead of this\nmodel with its numeric fields zeroed out.\n\n**`AliasChoices` on the two renamed fields is what keeps a version-7 row (written before\nPER-194 renamed `pages_changed` -> `metadata_changed`) validating cleanly.** Those rows\nare permanent — `RUN_STATS_VERSION` never rewrites history — and without the alias every\none of them would fail `model_validate` and silently degrade `LatestRunSnapshot.diff_state`\nto `\"not_recorded\"`, with a WARNING logged per row (`runs/service.py`'s `_to_latest`).\nEach `AliasChoices` includes the field's OWN new name first and its old name second, so no\n`populate_by_name` is needed and serialization (what a client actually receives) always\nuses the new name — the wire contract is the new one; only deserialization of an\nalready-stored row is bilingual.",
         "properties": {
           "added_sample": {
             "items": {
               "$ref": "#/components/schemas/IndexPageRef"
             },
             "title": "Added Sample",
-            "type": "array"
-          },
-          "changed_sample": {
-            "items": {
-              "$ref": "#/components/schemas/IndexPageRef"
-            },
-            "title": "Changed Sample",
             "type": "array"
           },
           "compared_to_completed_at": {
@@ -471,16 +470,63 @@
             "title": "Compared To Run Id",
             "type": "string"
           },
+          "content_changed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Changed"
+          },
+          "content_changed_sample": {
+            "items": {
+              "$ref": "#/components/schemas/IndexPageRef"
+            },
+            "title": "Content Changed Sample",
+            "type": "array"
+          },
           "llms_txt_bytes_delta": {
             "title": "Llms Txt Bytes Delta",
             "type": "integer"
           },
+          "metadata_changed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata Changed"
+          },
+          "metadata_changed_sample": {
+            "items": {
+              "$ref": "#/components/schemas/IndexPageRef"
+            },
+            "title": "Metadata Changed Sample",
+            "type": "array"
+          },
+          "metadata_not_comparable_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "enrichment_enabled",
+                  "enrichment_disabled"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata Not Comparable Reason"
+          },
           "pages_added": {
             "title": "Pages Added",
-            "type": "integer"
-          },
-          "pages_changed": {
-            "title": "Pages Changed",
             "type": "integer"
           },
           "pages_removed": {
@@ -533,10 +579,10 @@
           "compared_to_completed_at",
           "pages_added",
           "pages_removed",
-          "pages_changed",
+          "metadata_changed",
+          "metadata_changed_sample",
           "added_sample",
           "removed_sample",
-          "changed_sample",
           "urls_discovered_delta",
           "sections_delta",
           "selection_churn",
@@ -977,6 +1023,21 @@
         "title": "TriggerRunResponse",
         "type": "object"
       },
+      "UpdateWebsiteRequest": {
+        "description": "Body of `PATCH /websites/{id}`.\n\n`enrich_with_llm` is required, not optional, because it is currently the ONLY mutable\nfield this endpoint accepts — five of `websites`' six columns are not settable by anyone\n(`id`, `user_id`, `url`, `origin`, and `title`, which only a crawl writes). A `PUT` would\nmisrepresent what this endpoint actually replaces; `PATCH` reusing `WebsiteResponse` is\nthe design this ticket (PER-194) settled on over a schedule-shaped sub-resource, because\nthis is a column on `websites`, not an entity with a lifecycle of its own. When a second\nmutable field lands, THAT ticket decides whether both become optional — do not\npreemptively widen this model to guess at that shape now.",
+        "properties": {
+          "enrich_with_llm": {
+            "description": "Whether this website's runs ask for model-assisted summarization — a written title and description per page, in place of what is extracted from the page's own markup. This records INTENT, not capability: a run actually enriches only when this is true AND model-assisted summarization is enabled for this deployment (an operator-level setting this API never exposes — see ARCHITECTURE.md §11). A run that asked for enrichment and could not get it still completes, using extracted titles and descriptions, and records why in that run's stats. Mechanism and cost: one Claude Haiku 4.5 call per page, on the first 4,000 characters of its extracted text — on the order of cents for a 100-page run.",
+            "title": "Enrich With Llm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enrich_with_llm"
+        ],
+        "title": "UpdateWebsiteRequest",
+        "type": "object"
+      },
       "UpsertScheduleRequest": {
         "description": "Body of `PUT /websites/{id}/schedule`.\n\nBoth fields are required — there is no partial update here. A schedule has exactly two\nknobs a caller controls (`active`, `interval_minutes`); `next_run_at` and `last_run_at`\nare derived or owned elsewhere (see `ScheduleResponse`), so there is nothing left for a\n`PATCH`-style optional field to mean.\n\nDeliberately **not** `model_config = ConfigDict(extra=\"forbid\")` — the rest of this\ncodebase's request models do not set it either. An `auto_publish` key in the body is\nsilently ignored rather than rejected; `tests/test_schedules_api.py` proves that ignoring\nit does not mean writing it — the column this API never touches stays whatever it already\nwas.",
         "properties": {
@@ -1096,6 +1157,10 @@
             "title": "Created At",
             "type": "string"
           },
+          "enrich_with_llm": {
+            "title": "Enrich With Llm",
+            "type": "boolean"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
@@ -1152,6 +1217,7 @@
           "url",
           "origin",
           "title",
+          "enrich_with_llm",
           "created_at"
         ],
         "title": "WebsiteListItemResponse",
@@ -1164,6 +1230,10 @@
             "format": "date-time",
             "title": "Created At",
             "type": "string"
+          },
+          "enrich_with_llm": {
+            "title": "Enrich With Llm",
+            "type": "boolean"
           },
           "id": {
             "format": "uuid",
@@ -1201,6 +1271,7 @@
           "url",
           "origin",
           "title",
+          "enrich_with_llm",
           "created_at"
         ],
         "title": "WebsiteResponse",
@@ -1673,6 +1744,63 @@
           }
         ],
         "summary": "Get Website",
+        "tags": [
+          "websites"
+        ]
+      },
+      "patch": {
+        "description": "Change a website the caller owns — today, only `enrich_with_llm`.\n\n`PATCH`, not `PUT`: this endpoint accepts one field of six, and a `PUT` claims to\nreplace the whole resource (see `UpdateWebsiteRequest`'s own docstring). `403`, not\n`404`, for a non-owner — the identical reasoning `delete_website` below gives, since\n`GET /websites/{id}` already returns this row to every signed-in user.",
+        "operationId": "update_website_websites__id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWebsiteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsiteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Website",
         "tags": [
           "websites"
         ]

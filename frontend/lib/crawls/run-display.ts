@@ -36,6 +36,37 @@ export function runPagesCrawled(run: Pick<RunListItem, "stats">): number | null 
 }
 
 /**
+ * Whether this run asked for model-assisted summarization and did not get it (PER-194) — the
+ * predicate `RunEnrichmentBadge` (components/crawls/run-enrichment-badge.tsx) renders on.
+ *
+ * Reads `run.stats` with the same defensive `?.`/`typeof` idiom `runPagesCrawled` above
+ * uses, for the identical reason: `stats` is jsonb whose shape belongs to the crawler
+ * milestone (ARCHITECTURE.md §3.4), so a client reads it defensively rather than assuming a
+ * shape that may not be there — this run may predate `RUN_STATS_VERSION` 8, in which case
+ * `enrich_requested` is simply absent and this returns `false`.
+ *
+ * `status === "completed"` first: an in-flight or failed run has not finished deciding
+ * whether enrichment applied, and `stats` for those rows is whatever partial shape the last
+ * attempt left behind.
+ *
+ * The `enrich_unavailable_reason` clause is not redundant with `enrich_applied === false` —
+ * it is what keeps the badge off a run that asked, ran cleanly, and simply had nothing to
+ * summarize (every page's markdown was empty after truncation): that run has
+ * `enrich_requested: true`, `enrich_applied: false`, and `enrich_unavailable_reason: null`,
+ * which is not the "unavailable" case this badge exists to flag — see
+ * `RUN_STATS_VERSION`'s own version-8 paragraph (`backend/app/features/crawl/internals/
+ * run_stats.py`) for the full decision table this predicate is the frontend's reading of.
+ */
+export function runEnrichmentFellBack(run: Pick<RunListItem, "status" | "stats">): boolean {
+  return (
+    run.status === "completed" &&
+    run.stats?.enrich_requested === true &&
+    run.stats?.enrich_applied === false &&
+    typeof run.stats?.enrich_unavailable_reason === "string"
+  );
+}
+
+/**
  * A run's elapsed time, from the `duration_ms` the backend computes.
  *
  * `null` is returned as `null`, not "0s", and the caller renders it as an `<EmptyCell>`:

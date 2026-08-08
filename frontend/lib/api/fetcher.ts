@@ -199,7 +199,8 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 // Typed client — generic over `paths` from ./schema
 // ============================================================================
 //
-// Everything below builds `api.get`/`api.post`/`api.delete` on top of `apiFetch` above.
+// Everything below builds `api.get`/`api.post`/`api.put`/`api.patch`/`api.delete` on top of
+// `apiFetch` above.
 // The type-level goal is that an endpoint's request and response shapes are declared
 // exactly once, in the backend's Pydantic models — `paths` (openapi-typescript's output
 // in `./schema.d.ts`, regenerated from `./openapi.json` by `npm run gen:api`) is the
@@ -213,11 +214,12 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 // `lib/api/websites.ts` and friends are the intended call sites, via the exported `api`
 // object at the bottom.
 
-// The four verbs every current caller needs. PUT landed with the schedules ticket
-// (`PUT /websites/{id}/schedule` upserts a website's schedule) — PATCH is still nothing
-// planned. Widening this list further means adding the verb here once, plus one more
-// method on the `api` object below — everything else generalizes over it already.
-type HttpMethod = "get" | "post" | "put" | "delete";
+// The five verbs every current caller needs. PUT landed with the schedules ticket
+// (`PUT /websites/{id}/schedule` upserts a website's schedule); PATCH landed with PER-194
+// (`PATCH /websites/{id}` changes one column at a time). Widening this list further means
+// adding the verb here once, plus one more method on the `api` object below — everything
+// else generalizes over it already.
+type HttpMethod = "get" | "post" | "put" | "patch" | "delete";
 
 // The subset of `paths`' keys that actually declare method `M`. openapi-typescript emits
 // every unused method on every path as `{ verb?: never }`, so filtering on "does this
@@ -394,7 +396,7 @@ function buildQueryString(
 }
 
 async function performRequest<T>(
-  method: "GET" | "POST" | "PUT" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
   path: string,
   options: RuntimeRequestOptions | undefined
 ): Promise<T> {
@@ -408,8 +410,8 @@ async function performRequest<T>(
 }
 
 /**
- * The typed client. `api.get`, `api.post`, `api.put`, and `api.delete` derive their request
- * and response shapes from `paths` (`./schema.d.ts`), so a call to an endpoint that does not
+ * The typed client. `api.get`, `api.post`, `api.put`, `api.patch`, and `api.delete` derive
+ * their request and response shapes from `paths` (`./schema.d.ts`), so a call to an endpoint that does not
  * exist, or one that gets a parameter or a body wrong, fails at `tsc`, not at `fetch`.
  * `lib/api/websites.ts`, `lib/api/health.ts`, and every React Query hook in
  * `lib/query/` call through this object rather than `apiFetch` directly.
@@ -444,6 +446,14 @@ export const api = {
   ): Promise<ResponseFor<P, "put">> {
     const options = args[0] as RuntimeRequestOptions | undefined;
     return performRequest("PUT", path, options);
+  },
+
+  patch<P extends PathsWithMethod<"patch">>(
+    path: P,
+    ...args: OptionsArg<OperationFor<P, "patch">>
+  ): Promise<ResponseFor<P, "patch">> {
+    const options = args[0] as RuntimeRequestOptions | undefined;
+    return performRequest("PATCH", path, options);
   },
 
   delete<P extends PathsWithMethod<"delete">>(

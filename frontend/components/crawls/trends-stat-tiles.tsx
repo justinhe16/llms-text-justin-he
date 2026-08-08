@@ -3,14 +3,16 @@
 import { NumberTicker } from "@/components/magicui/number-ticker";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { StatsLatest, StatsTotals } from "@/lib/api/runs";
+import { METADATA_NOT_COMPARABLE } from "@/lib/crawls/enrichment-copy";
 import { successRatePercent } from "@/lib/crawls/stats-display";
 
 import { EmptyCell } from "./empty-cell";
 
 /** How many output tiles `TrendsOutputTiles` renders, and how many the skeleton draws for
  * that row. Named so the two cannot drift and leave the loading state a different height from
- * the loaded one. */
-const OUTPUT_TILE_COUNT = 4;
+ * the loaded one. PER-194 split the old "Changed" tile into "Content changed" and "Titles &
+ * descriptions", taking this from four to five. */
+const OUTPUT_TILE_COUNT = 5;
 
 /**
  * One tile's value: either a number to count up to, or nothing at all.
@@ -102,7 +104,7 @@ export function StatTile({
 export function TrendsStatTilesSkeleton() {
   return (
     <div aria-hidden="true" className="space-y-3">
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         {Array.from({ length: OUTPUT_TILE_COUNT }, (_, index) => (
           <div key={index} className="rounded-xl border border-border bg-card px-4 py-3">
             <Skeleton className="h-3 w-20" />
@@ -115,8 +117,9 @@ export function TrendsStatTilesSkeleton() {
   );
 }
 
-/** The `emptyLabel` for the three diff tiles, which — unlike "Pages in index" — depend on
- * whether a comparison exists at all rather than merely on whether a completed run does. */
+/** The `emptyLabel` for "Added"/"Removed" — and the fallback the two diff-detail helpers
+ * below reach for when there is no comparison at all — which, unlike "Pages in index",
+ * depend on whether a comparison exists rather than merely on whether a completed run does. */
 function diffEmptyLabel(latest: StatsLatest | null): string {
   if (latest === null) return "no completed run in this window";
   switch (latest.diff_state) {
@@ -132,20 +135,46 @@ function diffEmptyLabel(latest: StatsLatest | null): string {
   }
 }
 
+/** The `emptyLabel` for "Content changed" (PER-194) — `diffEmptyLabel` when there is no
+ * comparison at all, else the one reason `diff.content_changed` can still be `null` inside a
+ * real comparison: the previous run recorded no content hashes (it predates
+ * `RUN_STATS_VERSION` 8). Mirrors the footer's own `urls_discovered_delta` treatment. */
+function contentChangedEmptyLabel(latest: StatsLatest | null): string {
+  if (latest?.diff == null) return diffEmptyLabel(latest);
+  return "the previous run recorded no page fingerprints";
+}
+
+/** The `emptyLabel` for "Titles & descriptions" (PER-194) — `diffEmptyLabel` when there is no
+ * comparison at all, else `METADATA_NOT_COMPARABLE`'s sentence for whichever direction the
+ * enrichment toggle flipped since the previous run. */
+function metadataChangedEmptyLabel(latest: StatsLatest | null): string {
+  const diff = latest?.diff ?? null;
+  if (diff === null) return diffEmptyLabel(latest);
+  if (diff.metadata_not_comparable_reason) {
+    return METADATA_NOT_COMPARABLE[diff.metadata_not_comparable_reason];
+  }
+  // Unreachable in practice — `metadata_changed` is null iff `metadata_not_comparable_reason`
+  // is set — the identical "every branch needs a string" reasoning `diffEmptyLabel` gives.
+  return "no comparison recorded for this run";
+}
+
 /**
- * The four PRIMARY tiles: what the newest completed run's index looks like, and what changed
+ * The five PRIMARY tiles: what the newest completed run's index looks like, and what changed
  * in it — the output the ticket asks this panel to lead with, ahead of crawler health.
+ * PER-194 split the old single "Changed" tile into "Content changed" (mode-independent) and
+ * "Titles & descriptions" (not-comparable across an enrichment mode change).
  *
- * Two-up below `md` and four-up above it: four numbers side by side at 375px would each get
- * about 80 pixels, which is not enough for a label plus a signed count without wrapping onto
- * three lines.
+ * Two-up below `md` and five-up above it. The sibling docstring this comment used to carry
+ * argued four-up would not fit at a 375px mobile width — this panel stays two-up below `md`
+ * for exactly that reason, unchanged by the fifth tile; `md` (768px) and up have the room a
+ * 375px phone does not.
  */
 export function TrendsOutputTiles({ latest }: { latest: StatsLatest | null }) {
   const diff = latest?.diff ?? null;
   const emptyLabel = diffEmptyLabel(latest);
 
   return (
-    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
       <StatTile
         label="Pages in index"
         value={latest?.index_pages ?? null}
@@ -168,7 +197,17 @@ export function TrendsOutputTiles({ latest }: { latest: StatsLatest | null }) {
         tone={diff !== null && diff.pages_removed > 0 ? "negative" : undefined}
       />
 
-      <StatTile label="Changed" value={diff?.pages_changed ?? null} emptyLabel={emptyLabel} />
+      <StatTile
+        label="Content changed"
+        value={diff?.content_changed ?? null}
+        emptyLabel={contentChangedEmptyLabel(latest)}
+      />
+
+      <StatTile
+        label="Titles & descriptions"
+        value={diff?.metadata_changed ?? null}
+        emptyLabel={metadataChangedEmptyLabel(latest)}
+      />
     </div>
   );
 }

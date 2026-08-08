@@ -42,6 +42,7 @@ from app.features.websites.schemas import (
     CreateWebsiteRequest,
     LatestRunSummary,
     ScheduleSummary,
+    UpdateWebsiteRequest,
     WebsiteAlreadyExistsDetail,
     WebsiteInclude,
     WebsiteListItemResponse,
@@ -104,6 +105,7 @@ def _to_list_item(row: dict[str, Any]) -> WebsiteListItemResponse:
         url=row["url"],
         origin=row["origin"],
         title=row["title"],
+        enrich_with_llm=row["enrich_with_llm"],
         created_at=row["created_at"],
         latest_run=latest_run,
         schedule=schedule,
@@ -163,7 +165,10 @@ class WebsiteService:
         try:
             async with transaction(self._pool) as tx:
                 row = await WebsitesWriter(tx).insert(
-                    user_id=user_id, url=normalized.url, origin=normalized.origin
+                    user_id=user_id,
+                    url=normalized.url,
+                    origin=normalized.origin,
+                    enrich_with_llm=request.enrich_with_llm,
                 )
         except UniqueViolationError as error:
             # The check above is not atomic with the insert, so two concurrent POSTs of the
@@ -220,6 +225,46 @@ class WebsiteService:
         row = await self._reader.get_by_id(website_id)
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND_DETAIL)
+        return _to_website(row)
+
+    async def update_website(
+        self, website_id: UUID, request: UpdateWebsiteRequest, user_id: UUID
+    ) -> WebsiteResponse:
+        """Change a website the caller owns — today, only its `enrich_with_llm` intent.
+
+        The canonical write path for this codebase (ARCHITECTURE.md §4.2): fetch, then
+        `require_owner` with nothing in between, then — and only then — a short transaction.
+        Mirrors `delete_website` below exactly, one line longer for the `UPDATE`'s return
+        value.
+
+        A change here affects the NEXT run only, never a run already in flight or already
+        recorded — this method writes one column on `websites` and nothing on `runs`, so
+        that guarantee falls out of what the write touches rather than needing an explicit
+        check.
+
+        Raises:
+            HTTPException: `404` if there is no website with that id; `403` (from
+                `require_owner`) if the caller is not its owner, for the identical reason
+                `delete_website` gives — `GET /websites/{id}` already returns this row to
+                everyone, so a `404` for a non-owner would be a lie the next request
+                disproves. A second, race-window `404` — character-identical to the first —
+                if the website is deleted between the fetch above and the `UPDATE` below.
+        """
+        website = await self.get_website(website_id)  # 404
+        require_owner(website, user_id)  # 403 — nothing between these two lines
+
+        async with transaction(self._pool) as tx:
+            row = await WebsitesWriter(tx).update(
+                website_id, enrich_with_llm=request.enrich_with_llm
+            )
+        if row is None:
+            # Deleted in the race window between the fetch above and this UPDATE.
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND_DETAIL)
+
+        # `enrich_with_llm`'s value is not a secret (ARCHITECTURE.md §9.4 is about keys, not
+        # this boolean), so it is safe to log — unlike `Settings.anthropic_api_key`, which
+        # nothing in this line touches.
+        logger.info("Set enrich_with_llm=%s on website %s", request.enrich_with_llm, website_id)
         return _to_website(row)
 
     async def delete_website(self, website_id: UUID, user_id: UUID) -> None:

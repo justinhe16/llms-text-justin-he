@@ -95,8 +95,10 @@ function describeFailure(error: unknown): { message: string; retryable: boolean 
  * navigation.
  */
 export function useAddSite(): {
-  /** Validate `input` and run the sequence. Safe to call on Enter and on the arrow button. */
-  submit: (input: string) => void;
+  /** Validate `input` and run the sequence. Safe to call on Enter and on the arrow button.
+   *  `enrichWithLlm` is the field's own checkbox state at the moment of submit — see
+   *  `SiteUrlField`'s own docstring for why it owns that state rather than this hook. */
+  submit: (input: string, enrichWithLlm: boolean) => void;
   /** Re-run whatever failed — just the trigger if the website already exists, the whole
    *  sequence otherwise. No-op unless there is a retryable error showing. */
   retry: () => void;
@@ -113,9 +115,12 @@ export function useAddSite(): {
   // the request resolves would re-enable the field for the frame or two before the new
   // route paints, which looks like the submit did nothing.
   const [isNavigating, setIsNavigating] = useState(false);
-  // What was last submitted, so `retry()` can resend it without the field having to hand it
-  // back — the field may have been cleared or edited in between.
-  const lastUrl = useRef<string | null>(null);
+  // What was last submitted — URL AND the enrichment checkbox's state — so `retry()` can
+  // resend the SAME intent without the field having to hand either back. Before PER-194 this
+  // held only the URL (`lastUrl`); a retry that dropped the opt-in silently would be a bug
+  // this ref's whole job is to prevent — the field may have been cleared or its checkbox
+  // toggled again in between.
+  const lastSubmission = useRef<{ url: string; enrichWithLlm: boolean } | null>(null);
 
   // The website the pending `router.push` is heading for, so the watchdog below can still
   // point at it if that push never lands.
@@ -197,12 +202,12 @@ export function useAddSite(): {
   );
 
   const addSite = useCallback(
-    async (url: string): Promise<void> => {
-      lastUrl.current = url;
+    async (url: string, enrichWithLlm: boolean): Promise<void> => {
+      lastSubmission.current = { url, enrichWithLlm };
 
       let websiteId: string;
       try {
-        websiteId = (await createWebsite(url)).id;
+        websiteId = (await createWebsite({ url, enrichWithLlm })).id;
       } catch (caught) {
         // `409` — already added. Go to it. No second run is triggered on this path: the
         // user asked for a site they already have, not for another crawl of it, and
@@ -223,14 +228,14 @@ export function useAddSite(): {
   );
 
   const submit = useCallback(
-    (input: string) => {
+    (input: string, enrichWithLlm: boolean) => {
       const parsed = parseSiteUrl(input);
       if (!parsed.ok) {
         setError({ message: parsed.message, websiteId: null, retryable: false });
         return;
       }
       setError(null);
-      void addSite(parsed.url);
+      void addSite(parsed.url, enrichWithLlm);
     },
     [addSite]
   );
@@ -243,7 +248,9 @@ export function useAddSite(): {
       void startRun(websiteId);
       return;
     }
-    if (lastUrl.current !== null) void addSite(lastUrl.current);
+    if (lastSubmission.current !== null) {
+      void addSite(lastSubmission.current.url, lastSubmission.current.enrichWithLlm);
+    }
   }, [addSite, error, startRun]);
 
   const clearError = useCallback(() => setError(null), []);

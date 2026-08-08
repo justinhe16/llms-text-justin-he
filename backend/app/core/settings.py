@@ -126,14 +126,29 @@ class Settings(BaseSettings):
     # ARCHITECTURE.md §11 describes as sitting ABOVE `internals/llms_txt.py` rather than
     # inside it. Everything below is read by the worker only — the API never touches these.
     #
-    # `crawl_enrich_with_llm` defaults OFF, and OFF is load-bearing here, not merely
-    # cautious. With the flag off, nothing in this feature constructs an `AsyncAnthropic`
-    # client at all (`app/worker/settings.py`'s `open_worker_resources` checks this same
-    # flag before calling `build_anthropic_client`), so a run's artifact is byte-identical
-    # to what the deterministic path already produced, and this suite — and CI — never needs
-    # a live `ANTHROPIC_API_KEY` to go green. Flip it on and a website's crawl starts paying
-    # for a model call per page; that is a cost decision an operator makes deliberately, not
-    # a default this codebase should make for them.
+    # **PER-194 split what this flag means into two levels, and this is the top one.**
+    # `crawl_enrich_with_llm` no longer decides, by itself, whether any given website's runs
+    # enrich — `websites.enrich_with_llm` (per-website, owner-settable, default `False`) is
+    # the other half, and a run enriches only when BOTH are true
+    # (`CrawlService.execute_run`'s gate). What this flag alone answers is narrower but still
+    # load-bearing: IS model-assisted summarization available in this deployment at all. A
+    # website can have `enrich_with_llm = True` in a deployment where this flag is off — that
+    # is the ordinary state of "an owner opted in, but nobody has turned enrichment on for
+    # this installation yet" — and that run completes normally, falls back to extracted
+    # metadata, and records `enrich_unavailable_reason = "deployment_disabled"`
+    # (`internals/run_stats.py`'s version-8 paragraph).
+    #
+    # `crawl_enrich_with_llm` defaults OFF, and OFF is still load-bearing here, not merely
+    # cautious, and for the same reason as before PER-194: with the flag off, nothing in this
+    # feature constructs an `AsyncAnthropic` client at all (`app/worker/settings.py`'s
+    # `open_worker_resources` checks this same flag before calling `build_anthropic_client`),
+    # REGARDLESS of how many websites have opted in — so a run's artifact is byte-identical to
+    # what the deterministic path already produced for every website in the deployment, and
+    # this suite — and CI — never needs a live `ANTHROPIC_API_KEY` to go green. Flip it on and
+    # every website that has independently opted in starts paying for a model call per page on
+    # its next run; that is a cost decision an operator makes deliberately, not a default this
+    # codebase should make for them, and it is still a single deployment-wide switch — there is
+    # no per-website override of THIS half of the gate (§11: no per-run override either).
     #
     # Summarization is ALL-OR-NOTHING for a run, by design, and there is deliberately no
     # third "gap-filling" mode that mixes model-written and extracted metadata based on which
@@ -144,7 +159,10 @@ class Settings(BaseSettings):
     # to trust more. `internals/enrich.py`'s `enrich_pages` reports every page it could not
     # summarize, and `CrawlService.execute_run` falls back to the FULL deterministic artifact
     # rather than a partially-enriched one — see that method for exactly where the line is
-    # drawn.
+    # drawn. That "no gap-filling" rule is about a single run's OWN pages; it says nothing
+    # about the per-website opt-in this ticket adds, which is a different axis entirely — a
+    # deployment enriching some websites and not others is the intended product, not the
+    # blending this paragraph rules out.
     crawl_enrich_with_llm: bool = False
 
     # The Anthropic API key. Read only when `crawl_enrich_with_llm` is `True` — see

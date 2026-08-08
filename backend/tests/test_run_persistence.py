@@ -36,12 +36,14 @@ from conftest import (
     seed_run,
     seed_website,
 )
+from httpx import AsyncClient
 
 from app.core.settings import settings
 from app.features.crawl.internals.crawler import CrawlResult
 from app.features.crawl.internals.payload import PAYLOAD_CONTENT_TYPE
 from app.features.crawl.internals.robots import ALLOW_ALL
 from app.features.crawl.internals.sitemap import DiscoveryResult
+from app.features.crawl.internals.url_ranking import normalize_url
 from app.features.crawl.schemas import CrawledPage
 from app.features.crawl.service import TransientCrawlError, build_crawl_service
 from app.features.runs.internals.runs_writer import RunsWriter
@@ -58,8 +60,12 @@ def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.As
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
 
 
-async def _seed_pending(pool: Pool, suffix: str) -> tuple[UUID, UUID]:
-    website_id = await seed_website(pool, TEST_USER_A_ID, f"http://{_SEED_IP}/{suffix}")
+async def _seed_pending(
+    pool: Pool, suffix: str, *, enrich_with_llm: bool = False
+) -> tuple[UUID, UUID]:
+    website_id = await seed_website(
+        pool, TEST_USER_A_ID, f"http://{_SEED_IP}/{suffix}", enrich_with_llm=enrich_with_llm
+    )
     run_id = await seed_run(pool, website_id, started_at=_NOW, status="pending")
     return website_id, run_id
 
@@ -139,7 +145,7 @@ async def test_success_writes_a_completed_row_with_artifact_storage_path_and_sta
     assert row["completed_at"] is not None
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 7
+    assert stats["version"] == 8
     assert stats["pages_crawled"] == 1
     assert "cap_hit" in stats
     assert stats["pages_empty_content"] == 1, "the ok_handler's body has no extractable content"
@@ -412,7 +418,7 @@ async def test_partial_stats_survive_an_upload_failure(websites_db: Pool) -> Non
     assert row is not None
     stats = json.loads(row["stats"])
     assert stats["pages_crawled"] == 1
-    assert stats["version"] == 7
+    assert stats["version"] == 8
     # A failure row carries the same KEYS as a success row, at their hoisted defaults — the
     # shape `runs.stats` stores must not depend on how far a run got before it failed. The
     # four PER-180 counters are part of that same guarantee now: this suite's `_execute`
@@ -646,7 +652,7 @@ async def test_a_second_run_diffs_against_the_first_and_records_added_and_remove
     assert diff["previous_run_completed"] is True
     assert diff["pages_added"] == 1
     assert diff["pages_removed"] == 1
-    assert diff["pages_changed"] == 0
+    assert diff["metadata_changed"] == 0
     assert {entry["url"] for entry in diff["added_sample"]} == {f"http://{_SEED_IP}/docs/c"}
     assert {entry["url"] for entry in diff["removed_sample"]} == {f"http://{_SEED_IP}/docs/b"}
 
@@ -976,12 +982,12 @@ async def test_a_site_with_no_sitemap_falls_back_to_the_links_on_its_seed_page(
     assert stats["urls_discovered"] == 3, "off-origin, mailto: and fragment-only never count"
     assert stats["urls_selected"] == 3
     assert stats["pages_crawled"] == 4
-    assert stats["version"] == 7, (
+    assert stats["version"] == 8, (
         "a new VALUE for an existing key is still not a new shape — PER-178 added "
-        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 7 '
-        "because PER-180, PER-191, and PER-193 each added new KEYS after that, which are "
-        "shape changes; the number moved for reasons that have nothing to do with the value "
-        "asserted above."
+        '`discovery_source: "links"` and deliberately did not bump for it. This row reads 8 '
+        "because PER-180, PER-191, PER-193, and PER-194 each added new KEYS after that, which "
+        "are shape changes; the number moved for reasons that have nothing to do with the "
+        "value asserted above."
     )
 
 
@@ -1231,10 +1237,18 @@ async def test_links_found_but_all_ranked_away_still_report_the_links_source(
 
 # -----------------------------------------------------------------------------------------
 # PER-180: flag-gated, model-assisted per-page summarization
-# (`app.features.crawl.internals.enrich`), end to end against a real Postgres row. Every
-# test below monkeypatches `settings.crawl_enrich_with_llm` to `True` and hands `_execute`
-# a `conftest.FakeAnthropic` — the module-level `settings` object is real, so every test
-# above this section that never touches it keeps exercising the actual, flag-off default.
+# (`app.features.crawl.internals.enrich`), end to end against a real Postgres row.
+#
+# **PER-194 turned the gate two-level, and every test below is updated for it.** A run
+# enriches only when BOTH `Settings.crawl_enrich_with_llm` (the deployment flag) AND the
+# website's own `enrich_with_llm` column are true — so every test in this section that wants
+# enrichment to actually run now does two things, not one: `monkeypatch.setattr(settings,
+# "crawl_enrich_with_llm", True)` for the deployment half, and `_seed_pending(...,
+# enrich_with_llm=True)` for the website's own opt-in. The module-level `settings` object is
+# real, so every test above this section that never touches it keeps exercising the actual,
+# flag-off default; the new tests at the end of this section — starting with
+# `test_a_website_that_did_not_opt_in_is_never_enriched_even_with_the_flag_on` — are what pin
+# each half of the gate independently.
 #
 # `crawl_site` is monkeypatched to hand `execute_run` pre-built `CrawledPage`s, the same
 # pattern `test_cap_hit_from_the_crawl_result_lands_in_the_stored_stats` and
@@ -1304,7 +1318,9 @@ async def test_model_titles_reach_llms_txt_and_the_extracted_title_does_not(
     websites_db: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
-    _website_id, run_id = await _seed_pending(websites_db, "enrich-model-title")
+    _website_id, run_id = await _seed_pending(
+        websites_db, "enrich-model-title", enrich_with_llm=True
+    )
 
     page = _enrich_page(
         "enrich-model-title", title="Extracted Title Nobody Should See In The Artifact"
@@ -1332,7 +1348,7 @@ async def test_model_titles_reach_llms_txt_and_the_extracted_title_does_not(
     assert "Extracted Title Nobody Should See In The Artifact" not in row["llms_txt"]
 
     stats = json.loads(row["stats"])
-    assert stats["version"] == 7
+    assert stats["version"] == 8
     assert stats["pages_enriched"] == 1
     assert stats["enrich_failures"] == 0
 
@@ -1359,7 +1375,9 @@ async def test_a_total_enrichment_failure_still_completes_with_the_deterministic
     assert row_off["status"] == "completed"
 
     monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
-    _website_id_on, run_id_on = await _seed_pending(websites_db, "enrich-total-failure-on")
+    _website_id_on, run_id_on = await _seed_pending(
+        websites_db, "enrich-total-failure-on", enrich_with_llm=True
+    )
     fake_anthropic = FakeAnthropic(respond=_always_fails)
     outcome_on = await _execute(
         websites_db, FakeStorage(), run_id_on, _unreachable_handler, anthropic_client=fake_anthropic
@@ -1383,7 +1401,7 @@ async def test_a_per_page_enrichment_failure_mixes_model_and_extracted_titles(
     websites_db: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
-    _website_id, run_id = await _seed_pending(websites_db, "enrich-mixed")
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-mixed", enrich_with_llm=True)
 
     ok_page = _enrich_page(
         "enrich-mixed/ok",
@@ -1437,7 +1455,7 @@ async def test_the_archived_payload_keeps_the_extracted_metadata_not_the_models(
     run uploads to Storage keeps trafilatura's own title and description even though the
     artifact `runs.llms_txt` stores carries the model's."""
     monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
-    _website_id, run_id = await _seed_pending(websites_db, "enrich-payload")
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-payload", enrich_with_llm=True)
 
     page = _enrich_page(
         "enrich-payload",
@@ -1480,7 +1498,7 @@ async def test_all_four_enrichment_counters_are_recorded(
     websites_db: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
-    _website_id, run_id = await _seed_pending(websites_db, "enrich-counters")
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-counters", enrich_with_llm=True)
 
     page_a = _enrich_page("enrich-counters/a", markdown="Real content A, long enough to summarize.")
     page_b = _enrich_page("enrich-counters/b", markdown="Real content B, long enough to summarize.")
@@ -1525,7 +1543,7 @@ async def test_the_anthropic_call_never_happens_inside_a_database_transaction(
     independent ones that could pass separately while still overlapping a transaction
     between them."""
     monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
-    _website_id, run_id = await _seed_pending(websites_db, "enrich-no-tx")
+    _website_id, run_id = await _seed_pending(websites_db, "enrich-no-tx", enrich_with_llm=True)
 
     page = _enrich_page("enrich-no-tx")
     _mock_crawl_site(
@@ -1588,6 +1606,314 @@ async def test_the_anthropic_call_never_happens_inside_a_database_transaction(
     assert saw_enrich, "the Anthropic call never happened at all"
     assert saw_upload, "the Storage upload never happened at all"
     assert depth == 0, "a transaction was left open"
+
+
+# -----------------------------------------------------------------------------------------
+# PER-194: the per-website opt-in — a run enriches only when the deployment flag AND the
+# website's own `enrich_with_llm` are both true — and the content-hash side-channel the
+# retrofit diff joins against. `tests/test_run_stats.py` and `tests/test_index_diff.py` pin
+# the pure halves of this in isolation; what is pinned here is the WIRING against a real
+# Postgres row, end to end.
+# -----------------------------------------------------------------------------------------
+
+
+async def test_a_website_that_did_not_opt_in_is_never_enriched_even_with_the_flag_on(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[Compat]. The deployment flag alone is no longer enough to enrich a run — a website
+    that never set `enrich_with_llm` must see byte-identical behaviour to the flag-off world,
+    even with a real (fake) Anthropic client in hand and the deployment flag on."""
+    page = _enrich_page("no-opt-in", title="Extracted Title")
+    crawl_result = CrawlResult(
+        pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+    )
+
+    _mock_crawl_site(monkeypatch, crawl_result)
+    _website_id_off, run_id_off = await _seed_pending(websites_db, "no-opt-in-off")
+    outcome_off = await _execute(websites_db, FakeStorage(), run_id_off, _unreachable_handler)
+    assert outcome_off is not None
+    row_off = await websites_db.fetchrow(
+        "SELECT llms_txt, llms_full_txt FROM runs WHERE id = $1", run_id_off
+    )
+    assert row_off is not None
+
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _mock_crawl_site(monkeypatch, crawl_result)
+    _website_id_on, run_id_on = await _seed_pending(websites_db, "no-opt-in-on")
+    fake_anthropic = FakeAnthropic()
+    outcome_on = await _execute(
+        websites_db, FakeStorage(), run_id_on, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome_on is not None
+
+    assert fake_anthropic.calls == [], (
+        "a website that never opted in must never be sent to the model"
+    )
+
+    row_on = await websites_db.fetchrow(
+        "SELECT llms_txt, llms_full_txt, stats FROM runs WHERE id = $1", run_id_on
+    )
+    assert row_on is not None
+    assert row_on["llms_txt"] == row_off["llms_txt"]
+    assert row_on["llms_full_txt"] == row_off["llms_full_txt"]
+
+    stats_on = json.loads(row_on["stats"])
+    assert stats_on["enrich_requested"] is False
+    assert stats_on["enrich_applied"] is False
+    assert stats_on["enrich_unavailable_reason"] is None
+    assert stats_on["pages_enriched"] == 0
+    assert stats_on["enrich_failures"] == 0
+    assert stats_on["enrich_input_tokens"] == 0
+    assert stats_on["enrich_output_tokens"] == 0
+
+
+async def test_an_opted_in_website_with_the_global_flag_off_completes_and_records_deployment_disabled(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[Fallback]. The website asked; the deployment cannot provide it because the flag
+    itself is off — the run still completes with extracted metadata, and records why."""
+    _website_id, run_id = await _seed_pending(websites_db, "flag-off", enrich_with_llm=True)
+    page = _enrich_page("flag-off", title="Extracted Title")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+
+    outcome = await _execute(websites_db, FakeStorage(), run_id, _unreachable_handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow(
+        "SELECT status, llms_txt, stats FROM runs WHERE id = $1", run_id
+    )
+    assert row is not None
+    assert row["status"] == "completed"
+    assert "Extracted Title" in row["llms_txt"]
+
+    stats = json.loads(row["stats"])
+    assert stats["enrich_requested"] is True
+    assert stats["enrich_applied"] is False
+    assert stats["enrich_unavailable_reason"] == "deployment_disabled"
+
+
+async def test_an_opted_in_website_with_no_client_records_no_api_key(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[Fallback]. The deployment flag is on, but this worker process built no
+    `AsyncAnthropic` client — the `open_worker_resources` shape a missing `ANTHROPIC_API_KEY`
+    produces, reproduced here by simply not passing `anthropic_client`."""
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "no-client", enrich_with_llm=True)
+    page = _enrich_page("no-client", title="Extracted Title")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+
+    outcome = await _execute(websites_db, FakeStorage(), run_id, _unreachable_handler)
+    assert outcome is not None
+
+    row = await websites_db.fetchrow(
+        "SELECT status, llms_txt, stats FROM runs WHERE id = $1", run_id
+    )
+    assert row is not None
+    assert row["status"] == "completed"
+    assert "Extracted Title" in row["llms_txt"]
+
+    stats = json.loads(row["stats"])
+    assert stats["enrich_requested"] is True
+    assert stats["enrich_applied"] is False
+    assert stats["enrich_unavailable_reason"] == "no_api_key"
+
+
+async def test_every_enrichment_request_failing_records_api_error_and_completes_with_extracted_titles(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[Fallback]. The deployment can enrich and the website asked, but every request fails
+    — the run still completes with extracted metadata, and `enrich_unavailable_reason` names
+    the third reason: the pass ran and produced nothing usable."""
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "api-error", enrich_with_llm=True)
+    page = _enrich_page("api-error", title="Extracted Title")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+    fake_anthropic = FakeAnthropic(respond=_always_fails)
+
+    outcome = await _execute(
+        websites_db, FakeStorage(), run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    row = await websites_db.fetchrow(
+        "SELECT status, llms_txt, stats FROM runs WHERE id = $1", run_id
+    )
+    assert row is not None
+    assert row["status"] == "completed"
+    assert "Extracted Title" in row["llms_txt"]
+
+    stats = json.loads(row["stats"])
+    assert stats["enrich_requested"] is True
+    assert stats["enrich_applied"] is False
+    assert stats["enrich_unavailable_reason"] == "api_error"
+    assert stats["enrich_failures"] == 1
+
+
+async def test_an_opted_in_website_with_the_flag_on_enriches_and_records_applied(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary success path, end to end: both halves of the gate are true, the pass
+    succeeds, and the row says so."""
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+    _website_id, run_id = await _seed_pending(websites_db, "applied", enrich_with_llm=True)
+    page = _enrich_page("applied", title="Extracted Title")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+    fake_anthropic = FakeAnthropic(
+        respond=lambda _kwargs: fake_summary_response("Model Title", "Model written description.")
+    )
+
+    outcome = await _execute(
+        websites_db, FakeStorage(), run_id, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome is not None
+
+    row = await websites_db.fetchrow("SELECT llms_txt, stats FROM runs WHERE id = $1", run_id)
+    assert row is not None
+    assert "Model Title" in row["llms_txt"]
+
+    stats = json.loads(row["stats"])
+    assert stats["enrich_requested"] is True
+    assert stats["enrich_applied"] is True
+    assert stats["enrich_unavailable_reason"] is None
+
+
+async def test_the_content_hash_map_is_recorded_and_keyed_by_the_normalized_url(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`runs.stats["content_hashes"]` is recorded on every run — enrichment need not even be
+    requested — keyed by the SAME normalized form `IndexEntry.key` uses, which is what makes
+    the join in `internals/index_diff.py`'s `build_index_diff` exact."""
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "content-hash")
+    page = _diff_page("/docs/a")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+
+    outcome = await _execute(websites_db, FakeStorage(), run_id, _unreachable_handler)
+    assert outcome is not None
+
+    stats = json.loads(await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id))
+    hashes = stats["content_hashes"]
+    assert list(hashes.keys()) == [normalize_url(page.url)]
+
+
+async def test_the_first_run_after_opting_in_reports_a_not_comparable_metadata_diff_but_a_real_content_diff(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end-to-end mode-flip test against real Postgres. A website's first run happens
+    before it opts in; its second run happens after both the website and the deployment have
+    switched enrichment on. The comparison between them marks `metadata_changed`
+    not-comparable but still reports a real `content_changed` — here, `0`, because the page's
+    body genuinely did not change between the two runs, which is the point: `content_changed`
+    is a REAL comparison, not a blanked one."""
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, f"http://{_SEED_IP}/mode-flip")
+
+    run_id_1 = await seed_run(websites_db, website_id, started_at=_NOW, status="pending")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/docs/a", title="Page A")],
+            stats=_crawl_stats(pages_crawled=1),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+    outcome_1 = await _execute(websites_db, FakeStorage(), run_id_1, _unreachable_handler)
+    assert outcome_1 is not None
+
+    # Opt in, and turn the deployment flag on, strictly between the two runs.
+    await websites_db.execute(
+        "UPDATE websites SET enrich_with_llm = TRUE WHERE id = $1", website_id
+    )
+    monkeypatch.setattr(settings, "crawl_enrich_with_llm", True)
+
+    run_id_2 = await seed_run(
+        websites_db, website_id, started_at=_NOW + timedelta(minutes=1), status="pending"
+    )
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[_diff_page("/docs/a", title="Page A")],
+            stats=_crawl_stats(pages_crawled=1),
+            cap_hit=None,
+            seed_error=None,
+        ),
+    )
+    fake_anthropic = FakeAnthropic(
+        respond=lambda _kwargs: fake_summary_response("Model Title", "Model written description.")
+    )
+    outcome_2 = await _execute(
+        websites_db, FakeStorage(), run_id_2, _unreachable_handler, anthropic_client=fake_anthropic
+    )
+    assert outcome_2 is not None
+
+    stats_2 = json.loads(
+        await websites_db.fetchval("SELECT stats FROM runs WHERE id = $1", run_id_2)
+    )
+    diff = stats_2["index_diff"]
+    assert diff["state"] == "compared"
+    assert diff["metadata_changed"] is None
+    assert diff["metadata_not_comparable_reason"] == "enrichment_enabled"
+    # The page's body is identical in both runs — a real, computed `0`, not a blanked `None`.
+    assert diff["content_changed"] == 0
+    # Everything mode-independent still reports normally.
+    assert diff["pages_added"] == 0
+    assert diff["pages_removed"] == 0
+
+
+async def test_content_hashes_never_reach_the_runs_list_or_the_run_detail(
+    websites_db: Pool, monkeypatch: pytest.MonkeyPatch, user_client: AsyncClient
+) -> None:
+    """[content_hashes stripped]. `content_hashes` is a worker-only key —
+    `runs/service.py`'s `_public_stats` must strip it from both `GET /websites/{id}/runs` and
+    `GET /runs/{id}`, while an ordinary key like `pages_crawled` still reaches both."""
+    website_id, run_id = await _seed_pending_clean_origin(websites_db, "content-hash-hidden")
+    page = _diff_page("/docs/a")
+    _mock_crawl_site(
+        monkeypatch,
+        CrawlResult(
+            pages=[page], stats=_crawl_stats(pages_crawled=1), cap_hit=None, seed_error=None
+        ),
+    )
+
+    outcome = await _execute(websites_db, FakeStorage(), run_id, _unreachable_handler)
+    assert outcome is not None
+
+    list_response = await user_client.get(f"/websites/{website_id}/runs")
+    assert list_response.status_code == 200
+    list_item = next(item for item in list_response.json()["items"] if item["id"] == str(run_id))
+    assert "content_hashes" not in list_item["stats"]
+    assert "pages_crawled" in list_item["stats"]
+
+    detail_response = await user_client.get(f"/runs/{run_id}")
+    assert detail_response.status_code == 200
+    detail_stats = detail_response.json()["stats"]
+    assert "content_hashes" not in detail_stats
+    assert "pages_crawled" in detail_stats
 
 
 # -----------------------------------------------------------------------------------------
@@ -1721,11 +2047,11 @@ async def test_an_unreadable_robots_txt_completes_the_run(websites_db: Pool) -> 
     assert stats["crawl_delay_ms"] == settings.crawl_politeness_delay_ms
 
 
-async def test_stats_version_is_seven(websites_db: Pool) -> None:
-    """[Observability]. A live row lands with `RUN_STATS_VERSION` 7 — the persistence-layer
+async def test_stats_version_is_eight(websites_db: Pool) -> None:
+    """[Observability]. A live row lands with `RUN_STATS_VERSION` 8 — the persistence-layer
     companion to `tests/test_run_stats.py::test_run_stats_version_is_pinned`, which only
     checks the constant itself."""
-    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-seven")
+    _website_id, run_id = await _seed_pending_clean_origin(websites_db, "version-eight")
     storage = FakeStorage()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1739,4 +2065,4 @@ async def test_stats_version_is_seven(websites_db: Pool) -> None:
     row = await websites_db.fetchrow("SELECT stats FROM runs WHERE id = $1", run_id)
     assert row is not None
     stats = json.loads(row["stats"])
-    assert stats["version"] == 7
+    assert stats["version"] == 8

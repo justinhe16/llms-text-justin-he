@@ -41,7 +41,7 @@ export function LandingForm() {
           isAuthLoading={isAuthLoading}
           isBusy={isBusy}
           error={error}
-          onSubmit={submit}
+          onSubmit={(value, enrichWithLlm) => submit(value, enrichWithLlm)}
           onClearError={clearError}
           onRetry={retry}
           onSignIn={signIn}

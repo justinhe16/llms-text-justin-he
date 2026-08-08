@@ -22,7 +22,7 @@ import { getRun, listRuns } from "./runs";
 import type { RunDetail, RunPage } from "./runs";
 import { getSchedule, putSchedule } from "./schedules";
 import type { Schedule } from "./schedules";
-import { createWebsite, deleteWebsite, getWebsite, listWebsites } from "./websites";
+import { createWebsite, deleteWebsite, getWebsite, listWebsites, updateWebsite } from "./websites";
 import type { Website, WebsiteListItem } from "./websites";
 
 // A type-level "is A exactly B" check, not merely "does A extend B" — the latter would let
@@ -55,6 +55,10 @@ export type AssertGetWebsiteReturnsWebsite = Expect<
 
 export type AssertCreateWebsiteReturnsWebsite = Expect<
   Equal<Awaited<ReturnType<typeof createWebsite>>, Website>
+>;
+
+export type AssertUpdateWebsiteReturnsWebsite = Expect<
+  Equal<Awaited<ReturnType<typeof updateWebsite>>, Website>
 >;
 
 // `deleteWebsite` resolves `void`, matching the backend's `204 No Content` — see

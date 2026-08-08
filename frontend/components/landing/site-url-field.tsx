@@ -4,7 +4,9 @@ import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { ArrowRight, LoaderCircle } from "lucide-react";
 
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { ENRICHMENT_HELP, ENRICHMENT_LABEL } from "@/lib/crawls/enrichment-copy";
 import type { AddSiteError } from "@/lib/landing/use-add-site";
 
 type SiteUrlFieldProps = {
@@ -17,7 +19,9 @@ type SiteUrlFieldProps = {
   /** True across the whole create-then-trigger sequence: spinner in, arrow out. */
   isBusy: boolean;
   error: AddSiteError | null;
-  onSubmit: (value: string) => void;
+  /** `enrichWithLlm` is this field's own checkbox state at submit time — see the module
+   *  docstring below for why the checkbox lives here rather than in `useAddSite`. */
+  onSubmit: (value: string, enrichWithLlm: boolean) => void;
   onClearError: () => void;
   onRetry: () => void;
   onSignIn: () => void;
@@ -50,9 +54,15 @@ export function SiteUrlField({
   onSignIn,
 }: SiteUrlFieldProps) {
   const [value, setValue] = useState("");
+  // Owned here, not in `useAddSite`: this is display state for one form control, and the
+  // hook's job is the submit sequence, not the checkbox's own bookkeeping. `useAddSite.retry`
+  // still needs to resend this intent, which is why `submit`/`onSubmit` carry it explicitly
+  // rather than the hook reading it back off this component.
+  const [enrichWithLlm, setEnrichWithLlm] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const hasAutoFocused = useRef(false);
   const messageId = useId();
+  const enrichmentCheckboxId = useId();
 
   // "Input enabled and focused on load." The focus cannot be a plain `autoFocus`: at mount
   // `useUser()` is still resolving and the input is disabled, and a disabled input cannot
@@ -77,7 +87,7 @@ export function SiteUrlField({
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (isDisabled) return;
-    onSubmit(value);
+    onSubmit(value, enrichWithLlm);
   }
 
   return (
@@ -143,6 +153,31 @@ export function SiteUrlField({
             <span className="sr-only">Sign in to add a site</span>
           </button>
         ) : null}
+      </div>
+
+      {/* The opt-in checkbox, under the field and above the live region. Disabled under the
+          same three conditions the field itself is — a checkbox nobody can submit yet is not
+          a useful choice to offer. */}
+      <div className="mt-3 flex items-start gap-2.5 px-1">
+        <Checkbox
+          id={enrichmentCheckboxId}
+          checked={enrichWithLlm}
+          disabled={isDisabled}
+          onCheckedChange={(next) => setEnrichWithLlm(next === true)}
+        />
+        <div className="space-y-0.5">
+          <label
+            htmlFor={enrichmentCheckboxId}
+            className={
+              isDisabled
+                ? "text-sm text-muted-foreground"
+                : "cursor-pointer text-sm text-foreground"
+            }
+          >
+            {ENRICHMENT_LABEL}
+          </label>
+          <p className="text-xs text-muted-foreground">{ENRICHMENT_HELP}</p>
+        </div>
       </div>
 
       {/* A live region that is always present, so a message appearing in it is announced.

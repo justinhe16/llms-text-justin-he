@@ -1,6 +1,6 @@
 """Diffing one run's `llms.txt` index against the previous completed run's — the "what changed
 in the latest run" block the Trends tab reads through `runs.stats["index_diff"]`
-(`internals/run_stats.py`, `RUN_STATS_VERSION` 7).
+(`internals/run_stats.py`, `RUN_STATS_VERSION` 8).
 
 Pure, feature-owned, no I/O — the same category `internals/run_stats.py` and
 `internals/llms_txt.py` already occupy, and for the same reason CLAUDE.md #9 states for
@@ -8,15 +8,22 @@ those two: everything downstream of a fetched page stays behind a model-free sea
 module sits one layer further downstream than either, describing the DIFFERENCE between two
 already-generated artifacts rather than generating one.
 
-**Why this is a diff of two STRINGS, not a diff of two page lists.** `runs.stats` cannot
-afford to carry a stored `indexed_pages: [{url, title}]` list of its own — `_LIST_COLUMNS`
-(`runs/internals/runs_reader.py`) deliberately excludes `llms_txt` from every row of
-`GET /websites/{id}/runs`, a list the Runs tab polls every three seconds while a run is
-active, and re-adding an equivalent list under another name inside `stats` would undo that
-exclusion at up to `crawl_max_pages` entries per row. So this module reads back the ONE
-column that already exists cheaply enough to fetch per run — `runs.llms_txt` itself, "kilobytes
-for any site a crawler actually meets" (`llms_txt.py`'s `MAX_FULL_TEXT_BYTES` docstring) — and
-recovers the page list by parsing it.
+**Why this is a diff of two STRINGS, not a diff of two page lists — and, as of PER-194, not
+ONLY that.** `runs.stats` cannot afford to carry a stored `indexed_pages: [{url, title}]`
+list of its own — `_LIST_COLUMNS` (`runs/internals/runs_reader.py`) deliberately excludes
+`llms_txt` from every row of `GET /websites/{id}/runs`, a list the Runs tab polls every three
+seconds while a run is active, and re-adding an equivalent list under another name inside
+`stats` would undo that exclusion at up to `crawl_max_pages` entries per row. So this module
+reads back the ONE column that already exists cheaply enough to fetch per run —
+`runs.llms_txt` itself, "kilobytes for any site a crawler actually meets" (`llms_txt.py`'s
+`MAX_FULL_TEXT_BYTES` docstring) — and recovers the page list by parsing it.
+`build_content_hashes` below is the one exception to "pure module, no I/O awareness of
+`CrawledPage`": it imports `CrawledPage` from `app.features.crawl.schemas` — a frozen
+dataclass with no I/O of its own — to hash a run's page BODIES as a side-channel alongside
+the parsed-string diff, because a mode flip (enrichment turning on or off) rewrites title and
+description without touching a page's body at all, and that side-channel is what lets this
+module tell "the metadata changed because a different author wrote it" apart from "the page
+itself changed" (see `build_index_diff`'s own docstring).
 
 **Parsing BOTH sides, current and previous, is the part that actually matters.** The tempting
 alternative — build the current run's entry list directly from `artifact_pages`, the same
@@ -34,29 +41,33 @@ in `tests/test_index_diff.py` is the drift gate this trades for: `parse_index` a
 together — see the cross-reference comment on `_bullet` itself.
 """
 
+import hashlib
 import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from app.features.crawl.internals.url_ranking import normalize_url
+from app.features.crawl.schemas import CrawledPage
 
 
 SAMPLE_LIMIT: Final = 10
-"""How many entries `added_sample`/`removed_sample`/`changed_sample` each carry, at most.
+"""How many entries `added_sample`/`removed_sample`/`metadata_changed_sample`/
+`content_changed_sample` each carry, at most.
 
 Sized against `MAX_SAMPLE_TITLE_CHARS` below for the byte budget `runs.stats["index_diff"]`
-adds to a row: three samples times ten entries times (~200 bytes of URL plus up to 120 bytes
-of title) is on the order of 10 KB worst case, 1-2 KB typical — a number worth stating in the
+adds to a row: four samples times ten entries times (~200 bytes of URL plus up to 120 bytes
+of title) is on the order of 13 KB worst case, 1-2 KB typical — a number worth stating in the
 constant it depends on so a future "let's show 50" has to argue against it explicitly, the
-same way `internals/llms_txt.py`'s `MAX_TEXT_CHARS` states what it protects. The true count
-(`pages_added`/`pages_removed`/`pages_changed`) is always recorded beside the sample, so the
-UI never has to say "and more" without a number to put after it."""
+same way `internals/llms_txt.py`'s `MAX_TEXT_CHARS` states what it protects. PER-194 added the
+fourth list; the budget grew with it rather than being quietly left at three. The true count
+(`pages_added`/`pages_removed`/`metadata_changed`/`content_changed`) is always recorded beside
+the sample, so the UI never has to say "and more" without a number to put after it."""
 
 MAX_SAMPLE_TITLE_CHARS: Final = 120
 """How long a sample's `title` may be before it is cut. Deliberately smaller than
 `internals/llms_txt.py`'s `MAX_TEXT_CHARS` (500): that cap bounds ONE title stored once, in
-`runs.llms_txt`; this one bounds up to 30 titles (three sample lists of up to ten) riding
+`runs.llms_txt`; this one bounds up to 40 titles (four sample lists of up to ten) riding
 `RunListItemResponse.stats` on every row of every page of `GET /websites/{id}/runs` — a much
 tighter budget for a much more repeated cost."""
 
@@ -122,6 +133,98 @@ class PreviousIndex:
     `None` when that row predates `RUN_STATS_VERSION` 4 (`internals/run_stats.py`) or the
     value there is not an `int`. `None` here is what makes `urls_discovered_delta` below
     `None` rather than a number computed against a value that was never really there."""
+
+    enrich_applied: bool | None
+    """The previous run's `runs.stats["enrich_applied"]`, read defensively by the caller —
+    `None` when that row predates `RUN_STATS_VERSION` 8 or the value there is not a `bool`
+    (PER-194). **`None` is treated as COMPARABLE, not as "unknown mode"** — see
+    `build_index_diff`'s own docstring for why a pre-version-8 row is assumed to be in the
+    same mode as the current run rather than triggering a not-comparable result on every
+    website's first post-deploy run."""
+
+    content_hashes: dict[str, str] | None
+    """The previous run's `runs.stats["content_hashes"]`, read defensively by the caller —
+    `None` when that row predates `RUN_STATS_VERSION` 8, the value there is not a `dict`, or
+    any key or value in it is not a `str` (PER-194). `None` here is what makes
+    `content_changed` below `None` rather than a count computed against hashes that were
+    never really there — the identical null rule `urls_discovered` above already holds for
+    `urls_discovered_delta`."""
+
+
+CONTENT_HASH_CHARS: Final = 16
+"""How many hex characters of a page's sha256 `build_content_hashes` keeps — 64 bits. This is
+change DETECTION, not a security boundary, so a birthday collision only costs a false
+"unchanged" on two genuinely different bodies that happen to hash the same: at 500 entries
+(comfortably above `Settings.crawl_max_pages`'s default of 100) the collision probability is
+on the order of 7e-15, which is not a number worth spending the other 48 hex characters on."""
+
+
+def build_content_hashes(pages: list[CrawledPage]) -> dict[str, str]:
+    """A `{normalized_url: content_hash}` map of `pages`' bodies — the side-channel
+    `build_index_diff` joins against the previous run's own map (via `PreviousIndex.
+    content_hashes`) to compute `content_changed` independently of whatever a mode flip did
+    to title and description (PER-194).
+
+    **The key is character-identical to `IndexEntry.key`'s own construction** —
+    `normalize_url(page.url) or page.url` — which is what makes the join in `build_index_diff`
+    exact rather than approximate: every key this function emits either matches an
+    `IndexEntry.key` derived from the same URL or matches nothing, and there is no third
+    case where the two normalization rules quietly disagree, because there is only one rule.
+
+    **The value is a truncated sha256**, `hashlib.sha256(page.markdown.encode("utf-8")
+    ).hexdigest()[:CONTENT_HASH_CHARS]` — see `CONTENT_HASH_CHARS` for the collision
+    arithmetic.
+
+    **Populated from every page whose `markdown.strip()` is non-empty — deliberately NOT a
+    branch on `CrawledPage.is_empty`.** ARCHITECTURE.md §3.4 is explicit that
+    `generate_llms_txt` is "the ONE place in the codebase that branches on that flag";
+    `internals/enrich.py`'s own module docstring already refuses the same shortcut for the
+    identical reason, and this function holds the line a third time. The two signals can
+    disagree in both directions — a page can be `is_empty` with non-blank `markdown` (a
+    JavaScript shell whose extracted body is short but not zero) or have blank `markdown`
+    while `is_empty` is `False` in principle — and reading `is_empty` here would make this
+    function's population rule silently depend on `internals/extract.py`'s `MIN_BODY_CHARS`
+    threshold instead of on its own stated one.
+
+    **The key set is therefore a SUPERSET of the index** `parse_index` recovers from this same
+    run's `llms.txt` — `generate_llms_txt` additionally omits an empty page from the artifact
+    entirely, so a page with (say) ten characters of markdown can appear here and never appear
+    as an `IndexEntry`. That is safe by construction: `build_index_diff` intersects this map's
+    keys with `current_keys & previous_keys` before counting anything, so an extra key here
+    simply never joins to anything and is silently ignored, and no `IndexEntry` can ever lack
+    a corresponding hash (the index's population rule is strictly narrower than this one).
+
+    **Sized like `SAMPLE_LIMIT` above bounds its own budget.** One entry per page with
+    non-empty markdown, each entry roughly a normalized URL (~100-200 bytes) plus 16 hex
+    characters, bounded by `Settings.crawl_max_pages` (default 100) — on the order of 10 KB
+    typical, ~22 KB worst case for a run at the cap. That is real enough to matter on a
+    row the Runs tab polls every three seconds, which is why `runs/service.py`'s
+    `_public_stats` strips this key from every API response before it ever reaches a client;
+    this function itself has no opinion about who reads its output.
+
+    Args:
+        pages: `result.pages` — the run's ORIGINALLY EXTRACTED pages, never `artifact_pages`.
+            Enrichment (`internals/enrich.py`'s `apply_summaries`) rewrites `title` and
+            `description` and nothing else, so the two lists produce identical hashes here —
+            but reading `result.pages` makes "the body fingerprint is mode-independent" a
+            property of the code this function is called with, rather than a coincidence a
+            future refactor could quietly break. See the call site in `crawl/service.py` for
+            the same sentence, repeated at the point where the choice is actually made.
+
+    Returns:
+        A JSON-safe `dict[str, str]` — every key and value is a plain `str` — ready to sit
+        under `"content_hashes"` in the dict `build_run_stats` returns. `{}` for an empty
+        `pages` list, never `None`.
+    """
+    hashes: dict[str, str] = {}
+    for page in pages:
+        stripped = page.markdown.strip()
+        if not stripped:
+            continue
+        key = normalize_url(page.url) or page.url
+        digest = hashlib.sha256(page.markdown.encode("utf-8")).hexdigest()
+        hashes[key] = digest[:CONTENT_HASH_CHARS]
+    return hashes
 
 
 # Mirrors `llms_txt.py`'s `_LABEL_ESCAPES`, in REVERSE order — `_escape_label` replaces
@@ -254,14 +357,19 @@ def _sections_delta(
     return {section: delta for section, delta in sorted(deltas.items()) if delta != 0}
 
 
+MetadataNotComparableReason = Literal["enrichment_enabled", "enrichment_disabled"]
+
+
 def build_index_diff(
     *,
     current_llms_txt: str,
     current_urls_discovered: int,
+    current_enrich_applied: bool,
+    current_content_hashes: dict[str, str],
     previous: PreviousIndex | None,
     previous_run_completed: bool | None,
 ) -> dict[str, Any]:
-    """Build the `index_diff` block `RUN_STATS_VERSION` 7 stores in `runs.stats`.
+    """Build the `index_diff` block `RUN_STATS_VERSION` 8 stores in `runs.stats`.
 
     `previous is None` covers both `previous_run_completed` states that carry no comparison —
     no earlier run at all (`previous_run_completed is None`) and an earlier run that exists
@@ -274,10 +382,42 @@ def build_index_diff(
 
     **Semantics, pinned here because nowhere else states them:**
 
-    * **`pages_changed`** — an entry whose `key` (see `IndexEntry.key`) is present on both
+    * **`metadata_changed`** — an entry whose `key` (see `IndexEntry.key`) is present on both
       sides, with a different `title` **or** a different `description`. A same-key entry
       with both fields byte-identical is neither added, removed, nor changed; it simply
-      is not counted at all, the same way an untouched row does not appear in a diff.
+      is not counted at all, the same way an untouched row does not appear in a diff. Named
+      `metadata_changed`, not `pages_changed` (PER-194's rename): title and description are
+      the ONLY thing enrichment ever rewrites, so this is the one signal a mode flip
+      contaminates, and the honest name says exactly that.
+    * **Why `metadata_changed` is the only signal a mode flip contaminates, and every other
+      signal is reported normally regardless.** Enrichment rewrites title and description and
+      NOTHING else — the URL set, the extracted page bodies, and sitemap discovery are
+      untouched by it (`internals/enrich.py`'s `apply_summaries`). So when
+      `current_enrich_applied` disagrees with the previous run's own `enrich_applied`
+      (`mode_changed` below), a `metadata_changed` count would be comparing text written by
+      two different authors and calling the difference a "change" — every page in the index
+      could show up as changed for no reason a reader could act on. Nothing else has that
+      problem: `pages_added`/`pages_removed`/`urls_discovered_delta`/`sections_delta`/
+      `selection_churn`/`selection_churn_ratio` are all about which URLs the index lists, not
+      about what their bullets say, and a genuine content change is now detectable
+      independently via `content_changed` (below) because `current_content_hashes` fingerprints
+      page BODIES, which enrichment never touches. **Do not suppress the whole diff** — only
+      `metadata_changed` degrades to `None`; everything else in this list is computed and
+      returned exactly as it always was, mode flip or not, which is what
+      `test_a_mode_change_still_reports_a_genuine_content_change` pins.
+    * **`content_changed`** — an entry whose `key` is present in both this run's index AND
+      the previous run's, where `current_content_hashes` and `previous.content_hashes` both
+      have that key and disagree. `None` — never a count — when `previous.content_hashes` is
+      `None` (the previous run predates `RUN_STATS_VERSION` 8, or its hashes were otherwise
+      unreadable): the same "the previous row didn't record it" rule
+      `urls_discovered_delta` already applies to its own predecessor field.
+      Mode-independent by construction, since the hashes it joins are keyed off page bodies
+      `apply_summaries` never rewrites.
+    * **`metadata_not_comparable_reason`** — `None` when `metadata_changed` is a real count;
+      otherwise `"enrichment_enabled"` when this run enriched and the previous one did not
+      (the direction the ticket's own copy describes), or `"enrichment_disabled"` for the
+      mirror case. **An unknown previous mode (`previous.enrich_applied is None`) is treated
+      as COMPARABLE, not as "cannot tell"** — see the "unknown mode" paragraph below.
     * **`selection_churn`** = `pages_added + pages_removed`. **`selection_churn_ratio`** is
       that count divided by `len(current_keys | previous_keys)`, rounded to four decimal
       places, and `None` — never `0.0` — when that union is empty (both indexes have no
@@ -287,16 +427,44 @@ def build_index_diff(
       back from, and the index is the honest, available answer to "what does the crawler now
       consider important."
     * **`sections_delta`** — see `_sections_delta`.
-    * **Samples** (`added_sample`/`removed_sample`/`changed_sample`) — every entry in the
-      corresponding set, sorted by `key`, capped at `SAMPLE_LIMIT`, each title truncated at
-      `MAX_SAMPLE_TITLE_CHARS`. The true count is always recorded alongside the sample
-      (`pages_added` etc.), so a caller displaying "and N more" always has an N.
+    * **`llms_txt_bytes_delta`** — left reported and UNLABELLED even across a mode change.
+      Enrichment rewrites every enriched page's title and description, which shifts the
+      artifact's byte count regardless of whether any page was "added", "removed", or
+      genuinely changed in the sense this module can still measure — this field was already
+      a coarse, whole-artifact number before PER-194 and stays exactly that coarse after it;
+      adding a reason to it would imply a precision this field has never actually had.
+    * **Samples** (`added_sample`/`removed_sample`/`metadata_changed_sample`/
+      `content_changed_sample`) — every entry in the corresponding set, sorted by `key`,
+      capped at `SAMPLE_LIMIT`, each title truncated at `MAX_SAMPLE_TITLE_CHARS`. The true
+      count is always recorded alongside the sample (`pages_added` etc.), so a caller
+      displaying "and N more" always has an N. `metadata_changed_sample` is `[]` — never
+      `null` — when `metadata_changed` is `None`, and `content_changed_sample` is `[]` when
+      `content_changed` is `None`, so a client never has to guard a sample field against a
+      `null` its count field does not also carry.
+
+    **Why an unknown previous mode (`previous.enrich_applied is None`) is treated as
+    comparable rather than not-comparable.** A pre-version-8 row was written back when
+    enrichment was a single deployment-wide flag that defaults OFF — so "assume the same mode
+    as this run" is the assumption that keeps `metadata_changed` reporting normally for every
+    existing website's first run after this deploy, rather than blanking the signal for every
+    site at once on a ticket that, for most of them, changed nothing about how their runs
+    enrich. The one-time cost is real but bounded: a deployment that already had the global
+    flag ON, for a website that opts in for the first time under this ticket, sees exactly one
+    run report every page's metadata as "changed" (because it genuinely was, for that website,
+    on that run) rather than as not-comparable — an artifact of the flag having always applied
+    deployment-wide before this ticket existed, not a defect in this rule.
 
     Args:
         current_llms_txt: This run's freshly generated `llms.txt` — the same string just
             written to `runs.llms_txt`, parsed exactly once, here.
         current_urls_discovered: This run's `runs.stats["urls_discovered"]` value, for
             `urls_discovered_delta` below.
+        current_enrich_applied: This run's own `enrich_applied` (PER-194) — whether at least
+            one page in THIS run's index was enriched. Compared against `previous.
+            enrich_applied` to decide `metadata_not_comparable_reason`.
+        current_content_hashes: This run's own `build_content_hashes(result.pages)` — see
+            that function's own docstring. Joined against `previous.content_hashes` to compute
+            `content_changed`.
         previous: The previous completed run's index and metadata, or `None` — see above.
         previous_run_completed: Threaded straight into the returned dict either way (both the
             `"first_run"` and `"compared"` shapes carry it) — `None` when there is no earlier
@@ -328,14 +496,41 @@ def build_index_diff(
 
     current_keys = current_by_key.keys()
     previous_keys = previous_by_key.keys()
+    common_keys = current_keys & previous_keys
 
     added_keys = sorted(current_keys - previous_keys)
     removed_keys = sorted(previous_keys - current_keys)
-    changed_keys = sorted(
+
+    # THE TWO EXPRESSION SITES `mode_changed` IS READ AT, both inside this dict literal —
+    # kept that way deliberately (see the module's own risk notes / PR description): a
+    # reviewer greps for `mode_changed` and finds every place a mode flip actually changes
+    # behaviour, in one function, with nothing hidden behind an extra layer of indirection.
+    mode_changed = (
+        previous.enrich_applied is not None and previous.enrich_applied != current_enrich_applied
+    )
+    metadata_not_comparable_reason: MetadataNotComparableReason | None = None
+    if mode_changed:
+        metadata_not_comparable_reason = (
+            "enrichment_enabled" if current_enrich_applied else "enrichment_disabled"
+        )
+
+    metadata_changed_keys = sorted(
         key
-        for key in current_keys & previous_keys
+        for key in common_keys
         if (current_by_key[key].title, current_by_key[key].description)
         != (previous_by_key[key].title, previous_by_key[key].description)
+    )
+
+    content_changed_keys = (
+        []
+        if previous.content_hashes is None
+        else sorted(
+            key
+            for key in common_keys
+            if key in previous.content_hashes
+            and key in current_content_hashes
+            and previous.content_hashes[key] != current_content_hashes[key]
+        )
     )
 
     urls_discovered_delta = (
@@ -355,13 +550,18 @@ def build_index_diff(
         "compared_to_completed_at": previous.completed_at,
         "pages_added": len(added_keys),
         "pages_removed": len(removed_keys),
-        "pages_changed": len(changed_keys),
+        "metadata_changed": None if mode_changed else len(metadata_changed_keys),
         "added_sample": _sample([current_by_key[key] for key in added_keys]),
         "removed_sample": _sample([previous_by_key[key] for key in removed_keys]),
         # The CURRENT entry, not the previous one — a changed sample shows what the title
         # reads NOW, which is the more useful half of "this page changed" for a reader who
         # cannot see the previous run's text at all.
-        "changed_sample": _sample([current_by_key[key] for key in changed_keys]),
+        "metadata_changed_sample": (
+            [] if mode_changed else _sample([current_by_key[key] for key in metadata_changed_keys])
+        ),
+        "metadata_not_comparable_reason": metadata_not_comparable_reason,
+        "content_changed": (None if previous.content_hashes is None else len(content_changed_keys)),
+        "content_changed_sample": _sample([current_by_key[key] for key in content_changed_keys]),
         "urls_discovered_delta": urls_discovered_delta,
         "sections_delta": _sections_delta(current_entries, previous_entries),
         "selection_churn": selection_churn,

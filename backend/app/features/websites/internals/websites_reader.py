@@ -40,7 +40,9 @@ from app.infrastructure.db.base_repository import Reader
 # The columns of `websites`, in the order `WebsiteResponse` declares them. Named once so
 # the four queries below cannot drift apart, and so adding a column to the DTO produces one
 # edit rather than four.
-_WEBSITE_COLUMNS: Final = "w.id, w.user_id, w.url, w.origin, w.title, w.created_at"
+_WEBSITE_COLUMNS: Final = (
+    "w.id, w.user_id, w.url, w.origin, w.title, w.enrich_with_llm, w.created_at"
+)
 
 # "Most recently active first": the newest run's start time, falling back to when the
 # website was added for one that has never run. Used as the sort key by BOTH list queries,

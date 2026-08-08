@@ -553,6 +553,18 @@ calling an API — and `anthropic_client.py` sits at the top of the feature, bes
 gives: `app/worker/settings.py` has to import it to build the shared client, and `internals/`
 is private to this feature (§3.1).
 
+**PER-194 split the gate: `Settings.crawl_enrich_with_llm` is now the DEPLOYMENT half, and
+`websites.enrich_with_llm` (§6.4) is the WEBSITE half — a run enriches only when both are
+true.** `internals/enrich.py` above is unchanged by this ticket; the two-level check and the
+reason a request went unfulfilled are decided entirely in `CrawlService.execute_run`, which
+reads `website.enrich_with_llm` once, at the top of the attempt, into `enrich_requested`. When
+`enrich_requested` is true and the run still could not enrich, `execute_run` records ONE of
+`"deployment_disabled"` (the flag is off), `"no_api_key"` (the flag is on but this worker
+built no `AsyncAnthropic` client), or `"api_error"` (the pass ran and produced no usable
+summary) in `runs.stats["enrich_unavailable_reason"]`, alongside `enrich_requested` and
+`enrich_applied` — see `internals/run_stats.py`'s `RUN_STATS_VERSION` 8 paragraph for the full
+decision table. The Runs and Output tabs render a badge when a run asked and did not get it.
+
 **Diffing one run's index against the previous completed run's, as of PER-193.**
 `internals/index_diff.py`'s `build_index_diff` is a fourth model-free, pure module in this
 feature, alongside `run_stats.py`, `llms_txt.py`, and `url_ranking.py`. It never sees a
@@ -577,6 +589,30 @@ per-bucket series gains `runs_compared`/`pages_added`/`pages_removed` (real zero
 `index_pages`/`index_bytes` (`null`, never `0`, for a bucket with no completed run to ask), and
 a new `latest` field carries the newest completed run's own diff, window-scoped like
 `last_run_at`.
+
+**PER-194 retrofits this diff onto a world where enrichment can rewrite a page's title and
+description independently of the crawl that found it.** Enrichment touches title and
+description alone, never a page's markdown, the URL set, or discovery — so `pages_changed`/
+`changed_sample` are renamed to `metadata_changed`/`metadata_changed_sample` (the honest name
+for the one signal a mode flip contaminates), and `build_index_diff` gains a body-fingerprint
+side-channel: `build_content_hashes(pages) -> dict[normalized_url, content_hash]`, keyed on
+the SAME `normalize_url` form `IndexEntry.key` already uses, hashing `CrawledPage.markdown` for
+every page with non-empty extracted content (never a branch on `is_empty` — §3.4's "exactly
+one thing branches on it" rule holds a third time). `CrawlService.execute_run` computes it from
+`result.pages`, never `artifact_pages`, right beside `llms_txt_bytes`, and stores it in
+`runs.stats["content_hashes"]` — stripped from every API response (`runs/service.py`'s
+`_public_stats`) because it can run to tens of kilobytes per row on an endpoint the Runs tab
+polls every three seconds. When the current run's `enrich_applied` disagrees with the previous
+run's (a version-8-or-later field; an unknown, pre-version-8 previous mode is treated as
+COMPARABLE, not as unknown, so this costs nothing for a deployment that has never touched
+enrichment), `metadata_changed` reports `null` with a named
+`metadata_not_comparable_reason` (`"enrichment_enabled"` or `"enrichment_disabled"`) — and
+EVERY OTHER signal, `content_changed` (the joined hash comparison) included, still reports
+normally: a mode flip suppresses one field, never the whole diff. `RUN_STATS_VERSION` moves to
+**8** for the four enrichment-intent keys (previous paragraph) and this retrofit together, and
+`RunIndexDiff` (`runs/schemas.py`) uses `AliasChoices` on the two renamed fields so a
+version-7 row — permanent, since this jsonb column is never rewritten — still validates under
+its old key names rather than degrading to `diff_state: "not_recorded"`.
 
 **The bounded execution shell around that seam** lives in `backend/app/features/crawl/`,
 which owns no table and therefore holds no reader/writer pair — a feature with private,
@@ -942,6 +978,7 @@ Three tables, and they are the whole application state:
              │ url           text            │    (no FK — see below)
              │ origin        text            │
              │ title         text NULL       │
+             │ enrich_with_llm bool           │
              │ created_at    timestamptz     │
              │ UNIQUE (user_id, origin)      │
              └───────────────────────────────┘
@@ -971,6 +1008,13 @@ Three tables, and they are the whole application state:
 scheme + host and is the dedupe key. `UNIQUE (user_id, origin)` stops one user adding the
 same site twice while letting two users each add it — it is a dedupe key, not a tenancy
 boundary (§4).
+
+**`enrich_with_llm`** (PER-194) — the owner's intent to have this website's runs ask for
+model-assisted summarization, default `false`. It is HALF of the enrichment gate: a run
+actually enriches only when this column AND the deployment-wide `Settings.crawl_enrich_with_llm`
+are both true (`CrawlService.execute_run`, §3.4's "Model-assisted per-page summarization"
+paragraph). Settable by the owner at any time via `PATCH /websites/{id}` (§10.3); a change
+applies to the NEXT run only, never a run already in flight or already recorded.
 
 **`schedules`** — the recurring-run configuration, at most one per website, enforced by a
 `UNIQUE` on `website_id` rather than by convention. `(active, next_run_at)` is indexed
@@ -1490,6 +1534,7 @@ Plural nouns, nested under their parent, **no version prefix for now**:
 GET    /websites
 POST   /websites
 GET    /websites/{id}
+PATCH  /websites/{id}
 DELETE /websites/{id}
 GET    /websites/{id}/runs
 POST   /websites/{id}/runs
@@ -1503,6 +1548,14 @@ PUT    /websites/{id}/schedule
 
 - Path parameters are `{id}`, not `{website_id}`, when the noun is already in the path.
 - No verbs in paths. `POST /websites/{id}/runs` starts a run; there is no `/start-crawl`.
+- `PATCH /websites/{id}`, not `PUT` (PER-194). `PUT` claims to replace the whole resource, and
+  `UpsertScheduleRequest` earns that verb on `PUT /websites/{id}/schedule` because it carries
+  the schedule's entire mutable state. `websites` is different: five of its six columns are
+  not settable by anyone, so a `PUT` body would misrepresent what the endpoint actually
+  accepts. `PATCH` with a required field (`enrich_with_llm`) says exactly what this endpoint
+  does today — changes one column — without claiming a full-resource replacement it does not
+  perform. A second mutable field is a decision for the ticket that adds it, not a reason to
+  widen this body preemptively.
 - `schedule` is one of two exceptions to "plural nouns": it is a singleton sub-resource, at
   most one per website and enforced as such by `schedules`' `UNIQUE (website_id)` index, so
   there is never a collection of them to name in the plural.
@@ -1556,6 +1609,24 @@ Deliberately not decided here, and not to be decided by accident in an implement
   never existed — see `internals/enrich.py`'s own module docstring for the full argument, and
   `RUN_STATS_VERSION` 5's `enrich_failures` counter for how a reader tells "off" apart from
   "on and lost."
+
+  **PER-194 made the gate two-level and the fallback visible rather than silent.**
+  `Settings.crawl_enrich_with_llm` used to be the whole gate; now it is the deployment's half,
+  and `websites.enrich_with_llm` (owner-settable, default `false`, §6.4) is the other — a run
+  enriches only when both are true. `internals/enrich.py` itself is untouched (deliberately —
+  "do not widen it" is the concrete instruction this ticket followed): `CrawlService.
+  execute_run` is where the two-level decision and the reason it records both live. A run that
+  asked for enrichment and did not get it — the deployment flag off, no `AsyncAnthropic`
+  client built at worker boot, or the pass ran and produced nothing usable — still completes,
+  falls back to extracted metadata exactly as before, and now records ONE of
+  `"deployment_disabled"` / `"no_api_key"` / `"api_error"` in
+  `runs.stats["enrich_unavailable_reason"]` (`RUN_STATS_VERSION` 8), instead of the fallback
+  being indistinguishable from a run that never asked at all. The Runs and Output tabs surface
+  it as a badge. `internals/index_diff.py`'s retrofit is the other half of this ticket: a mode
+  flip (enrichment turning on or off between two compared runs) marks `metadata_changed`
+  not-comparable — title and description are the only thing enrichment ever rewrites — while
+  every other signal, including a new `content_changed` fingerprint of `CrawledPage.markdown`,
+  reports normally regardless of the flip.
 - **Cacheable and shareable artifact URLs.** PER-181 shipped `GET /runs/{id}/llms.txt` and
   `GET /runs/{id}/llms-full.txt` (§10.3), served straight from the `runs.llms_txt` /
   `runs.llms_full_txt` columns. What they deliberately do NOT have is any caching story — no

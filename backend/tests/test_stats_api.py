@@ -57,11 +57,16 @@ def _compared_diff(
     *,
     pages_added: int = 0,
     pages_removed: int = 0,
-    pages_changed: int = 0,
+    metadata_changed: int | None = 0,
+    content_changed: int | None = None,
+    metadata_not_comparable_reason: str | None = None,
     compared_to_run_id: str = "11111111-1111-1111-1111-111111111111",
 ) -> dict[str, Any]:
     """A `"compared"`-shaped `index_diff` block, valid enough to pass `RunIndexDiff.
-    model_validate` — the PER-193 counterpart to this file's other seeded-`stats` helpers."""
+    model_validate` — the PER-193/PER-194 counterpart to this file's other seeded-`stats`
+    helpers, using the current wire field names (`metadata_changed`/`content_changed`) rather
+    than the pre-PER-194 `pages_changed`/`changed_sample` — see `test_stats_api.py`'s own
+    version-7-compat test for the ONE place this suite deliberately builds the old shape."""
     return {
         "state": "compared",
         "previous_run_completed": True,
@@ -69,10 +74,13 @@ def _compared_diff(
         "compared_to_completed_at": "2026-01-01T00:00:00+00:00",
         "pages_added": pages_added,
         "pages_removed": pages_removed,
-        "pages_changed": pages_changed,
+        "metadata_changed": metadata_changed,
         "added_sample": [],
         "removed_sample": [],
-        "changed_sample": [],
+        "metadata_changed_sample": [],
+        "metadata_not_comparable_reason": metadata_not_comparable_reason,
+        "content_changed": content_changed,
+        "content_changed_sample": [],
         "urls_discovered_delta": None,
         "sections_delta": {},
         "selection_churn": pages_added + pages_removed,
@@ -88,14 +96,14 @@ def _stats_with_diff(
     llms_txt_bytes: int = 100,
     index_diff: Any = None,
 ) -> dict[str, Any]:
-    """A `RUN_STATS_VERSION` 7-shaped `stats` dict, carrying only the keys the queries and
+    """A `RUN_STATS_VERSION` 8-shaped `stats` dict, carrying only the keys the queries and
     `_to_latest` under test actually read."""
     return {
         "pages_crawled": pages_crawled,
         "links_emitted": links_emitted,
         "llms_txt_bytes": llms_txt_bytes,
         "index_diff": index_diff,
-        "version": 7,
+        "version": 8,
     }
 
 
@@ -785,6 +793,100 @@ async def test_latest_diff_state_is_compared_and_carries_the_samples(
     assert latest["diff"]["added_sample"] == [
         {"url": "https://example.test/new", "title": "New Page"}
     ]
+    assert latest["diff"]["metadata_changed"] == 0
+    assert latest["diff"]["metadata_not_comparable_reason"] is None
+
+
+async def test_a_not_comparable_metadata_diff_reaches_the_response_as_null_with_a_reason(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    """A mode-flip diff (PER-194) reaches the API with `metadata_changed: null` and a named
+    reason, while every mode-independent field — `pages_added`, `content_changed` — still
+    reports a real number."""
+    website_id = await seed_website(
+        websites_db, TEST_USER_A_ID, "https://stats-not-comparable.example"
+    )
+    diff = _compared_diff(
+        pages_added=1,
+        pages_removed=0,
+        metadata_changed=None,
+        metadata_not_comparable_reason="enrichment_enabled",
+        content_changed=2,
+    )
+
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        completed_at=_NOW,
+        status="completed",
+        stats=_stats_with_diff(index_diff=diff),
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["diff_state"] == "compared"
+    assert latest["diff"]["metadata_changed"] is None
+    assert latest["diff"]["metadata_changed_sample"] == []
+    assert latest["diff"]["metadata_not_comparable_reason"] == "enrichment_enabled"
+    assert latest["diff"]["content_changed"] == 2
+    assert latest["diff"]["pages_added"] == 1
+
+
+async def test_a_version_seven_diff_block_still_validates_and_reports_null_content_changed(
+    user_client: AsyncClient, websites_db: Pool
+) -> None:
+    """Pins the `AliasChoices` decision on `RunIndexDiff` (PER-194): a version-7 row — written
+    before `pages_changed`/`changed_sample` were renamed to `metadata_changed`/
+    `metadata_changed_sample` — must still validate and reach the API as `diff_state ==
+    "compared"`, never silently degrade to `"not_recorded"`. `content_changed`, which a
+    version-7 row never recorded at all, reports `null` rather than `0`."""
+    website_id = await seed_website(websites_db, TEST_USER_A_ID, "https://stats-v7-diff.example")
+    version_7_diff = {
+        "state": "compared",
+        "previous_run_completed": True,
+        "compared_to_run_id": "11111111-1111-1111-1111-111111111111",
+        "compared_to_completed_at": "2026-01-01T00:00:00+00:00",
+        "pages_added": 2,
+        "pages_removed": 1,
+        "pages_changed": 3,
+        "added_sample": [],
+        "removed_sample": [],
+        "changed_sample": [],
+        "urls_discovered_delta": None,
+        "sections_delta": {},
+        "selection_churn": 3,
+        "selection_churn_ratio": None,
+        "llms_txt_bytes_delta": 0,
+    }
+    await seed_run(
+        websites_db,
+        website_id,
+        started_at=_NOW,
+        completed_at=_NOW,
+        status="completed",
+        stats={
+            "pages_crawled": 1,
+            "links_emitted": 1,
+            "llms_txt_bytes": 100,
+            "index_diff": version_7_diff,
+            "version": 7,
+        },
+    )
+
+    response = await user_client.get(f"/websites/{website_id}/stats")
+
+    assert response.status_code == 200
+    latest = response.json()["latest"]
+    assert latest is not None
+    assert latest["diff_state"] == "compared"
+    assert latest["diff"]["metadata_changed"] == 3
+    assert latest["diff"]["content_changed"] is None
+    assert latest["diff"]["content_changed_sample"] == []
+    assert latest["diff"]["metadata_not_comparable_reason"] is None
 
 
 @pytest.mark.parametrize(

@@ -188,7 +188,16 @@ export interface paths {
         delete: operations["delete_website_websites__id__delete"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Update Website
+         * @description Change a website the caller owns — today, only `enrich_with_llm`.
+         *
+         *     `PATCH`, not `PUT`: this endpoint accepts one field of six, and a `PUT` claims to
+         *     replace the whole resource (see `UpdateWebsiteRequest`'s own docstring). `403`, not
+         *     `404`, for a non-owner — the identical reasoning `delete_website` below gives, since
+         *     `GET /websites/{id}` already returns this row to every signed-in user.
+         */
+        patch: operations["update_website_websites__id__patch"];
         trace?: never;
     };
     "/websites/{id}/runs": {
@@ -314,6 +323,12 @@ export interface components {
          * @description Body of `POST /websites`.
          */
         CreateWebsiteRequest: {
+            /**
+             * Enrich With Llm
+             * @description Whether this website's runs ask for model-assisted summarization — a written title and description per page, in place of what is extracted from the page's own markup. This records INTENT, not capability: a run actually enriches only when this is true AND model-assisted summarization is enabled for this deployment (an operator-level setting this API never exposes — see ARCHITECTURE.md §11). A run that asked for enrichment and could not get it still completes, using extracted titles and descriptions, and records why in that run's stats. Mechanism and cost: one Claude Haiku 4.5 call per page, on the first 4,000 characters of its extracted text — on the order of cents for a 100-page run.
+             * @default false
+             */
+            enrich_with_llm: boolean;
             /**
              * Url
              * @description An absolute http:// or https:// URL. Stored as submitted; its normalized origin (lowercased scheme and host, default port and path removed) is what deduplicates it against your existing websites.
@@ -544,12 +559,20 @@ export interface components {
          *     Present on `LatestRunSnapshot.diff` if and only if `diff_state == "compared"`; see that
          *     field's own docstring for why every other state carries `diff: None` instead of this
          *     model with its numeric fields zeroed out.
+         *
+         *     **`AliasChoices` on the two renamed fields is what keeps a version-7 row (written before
+         *     PER-194 renamed `pages_changed` -> `metadata_changed`) validating cleanly.** Those rows
+         *     are permanent — `RUN_STATS_VERSION` never rewrites history — and without the alias every
+         *     one of them would fail `model_validate` and silently degrade `LatestRunSnapshot.diff_state`
+         *     to `"not_recorded"`, with a WARNING logged per row (`runs/service.py`'s `_to_latest`).
+         *     Each `AliasChoices` includes the field's OWN new name first and its old name second, so no
+         *     `populate_by_name` is needed and serialization (what a client actually receives) always
+         *     uses the new name — the wire contract is the new one; only deserialization of an
+         *     already-stored row is bilingual.
          */
         RunIndexDiff: {
             /** Added Sample */
             added_sample: components["schemas"]["IndexPageRef"][];
-            /** Changed Sample */
-            changed_sample: components["schemas"]["IndexPageRef"][];
             /** Compared To Completed At */
             compared_to_completed_at: string | null;
             /**
@@ -557,12 +580,20 @@ export interface components {
              * Format: uuid
              */
             compared_to_run_id: string;
+            /** Content Changed */
+            content_changed?: number | null;
+            /** Content Changed Sample */
+            content_changed_sample?: components["schemas"]["IndexPageRef"][];
             /** Llms Txt Bytes Delta */
             llms_txt_bytes_delta: number;
+            /** Metadata Changed */
+            metadata_changed: number | null;
+            /** Metadata Changed Sample */
+            metadata_changed_sample: components["schemas"]["IndexPageRef"][];
+            /** Metadata Not Comparable Reason */
+            metadata_not_comparable_reason?: ("enrichment_enabled" | "enrichment_disabled") | null;
             /** Pages Added */
             pages_added: number;
-            /** Pages Changed */
-            pages_changed: number;
             /** Pages Removed */
             pages_removed: number;
             /** Removed Sample */
@@ -815,6 +846,26 @@ export interface components {
             status: "pending" | "processing" | "completed" | "failed";
         };
         /**
+         * UpdateWebsiteRequest
+         * @description Body of `PATCH /websites/{id}`.
+         *
+         *     `enrich_with_llm` is required, not optional, because it is currently the ONLY mutable
+         *     field this endpoint accepts — five of `websites`' six columns are not settable by anyone
+         *     (`id`, `user_id`, `url`, `origin`, and `title`, which only a crawl writes). A `PUT` would
+         *     misrepresent what this endpoint actually replaces; `PATCH` reusing `WebsiteResponse` is
+         *     the design this ticket (PER-194) settled on over a schedule-shaped sub-resource, because
+         *     this is a column on `websites`, not an entity with a lifecycle of its own. When a second
+         *     mutable field lands, THAT ticket decides whether both become optional — do not
+         *     preemptively widen this model to guess at that shape now.
+         */
+        UpdateWebsiteRequest: {
+            /**
+             * Enrich With Llm
+             * @description Whether this website's runs ask for model-assisted summarization — a written title and description per page, in place of what is extracted from the page's own markup. This records INTENT, not capability: a run actually enriches only when this is true AND model-assisted summarization is enabled for this deployment (an operator-level setting this API never exposes — see ARCHITECTURE.md §11). A run that asked for enrichment and could not get it still completes, using extracted titles and descriptions, and records why in that run's stats. Mechanism and cost: one Claude Haiku 4.5 call per page, on the first 4,000 characters of its extracted text — on the order of cents for a 100-page run.
+             */
+            enrich_with_llm: boolean;
+        };
+        /**
          * UpsertScheduleRequest
          * @description Body of `PUT /websites/{id}/schedule`.
          *
@@ -913,6 +964,8 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Enrich With Llm */
+            enrich_with_llm: boolean;
             /**
              * Id
              * Format: uuid
@@ -948,6 +1001,8 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Enrich With Llm */
+            enrich_with_llm: boolean;
             /**
              * Id
              * Format: uuid
@@ -1255,6 +1310,41 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_website_websites__id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateWebsiteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebsiteResponse"];
+                };
             };
             /** @description Validation Error */
             422: {

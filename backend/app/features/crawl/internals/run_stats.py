@@ -41,7 +41,7 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
-RUN_STATS_VERSION: Final = 7
+RUN_STATS_VERSION: Final = 8
 """Which definition of this whole dict's shape a stored row was written under — not just
 `links_emitted`'s meaning, but which KEYS a row of this version even has.
 
@@ -211,7 +211,41 @@ trustworthy as every other key in this dict. `RunsReader._WEBSITE_STATS`'s
 `jsonb_typeof(...) = 'number'`/`'object'` guards are what let a query written against
 version-7 rows run harmlessly over the version-1-through-6 rows already in the table, the
 same defensive pattern every earlier version bump in this file already established for its
-own new keys."""
+own new keys.
+
+**Version 8** rows add four keys and redefine nothing (PER-194): `enrich_requested`,
+`enrich_applied`, `enrich_unavailable_reason`, and `content_hashes` are what let a run report
+the per-website enrichment opt-in this ticket adds, and its outcome. `enrich_requested`
+(bool) is `website.enrich_with_llm` AT THE TIME THIS RUN EXECUTED — not the deployment flag,
+which has no per-run record of its own because it cannot change per website.
+`enrich_applied` (bool) is `pages_enriched > 0`: at least one page actually got a
+model-written title and description. `enrich_unavailable_reason` is one of
+`"deployment_disabled"` (the website asked, but `Settings.crawl_enrich_with_llm` is off),
+`"no_api_key"` (the deployment flag is on but this worker process built no Anthropic
+client), `"api_error"` (the pass ran and produced no usable summary), or JSON `null`.
+`content_hashes` (object, `{normalized_url: content_hash}`) is a worker-only side-channel a
+future run's `index_diff` computation joins against — see `internals/index_diff.py`'s
+`build_content_hashes` for exactly what it contains and why, and `runs/service.py`'s
+`_public_stats` for why it never reaches an API response.
+
+**`enrich_applied` cannot be read alone, for the identical reason `pages_enriched` could
+not starting at version 5.** `False` means one of three genuinely different things: the
+website never asked (`enrich_requested` is also `False`), the website asked but enrichment
+was unavailable (`enrich_requested` is `True` and `enrich_unavailable_reason` names why), or
+the website asked, enrichment ran cleanly, and there was nothing to summarize — every page's
+markdown was empty after truncation (`enrich_requested` is `True` and
+`enrich_unavailable_reason` is `None`). `enrich_requested` plus `enrich_unavailable_reason`
+together are what tell those three apart, the same two-field disambiguation version 5's own
+paragraph describes for `pages_enriched`/`enrich_failures`.
+
+**`enrich_unavailable_reason` is `None` on every row where it does not apply, not merely
+absent, whether that is because enrichment was never requested or because it succeeded** —
+the same "absence is recorded as JSON `null`, never a missing key" discipline `index_diff`
+already holds at version 7. A version-7-and-earlier row has no such key at all; a version-8
+row always has one, `null` included, and that `null` is exactly as trustworthy as every other
+value in this dict.
+
+Every version-7 key keeps its version-7 meaning here."""
 
 
 def build_run_stats(
@@ -230,11 +264,16 @@ def build_run_stats(
     enrich_output_tokens: int,
     llms_txt_bytes: int,
     index_diff: dict[str, Any] | None,
+    enrich_requested: bool,
+    enrich_applied: bool,
+    enrich_unavailable_reason: str | None,
+    content_hashes: dict[str, str],
 ) -> dict[str, Any]:
     """Combine `crawl_stats` (from `CrawlResult.stats`) with the two numbers only the
     artifacts know, the three only the discovery step knows, the two only `robots.txt`
     handling knows, the four only the enrichment pass knows, the two only the diff step
-    knows, and `version`, into the exact `dict` `runs.stats` stores.
+    knows, the four only the per-website opt-in gate knows, and `version`, into the exact
+    `dict` `runs.stats` stores.
 
     **A row's `status` and its `index_diff` can disagree about whether an index was ever
     persisted, and that is expected rather than a bug.** `CrawlService.execute_run` computes
@@ -341,14 +380,33 @@ def build_run_stats(
             anything from `internals/index_diff.py`, keeping the same one-way "the caller
             already did the work, this module only assembles the dict" relationship it has
             with every other keyword argument here.
+        enrich_requested: `website.enrich_with_llm` at the time this run executed
+            (PER-194) — whether the OWNER asked for model-assisted summarization, independent
+            of whether the deployment could currently provide it. `False` on every run for a
+            website that never opted in.
+        enrich_applied: `pages_enriched > 0` — whether at least one page actually received a
+            model-written title and description. See `RUN_STATS_VERSION`'s version-8
+            paragraph for why this cannot be read without `enrich_requested` and
+            `enrich_unavailable_reason` beside it.
+        enrich_unavailable_reason: Decided entirely by the caller (`CrawlService.execute_run`)
+            — one of `"deployment_disabled"`, `"no_api_key"`, `"api_error"`, or `None`. `None`
+            both when enrichment applied and when it was never requested; see
+            `RUN_STATS_VERSION`'s version-8 paragraph for the full decision table. This module
+            does not itself decide the reason — it only carries whatever the caller passed.
+        content_hashes: `internals/index_diff.py`'s `build_content_hashes(result.pages)` —
+            a `{normalized_url: content_hash}` map of this run's page bodies, `{}` on every
+            path that never fetched any pages. Worker-only: stripped from every API response
+            by `runs/service.py`'s `_public_stats` before it ever reaches a client.
 
     Returns:
         `crawl_stats` spread first, followed by `links_emitted`, `full_txt_truncated`,
         `discovery_source`, `urls_discovered`, `urls_selected`, `urls_robots_disallowed`,
         `crawl_delay_ms`, `pages_enriched`, `enrich_failures`, `enrich_input_tokens`,
-        `enrich_output_tokens`, `llms_txt_bytes`, `index_diff`, and `version`. `crawl_stats`'s
-        own keys come first and are never overwritten by the fourteen added here, because none
-        of those fourteen names is a key `CrawlResult.stats` has ever produced.
+        `enrich_output_tokens`, `llms_txt_bytes`, `index_diff`, `enrich_requested`,
+        `enrich_applied`, `enrich_unavailable_reason`, `content_hashes`, and `version`.
+        `crawl_stats`'s own keys come first and are never overwritten by the eighteen added
+        here, because none of those eighteen names is a key `CrawlResult.stats` has ever
+        produced.
     """
     stats = {
         **crawl_stats,
@@ -365,6 +423,10 @@ def build_run_stats(
         "enrich_output_tokens": enrich_output_tokens,
         "llms_txt_bytes": llms_txt_bytes,
         "index_diff": index_diff,
+        "enrich_requested": enrich_requested,
+        "enrich_applied": enrich_applied,
+        "enrich_unavailable_reason": enrich_unavailable_reason,
+        "content_hashes": content_hashes,
         "version": RUN_STATS_VERSION,
     }
     # "Generation complete, with stats" — passed as `extra=stats` rather than folded into the
