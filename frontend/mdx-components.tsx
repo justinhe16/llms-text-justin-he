@@ -84,6 +84,14 @@ export function useMDXComponents(components: MDXComponents): MDXComponents {
         {children}
       </pre>
     ),
+    // No `table`/`thead`/`tr`/`th`/`td` entries here, deliberately — they would be dead
+    // code. This map only intercepts elements markdown syntax produces (`## ` becomes
+    // `_components.h2`, blank-line-separated text becomes `_components.p`, and so on); a
+    // `<table>` written as literal HTML in an `.mdx` file compiles straight to a JSX
+    // intrinsic (`_jsx("table", …)`) and never touches this object — confirmed against the
+    // compiled output in `.next/server/app/docs/features/page.js`, not assumed. Features'
+    // tables are styled by `components/docs/docs-table.tsx`'s `DocsTable`, imported and used
+    // like any other component, for exactly that reason.
     // Internal links go through `next/link` so `/crawls` is a client navigation; external
     // ones stay plain anchors and open in a new tab, since leaving the docs to read the
     // llms.txt specification should not lose your place.
