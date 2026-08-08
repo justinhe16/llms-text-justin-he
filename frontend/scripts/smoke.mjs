@@ -61,15 +61,18 @@
  *      Fetch heading after the route-group restructure that moved the run tab under
  *      `app/docs/(run)/`. `next build` has no opinion about a URL fragment; only a real
  *      browser navigation proves the anchor still resolves.
- *  16. `GET /docs/architecture` returns 200, and its diagram renders seven nodes and seven
+ *  16. `GET /docs/architecture` returns 200, and its diagram renders seven nodes and eight
  *      beams — a different count from the pipeline's seven nodes and six beams, because a
- *      topology is a graph and not every node has exactly one neighbour below it.
+ *      topology is a graph and not every node has exactly one neighbour below it. Two of the
+ *      eight run between the same pair of nodes (`redis` and `worker`, one each direction) —
+ *      the queue loop the reviewer asked to see drawn.
  *  17. Every node id in `lib/docs/architecture.ts` resolves to an `h2` on the rendered page —
  *      the same anchor gate as assertion 10, for the second file that can drift the same way.
- *  18. Every topology beam lands on the centres of the nodes ITS EDGE names, paired by the
- *      `data-arch-edges` list rather than by array adjacency. The pipeline's beam *i* always
- *      connects node *i* and node *i+1*; the topology's does not (`api` feeds both `redis`
- *      and `supabase`), so this pairing has to come from the edge list, not from position.
+ *  18. Every topology beam lands on the centres of the nodes ITS EDGE names, offset by that
+ *      edge's `laneOffsetPx` where one is given, paired by the `data-arch-edges` list rather
+ *      than by array adjacency. The pipeline's beam *i* always connects node *i* and node
+ *      *i+1*; the topology's does not (`api` feeds both `redis` and `supabase`), so this
+ *      pairing has to come from the edge list, not from position.
  *  19. The worker→anthropic edge is the only dashed beam. A regression that lost the dash
  *      would silently reclassify a call this deployment never makes as one that happens; a
  *      regression that dashed every beam would make the distinction meaningless.
@@ -523,20 +526,27 @@ async function checkDocs(page) {
   );
 }
 
-/** The `data-arch-edges` container attribute, parsed back into `{ from, to }` pairs. */
+/** The `data-arch-edges` container attribute, parsed back into `{ from, to, offsetX }`
+ *  triples. `offsetX` is the edge's `laneOffsetPx` (0 when the encoding omits it) — the
+ *  worker→redis edge draws a few pixels off the direct line between the two node centres so
+ *  it doesn't sit on top of the redis→worker beam running the opposite way, and this is what
+ *  lets `misalignedArchBeams` tell "drawn where the data says to" from "drawn wrong". */
 function parseArchEdges(edgesAttr) {
   return (edgesAttr ?? "")
     .split(",")
     .filter(Boolean)
     .map((pair) => {
-      const [from, to] = pair.split(">");
-      return { from, to };
+      const [path, offset] = pair.split(":");
+      const [from, to] = path.split(">");
+      return { from, to, offsetX: offset ? Number(offset) : 0 };
     });
 }
 
 /** Every beam's endpoints checked against the centres its edge names, not against array
  *  adjacency — the topology is a graph, so beam *i* does not necessarily connect node *i*
- *  and node *i+1* the way the pipeline's beams do. */
+ *  and node *i+1* the way the pipeline's beams do. An edge's `offsetX` (see `parseArchEdges`)
+ *  shifts the expected x-coordinate at both ends by the same amount, matching the
+ *  `startXOffset`/`endXOffset` `ArchitectureDiagram` feeds `AnimatedBeam` for that one edge. */
 function misalignedArchBeams(diagram) {
   const byId = new Map(diagram.nodes.map((node) => [node.id, node]));
   const edges = parseArchEdges(diagram.edges);
@@ -547,10 +557,11 @@ function misalignedArchBeams(diagram) {
       const from = edge && byId.get(edge.from);
       const to = edge && byId.get(edge.to);
       if (!points || !from || !to) return `beam ${index}: unmeasured (d="${beam.d}")`;
+      const offsetX = edge.offsetX ?? 0;
       const drift = Math.max(
-        Math.abs(points.startX - from.centerX),
+        Math.abs(points.startX - (from.centerX + offsetX)),
         Math.abs(points.startY - from.centerY),
-        Math.abs(points.endX - to.centerX),
+        Math.abs(points.endX - (to.centerX + offsetX)),
         Math.abs(points.endY - to.centerY),
       );
       // One pixel of slack for sub-pixel layout, same tolerance checkDocs uses.
@@ -565,7 +576,7 @@ function misalignedArchBeams(diagram) {
  *  too. */
 async function checkArchitecture(page) {
   const ARCH_NODE_COUNT = 7;
-  const ARCH_BEAM_COUNT = 7;
+  const ARCH_BEAM_COUNT = 8;
 
   const response = await page.goto(`${BASE_URL}/docs/architecture`, { waitUntil: "load" });
   check(
@@ -606,7 +617,7 @@ async function checkArchitecture(page) {
   );
   check(
     arch.beams.length === ARCH_BEAM_COUNT,
-    "/docs/architecture renders seven beams",
+    "/docs/architecture renders eight beams",
     `got ${arch.beams.length}`,
   );
 

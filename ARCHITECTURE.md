@@ -1257,9 +1257,11 @@ the two ways the screen it describes differs from the pipeline's: an explicit
 connections have to be named rather than derived from `length - 1`; and a `column`/`row` on
 every node, because a graph has to be positioned on more than one axis, not just placed next
 in a list. `use-active-section.ts` is used by the pipeline diagram only — the topology's
-node-to-section mapping is many-to-many rather than 1:1 and ordered (the worker node is what
-both "Concurrency" and "Failure handling" are about), so no single node could honestly be
-"the" active one, and `architecture-diagram.tsx` carries no lit state at all.
+node-to-section mapping is nearly 1:1 (each deployed piece gets its own `h2` on
+`app/docs/architecture/page.mdx`), but not quite: the worker node and the Anthropic node both
+point at "ARQ worker", because the Anthropic call is a thing only the worker would make. That
+one remaining overlap is enough that no single node could honestly be "the" active one, so
+`architecture-diagram.tsx` carries no lit state at all.
 
 **Ids that cross a file boundary need a gate, because the compiler will not give you one.**
 `lib/docs/sections.ts` names heading ids; `rehype-slug` (wired in `next.config.ts`) derives

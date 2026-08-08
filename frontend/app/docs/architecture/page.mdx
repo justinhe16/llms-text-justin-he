@@ -20,121 +20,119 @@
        ARCHITECTURE.md does — it does not follow ARCHITECTURE.md's prose, which can itself go
        stale. */}
 
-llms-text runs as four deployed pieces, talking to each other over an HTTP request/response
-path and a queue.
-
 ## Shape
 
-Vercel serves the Next.js App Router and the route handlers under `app/api/[...path]/`.
-Fly.io runs one Docker image as two processes — `app`, the FastAPI service, and `worker`, the
-ARQ job runner — scaled independently of each other. Supabase is Postgres, Auth, and Storage.
-Upstash Redis holds the ARQ queue the worker polls.
+Four deployed pieces: Vercel (Next.js), Fly.io (FastAPI and the ARQ worker, one image), Upstash
+Redis (the job queue), and Supabase (Postgres, Auth, Storage). The worker can call Anthropic to
+summarize a page; `CRAWL_ENRICH_WITH_LLM` is off in production, so it doesn't today — the
+diagram draws that edge dashed, not animated.
 
-The worker can call the Anthropic API to summarize a page. `CRAWL_ENRICH_WITH_LLM` is `false`
-in the deployed service, so it does not — which is why the diagram draws that edge dashed
-rather than animated: nothing travels along it today.
+## Next.js
+
+Vercel. The App Router, and the route handlers under `app/api/[...path]/` that proxy every
+request to FastAPI. That proxy is the only logic here — see **Request path**.
+
+## FastAPI
+
+Fly.io, the `app` process — one of two on the same Docker image as the worker, scaled
+independently. It holds the HTTP API: auth, every read, every write, and enqueuing a triggered
+run into the job queue. It never crawls; that's the worker.
+
+## Job queue
+
+Upstash Redis holds the ARQ queue. A crawl job goes in from two places: someone presses **Run
+now**, or the scheduler tick fires — every 60 seconds, at second 0, claiming up to 50 due
+schedules per pass. Both commit the `runs` row, then enqueue the job, in that order: commit
+first, enqueue second, so a crash between them leaves a `pending` row nothing will act on. The
+reaper sweeps those after 10 minutes — see **Failure handling**.
+
+The worker polls Redis every 5 seconds and claims what's due.
+
+## ARQ worker
+
+Fly.io, the `worker` process. Three things run here, and only here:
+
+- **The crawl** — fetches a site, extracts its pages, writes the two artifacts.
+- **The scheduler tick** — every 60 seconds, turns a due schedule into a run and enqueues it
+  back into the job queue.
+- **The reaper** — every 5 minutes, sweeps stuck runs (see **Failure handling**).
+
+One worker machine runs at most 2 of these at a time (see **Concurrency**).
+
+## Supabase
+
+Postgres, Auth, and Storage. asyncpg runs every query at runtime; Prisma only manages the schema
+and its migrations, never the deployed database. The API and the worker each build their own
+pool of 2 to 10 connections — together up to 20, not 10.
+
+A completed run's `llms.txt` and `llms-full.txt` live directly in `runs` columns (see
+**Trade-offs**). Its full corpus — every page's markdown, gzip-compressed, newline-delimited
+JSON — goes to Storage separately, at `crawl-payloads/{website_id}/{run_id}.jsonl.gz`, uploaded
+before the transaction that records its path: a transaction here never spans a network call.
 
 ## Request path
 
-A browser never calls Fly directly. It requests a same-origin Next.js route under
-`app/api/[...path]/`, which forwards the request to FastAPI, server-side. That proxy is the
-only place a Supabase access token is read from the session and attached to an outbound
-request, and it happens entirely on the server — which is also why there is no CORS
-configuration anywhere in this repository, and why `API_URL` is a server-only variable, never
-prefixed `NEXT_PUBLIC_`.
+A browser never calls Fly directly — only same-origin Next.js. The proxy reads the Supabase
+access token from the session and attaches it to the outbound FastAPI call, entirely
+server-side: that's why there's no CORS configuration anywhere in this repo, and why `API_URL`
+is never prefixed `NEXT_PUBLIC_`.
 
-The proxy bounds the upstream call at 30 seconds and answers `504` itself when that budget
-runs out, rather than letting Vercel's own function-execution limit kill the request
-mid-flight.
-
-## Queueing a run
-
-A run is queued from two entry points. A person presses **Run now**, or a scheduler tick
-fires: it runs every 60 seconds, at second 0, and claims up to 50 due schedules in one pass.
-Both paths do the same two things in the same order — commit the `runs` row, then enqueue the
-job.
-
-That ordering, not the reverse, is where an orphaned `pending` row comes from: a crash between
-the commit and the enqueue leaves a row with nothing acting on it. It is also why the reaper
-sweeps a `pending` run once it has sat unqueued for 10 minutes. The worker itself polls Redis
-for work every 5 seconds.
+The proxy bounds the upstream call at 30 seconds and answers `504` itself when that budget runs
+out, ahead of Vercel's own function-execution limit.
 
 ## Concurrency
 
-The backend runs on asyncio — one event loop per process, and no threads anywhere in it. A
-crawl bounds its own requests in flight with `asyncio.Semaphore(5)`; a politeness gate
-serializes request *starts* 200 ms apart across the whole run, independent of how many
-requests are in flight; and the crawl itself runs inside a 300-second wall-clock timeout, with
-arq's 600-second job timeout behind it as the outer backstop for a job wedged somewhere that
-timeout does not cover.
+The backend runs on asyncio: one event loop per process, no threads. A crawl caps its in-flight
+requests at `asyncio.Semaphore(5)`; a politeness gate serializes request *starts* 200 ms apart,
+independent of how many are in flight. The crawl itself times out at 300 seconds wall-clock;
+arq's 600-second job timeout sits behind it as the backstop for a job wedged somewhere that
+timeout doesn't cover.
 
-Several of those concurrent requests can trip a shared cap — the page count, the byte budget —
-at the same moment. The check-and-set that records which cap fired is lock-free: nothing
-between the check and the set awaits, so the event loop cannot hand control to another task in
-the middle of it, and exactly one cap gets recorded no matter how many tasks reach it
-together.
+Concurrent requests can trip a shared cap — page count, byte budget — at the same instant.
+Recording which one fired is lock-free: nothing between the check and the set awaits, so the
+event loop can't hand off mid-check, and exactly one cap gets recorded no matter how many tasks
+arrive together.
 
-One worker machine runs at most 2 jobs at a time — a crawl, a scheduler tick, and a reaper
-pass all draw from that same limit.
-
-## Data
-
-asyncpg runs every query at runtime. Prisma's job stops at the schema and its migrations — it
-never runs against the production database. Each process, the API and the worker separately,
-builds its own connection pool of 2 to 10, so the two together can hold up to 20 connections
-to Postgres, not 10.
-
-A completed run's two artifacts, `llms.txt` and `llms-full.txt`, live directly in the
-`runs.llms_txt` and `runs.llms_full_txt` text columns. The full fetched corpus — every page's
-markdown, gzip-compressed, newline-delimited JSON — is uploaded to Supabase Storage
-separately, at `crawl-payloads/{website_id}/{run_id}.jsonl.gz`. That upload happens before the
-transaction that records its path, never inside one: a database transaction here never spans a
-network call.
+One worker machine runs at most 2 jobs at a time — a crawl, a scheduler tick, and a reaper pass
+share that limit.
 
 ## Failure handling
 
-A run stuck in `processing` is worse than a run that failed outright. The duplicate guard
-refuses to start a new run for a website while one is already in flight, so a run that never
-finishes blocks that website's every future trigger — each one answers `409` against a run
-that is never coming back.
+A run stuck in `processing` is worse than one that failed outright: the duplicate guard blocks a
+new run for that website while one is in flight, so a run that never finishes blocks every
+future trigger — each answers `409` against a run that isn't coming back.
 
 A run gets 3 attempts. The first two failures defer the next attempt by 10 seconds, then 60.
-A failure is retried only when it is a request timeout, a transport error, or a Storage upload
-failure; everything else — including an exception the classifier has never seen — is treated
-as permanent, on the theory that an unrecognized failure is far more likely to be a bug than a
-blip.
+Retried: request timeouts, transport errors, Storage upload failures. Everything else is
+permanent — even an exception the classifier has never seen — since an unrecognized failure is
+more likely a bug than a blip.
 
-A reaper runs every 5 minutes and cleans up two kinds of stranded run: a `processing` run whose
-worker claimed it more than 15 minutes ago, and a `pending` run more than 10 minutes old with
-nothing behind it. It acts on up to 100 rows per pass.
+A reaper runs every 5 minutes and sweeps two kinds of stranded run: a `processing` run claimed
+more than 15 minutes ago, and a `pending` run more than 10 minutes old with nothing behind it. Up
+to 100 rows per pass.
 
 ## Trade-offs
 
-- **Why asyncio rather than threads or Celery.** The work is I/O — DNS, TCP, TLS, HTTP. One
-  event loop runs five requests concurrently in one thread's memory. ARQ is asyncio-native and
-  shares the process's own loop and its `httpx` client; Celery would add a second broker
-  protocol and a second serialization format for two job types.
-- **Why trafilatura extraction runs on the event loop.** It is synchronous CPU work called
-  from the fetch path, and it blocks the loop for the length of one parse. That is acceptable
-  behind a 200 ms politeness gate at 100 pages: the loop already has 200 ms of slack per page
-  start, and a parse is well under it. What it costs is that one pathological page delays
-  every other request already in flight.
-- **Why discovery stops at the seed page.** The caps bind before depth does — 100 pages, 50
-  MiB, 5 minutes. A second level of links on a typical documentation site produces more URLs
-  than the page cap admits, so recursion would change *which* 100 pages are fetched, not how
-  many; and selection's ranked top 100 of a sitemap beats an arbitrary breadth-first 100.
-- **Why reads are unscoped and only writes are ownership-checked.** This system is not
-  multi-tenant. Read endpoints require a JWT and do not filter by user; write endpoints check
-  ownership as soon as the resource is fetched. The cost, stated plainly: any signed-in caller
-  can read any run's files.
-- **Why artifacts are served from Postgres columns rather than Storage.** Reading one is a
-  query the API already makes. Storage would be a second network call and a signed URL to
-  manage for a value already sitting in the row. What it costs: `llms-full.txt` is bounded at
-  5 MiB, so a single completed run can carry 5 MiB in one column.
-- **What breaks first under 100× load.** The single Fly worker, capped at 2 concurrent jobs.
-  Next, the Postgres connection budget — pool size is set per process, not shared, so the API
-  and the worker each add up to 10 of their own. Then `runs` itself, growing by up to 5 MiB
-  for every completed run.
-- **What would change first.** Artifacts would move to Storage with signed URLs; extraction
-  would move off the event loop; and rate limiting would move to the edge, per user — today's
-  two abuse caps are counted per request and are check-then-act rather than atomic.
+- **Why asyncio, not threads or Celery.** The work is I/O: DNS, TCP, TLS, HTTP. One event loop
+  runs five requests concurrently in one thread. ARQ is asyncio-native and shares the process's
+  own loop and `httpx` client; Celery would add a second broker protocol and format for two job
+  types.
+- **Why extraction runs on the event loop.** trafilatura is synchronous CPU work that blocks the
+  loop for one parse — fine behind a 200 ms politeness gate at 100 pages, since a parse is well
+  under that slack. Cost: one pathological page delays every request already in flight.
+- **Why discovery stops at the seed page.** The caps bind before depth does: 100 pages, 50 MiB,
+  5 minutes. A second link level on a typical doc site already exceeds the page cap, so
+  recursion would change *which* 100 pages get fetched, not how many; a sitemap's ranked top 100
+  beats an arbitrary breadth-first 100.
+- **Why reads are unscoped, writes ownership-checked.** This system isn't multi-tenant. Reads
+  require a JWT and no user filter; writes check ownership as soon as the resource is fetched.
+  Cost: any signed-in caller can read any run's files.
+- **Why artifacts live in Postgres, not Storage.** Reading one is a query the API already makes;
+  Storage would add a network call and a signed URL for a value already in the row. Cost:
+  `llms-full.txt` is capped at 5 MiB, so one completed run can carry 5 MiB in a column.
+- **What breaks first at 100× load.** The single Fly worker, capped at 2 concurrent jobs. Next,
+  the Postgres connection budget: pool size is per process, not shared, so the API and the
+  worker each add up to 10. Then `runs` itself, growing up to 5 MiB per completed run.
+- **What would change first.** Artifacts move to Storage with signed URLs; extraction moves off
+  the event loop; rate limiting moves to the edge, per user. Today's two abuse caps are
+  check-then-act, not atomic.

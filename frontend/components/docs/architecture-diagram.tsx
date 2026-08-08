@@ -9,24 +9,26 @@ import { cn } from "@/lib/utils";
 
 /**
  * The topology diagram in the left column of `/docs/architecture`: seven nodes on a 2-column
- * grid, seven `AnimatedBeam`s between them.
+ * grid, eight `AnimatedBeam`s between them.
  *
  * It is an aid, not the documentation — the same claim `docs-diagram.tsx` makes about the
  * pipeline. The right column is complete prose on its own; delete this component and the tab
- * loses a picture, not a fact. `failure-handling` and `trade-offs` have no node pointing at
- * them for exactly that reason: this diagram draws *what is deployed where*, not a table of
- * contents, and a picture cannot draw a trade-off.
+ * loses a picture, not a fact. `shape`, `concurrency`, `failure-handling` and `trade-offs`
+ * have no node pointing at them for exactly that reason: this diagram draws *what is
+ * deployed where*, not a table of contents, and a picture cannot draw a trade-off.
  *
  * ## No active/lit state
  *
  * `DocsDiagram` lights the node under the reader's scroll position because its mapping from
  * node to section is 1:1 and ordered — stage 3 is always "Selection". This diagram's mapping
- * is many-to-many: the worker node is what "Concurrency" *and* "Failure handling" are about,
- * and "Failure handling" has no node of its own at all. Lighting one node would misstate what
- * the reader is looking at, and lighting three would make `aria-current` mean nothing, so
- * this component carries none. Every node still scrolls on click — the `[Smoke]` gate that
- * gave the pipeline diagram its anchor test applies here too, and a `data-arch-section` only
- * a test reads is a dead relationship no test should be gating.
+ * is nearly that now, but not quite: the worker node and the Anthropic node both point at
+ * `arq-worker`, because the Anthropic call is a thing the worker — and only the worker —
+ * would make. One remaining shared section is enough that no single node could honestly be
+ * "the" active one, so this component still carries no lit state; and the diagram is an aid
+ * rather than a table of contents regardless, so a perfect 1:1 mapping was never the bar.
+ * Every node still scrolls on click — the `[Smoke]` gate that gave the pipeline diagram its
+ * anchor test applies here too, and a `data-arch-section` only a test reads is a dead
+ * relationship no test should be gating.
  *
  * ## The grid, and the empty channel
  *
@@ -41,19 +43,30 @@ import { cn } from "@/lib/utils";
  * ## Explicit edges, not a derived chain
  *
  * `DOCS_SECTIONS.length - 1` gives the pipeline its six beams because a pipeline is a line.
- * This is a graph — `api` feeds both `redis` and `supabase`, and `worker` feeds both
- * `supabase` and `anthropic` — so the connections are named once, explicitly, in
- * `ARCHITECTURE_EDGES`, and nothing here recomputes them.
+ * This is a graph — `api` feeds both `redis` and `supabase`, `worker` feeds both `supabase`
+ * and `anthropic`, and `redis` and `worker` feed each other (the worker claims a job one way;
+ * its own scheduler tick enqueues one back the other way) — so the connections are named
+ * once, explicitly, in `ARCHITECTURE_EDGES`, and nothing here recomputes them.
+ *
+ * ## Two beams, one pair of nodes
+ *
+ * `redis` and `worker` sit in the same grid column, so `redis→worker` and `worker→redis`
+ * would draw on identical paths. `worker→redis` alone carries `laneOffsetPx`, fed to
+ * `AnimatedBeam` as `startXOffset`/`endXOffset` so that one beam draws a few pixels to the
+ * side instead of on top of the other — two parallel lanes, not one line with two pulses
+ * fighting over it. It also carries `reverse`, so its gradient travels worker-to-redis
+ * instead of the default top-to-bottom. `scripts/smoke.mjs`'s alignment check reads the same
+ * offset back off `data-arch-edges` rather than assuming every beam lands dead-centre.
  *
  * ## Why the beams are direct children of the container
  *
  * Same reason as `docs-diagram.tsx`: each `AnimatedBeam` renders one absolutely-positioned
  * `<svg>` spanning the whole container, so it has to sit outside the grid flow against a
  * `relative` parent it can measure. Keeping them as *direct* children gives
- * `scripts/smoke.mjs` an exact selector for the seven beams — `[data-arch-diagram] > svg` —
+ * `scripts/smoke.mjs` an exact selector for the eight beams — `[data-arch-diagram] > svg` —
  * that cannot accidentally pick up the icon `<svg>`s nested inside the buttons.
  * `data-arch-edges` on that same container is a comma-joined, `>`-delimited encoding of
- * `ARCHITECTURE_EDGES` (`"browser>vercel,vercel>api,…"`), built with one
+ * `ARCHITECTURE_EDGES` (`"browser>vercel,vercel>api,…worker>redis:7,…"`), built with one
  * `.map().join(",")` so it cannot drift from the array the beams are actually built from; the
  * smoke test reads it to pair beam *i* in DOM order with edge *i* in this list.
  */
@@ -82,7 +95,10 @@ export function ArchitectureDiagram() {
   );
 
   const edgeAttr = useMemo(
-    () => ARCHITECTURE_EDGES.map((edge) => `${edge.from}>${edge.to}`).join(","),
+    () =>
+      ARCHITECTURE_EDGES.map(
+        (edge) => `${edge.from}>${edge.to}${edge.laneOffsetPx ? `:${edge.laneOffsetPx}` : ""}`,
+      ).join(","),
     [],
   );
 
@@ -122,6 +138,20 @@ export function ArchitectureDiagram() {
             </span>
             <span className="text-xs font-medium text-foreground sm:text-sm">{node.label}</span>
             <span className="text-[0.6875rem] text-muted-foreground">{node.sublabel}</span>
+            {/* Visible, not sr-only: the worker's subitems are the answer to "where does the
+                reaper run?", and that question is exactly what a picture is for. */}
+            {node.subitems ? (
+              <span className="mt-0.5 flex flex-col items-center gap-0.5">
+                {node.subitems.map((item) => (
+                  <span
+                    key={item}
+                    className="rounded-full border border-border/70 bg-muted px-1.5 py-0.5 text-[0.5625rem] leading-none whitespace-nowrap text-muted-foreground"
+                  >
+                    {item}
+                  </span>
+                ))}
+              </span>
+            ) : null}
             {/* The accessible name is the visible label plus this, in that order — never an
                 `aria-label` that replaces it. See `description` in lib/docs/sections.ts for
                 the WCAG 2.5.3 reasoning, repeated verbatim for this diagram. */}
@@ -145,6 +175,9 @@ export function ArchitectureDiagram() {
               orientation="vertical"
               duration={4}
               pathWidth={1.5}
+              reverse={edge.reverse}
+              startXOffset={edge.laneOffsetPx ?? 0}
+              endXOffset={edge.laneOffsetPx ?? 0}
               {...(edge.dashed
                 ? {
                     className: "[&_path]:[stroke-dasharray:4_4]",
