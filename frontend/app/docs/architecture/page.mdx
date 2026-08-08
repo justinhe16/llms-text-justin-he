@@ -9,8 +9,11 @@
 
     2. Every number here is read from the code that enforces it, not from memory: the
        concurrency and byte caps are `Settings` defaults in backend/app/core/settings.py; the
-       job, retry and reaper numbers are backend/app/worker/policy.py. A cap changed there is
-       wrong here until someone edits both.
+       job and reaper numbers are backend/app/worker/policy.py. A cap changed there is wrong
+       here until someone edits both. The retry ladder itself is no longer stated here —
+       Limits on the Features tab is its canonical statement, and this page names only what
+       Failure handling's own argument needs (which errors are retried, and why an unknown
+       one is not) and links there for the counts.
 
     3. This is the PUBLIC rendering of the system's shape. ARCHITECTURE.md is the internal
        engineering contract this codebase is actually held to, and the two are allowed to
@@ -102,10 +105,11 @@ A run stuck in `processing` is worse than one that failed outright: the duplicat
 new run for that website while one is in flight, so a run that never finishes blocks every
 future trigger — each answers `409` against a run that isn't coming back.
 
-A run gets 3 attempts. The first two failures defer the next attempt by 10 seconds, then 60.
-Retried: request timeouts, transport errors, Storage upload failures. Everything else is
-permanent — even an exception the classifier has never seen — since an unrecognized failure is
-more likely a bug than a blip.
+A run gets a fixed number of attempts, each deferred by a longer backoff than the last — see
+[Limits](/docs/features#limits) on the Features tab for the exact counts. Retried: request
+timeouts, transport errors, Storage upload failures. Everything else is permanent — even an
+exception the classifier has never seen — since an unrecognized failure is more likely a bug
+than a blip.
 
 A reaper runs every 5 minutes and sweeps two kinds of stranded run: a `processing` run claimed
 more than 15 minutes ago, and a `pending` run more than 10 minutes old with nothing behind it. Up

@@ -10,9 +10,10 @@ llms-text generates an `llms.txt` file for a website.
     will reliably make.
 
     Every number on this page is read from the code that enforces it, not from memory. The
-    caps in "Limits" are `Settings` defaults in backend/app/core/settings.py; the retry ladder
-    is backend/app/worker/policy.py. A cap changed there is wrong here until someone edits
-    both.
+    caps named under "Fetch" are `Settings` defaults in backend/app/core/settings.py. The
+    complete set of run and account caps — this page states only what Fetch's own argument
+    needs — lives on the Features tab's Limits section now, not here; see that section for
+    why the split exists.
 
     One section states a condition rather than a flat behaviour. "Summarize" is gated by
     `CRAWL_ENRICH_WITH_LLM`, which is `false` in the deployed service — so the sentence that
@@ -104,9 +105,10 @@ selects the same pages.
 
 ## Fetch
 
-Fetching runs under six caps: 100 pages, 5 minutes, 50 MiB, 10 seconds per request, 5
-concurrent requests, and 200 ms between requests, or the site's own `Crawl-delay` where it
-asks for more, up to 10 seconds.
+Fetching runs under a fixed set of caps on page count, total bytes, wall clock, per-request
+timeout and concurrency — the full list is in [Limits](/docs/features#limits) on the Features
+tab. Requests are spaced 200 ms apart, or by the site's own `Crawl-delay` where it asks for
+more, up to a 10 second cap.
 
 Every URL passes an SSRF check before a socket opens. The check requires an `http` or `https`
 scheme, port 80 or 443, and no embedded credentials. It resolves the host and refuses the URL
@@ -164,87 +166,7 @@ Both files are on a finished run's **Output** tab, with line numbers, a **Copy**
 
 Runs are retained. Open an older run from the **Runs** tab to read the file it produced.
 
-## Adding a site
-
-The field on the [home page](/) takes an absolute URL. The URL carries its scheme:
-`https://example.com`. Pressing Enter sends two requests: one registers the website, one
-starts its first run.
-
-The browser then opens the site's page with a run showing as **pending**. That page updates
-itself as the run progresses. Nothing needs refreshing.
-
-Submitting a URL the account already holds opens that site. The **Run now** button on a site's
-page starts another run at any time.
-
-## Schedules
-
-A schedule repeats a run without a person pressing anything. A website carries at most one
-schedule, set through `PUT /websites/{id}/schedule`. Four intervals are available: hourly,
-every 6 hours, daily, and weekly.
-
-A scheduler tick runs every 60 seconds and claims up to 50 due schedules. Each fire time after
-the first is offset by up to ±5% of the interval. That is about ±3 minutes on an hourly
-schedule and ±72 minutes on a daily one. The offset keeps sites added in one sitting from
-crawling in the same second forever.
-
-A schedule can be switched off without being deleted. Its run history outlives it.
-
-## Limits
-
-Every run executes inside fixed caps, and two more caps apply per account. They are listed
-here so nobody discovers one by hitting it.
-
-**Per run**
-
-- **100 pages** — the most a single run fetches.
-- **50 MiB** — the total downloaded across the run (52,428,800 bytes), counted across
-  discovery and fetching together.
-- **5 minutes** — the crawler's wall clock. The job runner stops a job at 10 minutes.
-
-The page and byte caps are budgets. Reaching one part-way through ends the run with the pages
-already collected, so a large site yields a partial file and a `completed` run.
-
-Three cases fail a run outright. The first is a seed page that cannot be fetched. The second
-is a seed page over the byte cap, which reports "The site's response was too large." The
-third is a seed page the site's own `robots.txt` disallows, which reports "This site's
-robots.txt disallows crawling this URL." and is never fetched at all. A run stopped at 5
-minutes is cut off mid-flight.
-
-A run gets 3 attempts when it fails on a request timeout, a transport error, or a storage
-upload failure. The two retries wait 10 seconds and 60 seconds. Every other failure is
-permanent and ends the run at the first attempt.
-
-**Per account**
-
-- **2 concurrent manual runs** — a third waits for one of them to finish.
-- **50 runs per rolling 24 hours** — counting manual and scheduled runs together.
-
-Exceeding either cap is answered immediately with a message naming the cap. The daily cap also
-reports when it resets. The concurrent cap reports no time, because it clears when a run
-already in flight finishes. The daily cap refuses further manual runs while schedules keep
-firing. A busy schedule can therefore spend a budget a manual run is then refused for. Nothing
-is queued behind a cap and nothing is silently dropped.
-
-## API
-
-llms-text is a FastAPI service. It publishes interactive OpenAPI documentation generated from
-the code that serves each endpoint.
-
-Every endpoint requires a Supabase JWT in an `Authorization: Bearer` header. Read endpoints
-are unscoped: a signed-in caller reads every website and every run. Write endpoints check
-ownership and answer `403` to anyone else.
-
-Two endpoints return a run's files as plain text:
-
-- `GET /runs/{id}/llms.txt`
-- `GET /runs/{id}/llms-full.txt`
-
-Each answers `404` while the run is pending, processing, or failed.
-
-{/* A hyperlink a reader clicks, not a request this application makes. ARCHITECTURE.md §8.1
-    ("the browser never calls Fly") is about how this app fetches data — which is always
-    same-origin, through app/api/[...path]/. Nothing on this page fetches anything. */}
-
-[Browse the API documentation](https://llms-text-justin-he.fly.dev/docs)
-
-Running the stack locally, the same document is at `http://localhost:8000/docs`.
+{/* This page ends at Output — the seventh and last pipeline stage. Adding a site,
+    Schedules, Limits and API describe using the product rather than a stage a run passes
+    through, and moved to the Features tab (PER-192) so this page stays exactly the seven
+    stages the diagram in its left column draws. See app/docs/features/page.mdx. */}

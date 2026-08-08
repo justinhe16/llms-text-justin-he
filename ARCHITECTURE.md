@@ -1119,26 +1119,32 @@ never exist only in the README.
 ### 8.1 App Router and the BFF
 
 - **App Router only.** No `pages/` directory.
-- **MDX is for prose pages, and there are two.** `@next/mdx` is wired up in
+- **MDX is for prose pages, and there are three.** `@next/mdx` is wired up in
   `frontend/next.config.ts` — which is why `pageExtensions` lists `ts` and `tsx`
   explicitly: setting that key replaces the default list rather than extending it, and
   omitting them would unroute every other page in the app. `frontend/mdx-components.tsx`
   maps each element onto the palette's own tokens; it sits at the project root under that
   exact name because that is `@next/mdx`'s contract for the App Router, not a filing
-  decision. No remark or rehype plugins, and no `@tailwindcss/typography` — a typography
-  plugin brings its own colour opinions, including the `prose-invert` dark variant §8.5
-  forbids. `app/docs/(run)/page.mdx` ("How a run works") and `app/docs/architecture/page.mdx`
-  ("Architecture") are the two, and they are two *routes*, not one page switching between two
-  bodies — `app/docs/(run)/` is a route group, which keeps the first at `/docs` (a route
-  group's parens are stripped from the URL) while still letting each tab own its own
-  `metadata` and its own left-column layout (`app/docs/(run)/layout.tsx`,
-  `app/docs/architecture/layout.tsx`); `app/docs/layout.tsx` is the thin frame both share —
-  the back link and the tab nav (`components/docs/docs-tabs.tsx`) — and carries no `metadata`
-  of its own. `app/docs/architecture/page.mdx` is the public rendering of this document's own
-  shape, and it is allowed to differ from this document in depth: it documents the shape and
-  the trade-offs for a reader who is not changing this code, not the decisions and their
-  history that this file exists to hold. A third prose page is fine; a docs *site* (sidebar,
-  search, version switcher) is a different ticket.
+  decision. No `@tailwindcss/typography` — a typography plugin brings its own colour
+  opinions, including the `prose-invert` dark variant §8.5 forbids.
+  `app/docs/(run)/page.mdx` ("How a run works"), `app/docs/architecture/page.mdx`
+  ("Architecture") and `app/docs/features/page.mdx` ("Features", PER-192 — usage-focused:
+  the website/run/schedule object model, adding a site, schedules, Trends, the canonical
+  limits table, and the API) are the three, and they are three *routes*, not one page
+  switching between three bodies — `app/docs/(run)/` is a route group, which keeps that one
+  at `/docs` (a route group's parens are stripped from the URL) while still letting each tab
+  own its own `metadata` and its own left-column layout (`app/docs/(run)/layout.tsx`,
+  `app/docs/architecture/layout.tsx`, `app/docs/features/layout.tsx`); `app/docs/layout.tsx`
+  is the thin frame all three share — the back link and the tab nav
+  (`components/docs/docs-tabs.tsx`) — and carries no `metadata` of its own. The tab nav's
+  *display* order (Features, How a run works, Architecture) is not route order: `/docs`
+  stays the run tab regardless of where it is drawn, because `/docs#fetch` is a published
+  deep link nothing may break — see `docs-tabs.tsx` for the argument in full.
+  `app/docs/architecture/page.mdx` is the public rendering of this document's own shape, and
+  it is allowed to differ from this document in depth: it documents the shape and the
+  trade-offs for a reader who is not changing this code, not the decisions and their history
+  that this file exists to hold. A fourth prose page is fine; a docs *site* (sidebar, search,
+  version switcher) is a different ticket.
 - Route handlers under `app/api/[...path]/` proxy to FastAPI. This is a
   backend-for-frontend: the browser calls same-origin Next.js routes, and Next.js calls Fly
   server-side.
@@ -1198,7 +1204,7 @@ threat model would.
 | `components/magicui/` | Magic UI components |
 | `components/crawls/` | App-specific composites built from the above |
 | `components/landing/` | The landing page's own composites — the URL field and the account chip |
-| `components/docs/` | `/docs`'s own composites — the pipeline diagram, the architecture topology, the tab nav between them, and the brand marks Lucide does not ship |
+| `components/docs/` | `/docs`'s own composites — the pipeline diagram, the architecture topology, the Features tab's in-page contents list, the tab nav between the three, and the brand marks Lucide does not ship |
 | `components/auth/` | Sign-in / sign-out affordances and the client-side identity hook |
 
 Feature composites go in a directory named after the screen they belong to —
@@ -1263,6 +1269,15 @@ point at "ARQ worker", because the Anthropic call is a thing only the worker wou
 one remaining overlap is enough that no single node could honestly be "the" active one, so
 `architecture-diagram.tsx` carries no lit state at all.
 
+`features.ts` is the fifth file, backing the "Features" tab's in-page contents list
+(`components/docs/features-contents.tsx`, PER-192). It is the smallest of the three: no
+diagram to gate an id against a node's position, no beams, no active-section highlighting —
+just the ordered `{id, label}` pairs the list renders as links, in document order, to
+`app/docs/features/page.mdx`'s headings. `FeaturesContents` is a server component for the
+same reason its content is this thin: an `<a href="#id">` needs no click handler and nothing
+here measures the DOM, so — unlike `docs-diagram.tsx` and `architecture-diagram.tsx` — it
+never needed `"use client"`.
+
 **Ids that cross a file boundary need a gate, because the compiler will not give you one.**
 `lib/docs/sections.ts` names heading ids; `rehype-slug` (wired in `next.config.ts`) derives
 those ids from the *text* of the headings in `app/docs/(run)/page.mdx`. Nothing type-checks
@@ -1271,9 +1286,10 @@ the join, so renaming a heading turns a diagram node into a button that scrolls 
 rendered page and fails when an id resolves to no `h2` — the same argument §8.5's smoke test
 makes about rendered output, applied to a string rather than a colour. The same gate covers
 `lib/docs/architecture.ts`'s `sectionId` against `app/docs/architecture/page.mdx`, via
-`data-arch-section` rather than `data-docs-node` — a second file, the same failure mode, the
-same test. A cross-file convention with no gate is a convention that is already broken
-somewhere.
+`data-arch-section` rather than `data-docs-node`, and `lib/docs/features.ts`'s `id` against
+`app/docs/features/page.mdx`, via `data-features-link` — a second and a third file, the same
+failure mode, the same test. A cross-file convention with no gate is a convention that is
+already broken somewhere.
 
 ### 8.5 Light theme only
 

@@ -4,7 +4,7 @@ import { DocsDiagram } from "@/components/docs/docs-diagram";
 
 export const metadata: Metadata = {
   title: "Docs · llms-text",
-  description: "What llms.txt is, the seven stages of a run, and the limits that apply.",
+  description: "What llms.txt is, and the seven stages a run passes through.",
 };
 
 /**
@@ -29,12 +29,25 @@ export const metadata: Metadata = {
  * *document*, so the browser's back/forward scroll restoration keeps working, `scroll-mt-28`
  * on the headings applies, and a link to `/docs#fetch` lands where it should. Giving the
  * right column `overflow-y-auto` would break all three at once.
+ *
+ * ## Why the bottom padding is this large
+ *
+ * `Output` is the last of the seven headings, and clicking its diagram node has to bring
+ * *that heading's own top* to the top of the viewport (`scrollToSection`'s `block: "start"`).
+ * A browser cannot scroll past the end of the document, so if too little page remains below
+ * `Output` once it is at the top of the screen, the scroll stops short and the heading — and
+ * the node lit for it (`use-active-section.ts`'s own docstring names this exact edge case) —
+ * both land wrong. PER-192 moved four sections that used to follow `Output` onto the Features
+ * tab, which is what shortened this page enough to trigger it; this padding is the page's
+ * standing guarantee of scroll room below the last heading, not a one-off tuned to today's
+ * content. `frontend/scripts/smoke.mjs`'s click-to-scroll assertion is what catches a value
+ * too small to still cover it.
  */
 export default function DocsRunLayout({ children }: { children: React.ReactNode }) {
   return (
     <div className="mt-10 grid gap-12 pb-10 lg:grid-cols-[15rem_minmax(0,1fr)] lg:items-start lg:gap-14">
       <DocsDiagram />
-      <div className="min-w-0 max-w-2xl">{children}</div>
+      <div className="min-w-0 max-w-2xl pb-96">{children}</div>
     </div>
   );
 }

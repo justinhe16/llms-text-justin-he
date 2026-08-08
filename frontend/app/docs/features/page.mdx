@@ -1,0 +1,295 @@
+# Features
+
+import { DocsTable } from "@/components/docs/docs-table";
+
+{/* Same three rules as app/docs/(run)/page.mdx and app/docs/architecture/page.mdx, restated
+    rather than linked to because this file is read on its own:
+
+    1. Present tense, no roadmap language — no "not built yet", no "coming soon", no naming
+       of milestones. A public page written against a roadmap goes stale the moment an
+       unrelated change merges, and nobody remembers to come back and fix it.
+
+    2. Every number here is read from the code that enforces it, not from memory: the run
+       caps are `Settings` defaults in backend/app/core/settings.py; the retry ladder is
+       backend/app/worker/policy.py; the Trends windows and their buckets are
+       backend/app/features/runs/internals/stats_window.py. A cap or a window changed there
+       is wrong here until someone edits both.
+
+    3. This tab is the canonical statement of the limits every run and every account run
+       under. How a run works and Architecture each keep only the numbers their own argument
+       needs, and link here rather than restating the full set — see this page's own Limits
+       section for why that split exists and where each number now lives. */}
+
+This tab is what things are, and how you use them: the website/run/schedule model, adding a
+site, keeping it current on a schedule, watching its output change over time, the limits that
+bound every run, and the API underneath all of it. For the seven stages a run passes through,
+see [How a run works](/docs). For what's deployed and why, see
+[Architecture](/docs/architecture).
+
+## Object model
+
+Three objects, and how they relate.
+
+<DocsTable>
+  <thead>
+    <tr>
+      <th>Object</th>
+      <th>Belongs to</th>
+      <th>Cardinality</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Website</td>
+      <td>an account</td>
+      <td>one row per site added</td>
+    </tr>
+    <tr>
+      <td>Schedule</td>
+      <td>a website</td>
+      <td>at most one per website</td>
+    </tr>
+    <tr>
+      <td>Run</td>
+      <td>a website, and optionally the schedule that started it</td>
+      <td>many per website</td>
+    </tr>
+  </tbody>
+</DocsTable>
+
+A run's trigger is `manual` or `scheduled`. Its status moves `pending` → `processing` →
+`completed` or `failed`.
+
+Turning a schedule off, or deleting it, does not touch the runs it already started. A deleted
+schedule's runs keep their own history — only the reference to the schedule is cleared. Run
+history outlives the schedule that produced it.
+
+## Adding a site
+
+The field on the [home page](/) takes an absolute URL. The URL carries its scheme:
+`https://example.com`. Pressing Enter sends two requests: one registers the website, one
+starts its first run.
+
+The browser then opens the site's page with a run showing as **pending**. That page updates
+itself as the run progresses. Nothing needs refreshing.
+
+Submitting a URL the account already holds opens that site. The **Run now** button on a
+site's page starts another run at any time.
+
+## Schedules
+
+A schedule repeats a run without a person pressing anything. A website carries at most one
+schedule, set through `PUT /websites/{id}/schedule`. Four intervals are available: hourly,
+every 6 hours, daily, and weekly.
+
+A scheduler tick runs every 60 seconds and claims up to 50 due schedules. Each fire time
+after the first is offset by up to ±5% of the interval — about ±3 minutes on an hourly
+schedule, ±72 minutes on a daily one. The offset keeps sites added in one sitting from
+crawling in the same second forever.
+
+A schedule can be switched off without being deleted.
+
+## Trends
+
+Trends is the last of four tabs on a website's page (`/crawls/{id}`). As of a recent rework
+it reports on the artifact — what `llms.txt` looks like, and what changed in it — rather than
+on the crawler's own timing.
+
+Four tiles lead the panel, each computed against the previous completed run:
+
+<DocsTable>
+  <thead>
+    <tr>
+      <th>Tile</th>
+      <th>What it shows</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Pages in index</td>
+      <td>the page count of the newest completed run's <code>llms.txt</code></td>
+    </tr>
+    <tr>
+      <td>Added</td>
+      <td>pages in the newest run that weren't in the one before it</td>
+    </tr>
+    <tr>
+      <td>Removed</td>
+      <td>pages in the previous run that aren't in this one</td>
+    </tr>
+    <tr>
+      <td>Changed</td>
+      <td>pages in both runs, with different content</td>
+    </tr>
+  </tbody>
+</DocsTable>
+
+Below the tiles: an **index size** chart (`llms.txt` size per bucket, from the last completed
+run in it), an **index changes** chart (pages added and removed per bucket, from runs that
+recorded a comparison), and an **outcomes** chart (how runs in the window ended — completed,
+failed, or still in progress). A "What changed in the latest run" panel names the added,
+removed and changed pages. Total runs and success rate sit below all of it, in one line
+rather than as tiles of their own.
+
+A **1d / 7d / 14d** switcher above the panel selects the window. The choice lives in the URL
+(`?window=`), so a link to a specific window reopens exactly that view.
+
+<DocsTable>
+  <thead>
+    <tr>
+      <th>Window</th>
+      <th>Span</th>
+      <th>Bucket</th>
+      <th>Buckets</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1d</td>
+      <td>last 24 hours</td>
+      <td>hour</td>
+      <td>24</td>
+    </tr>
+    <tr>
+      <td>7d</td>
+      <td>last 7 days</td>
+      <td>hour</td>
+      <td>168</td>
+    </tr>
+    <tr>
+      <td>14d</td>
+      <td>last 14 days</td>
+      <td>day</td>
+      <td>14</td>
+    </tr>
+  </tbody>
+</DocsTable>
+
+7d is the default. Every bucket, in every window, is a UTC hour or a UTC day — the panel says
+so once rather than converting to the reader's own time zone, so a bucket's label always
+matches the instant it covers.
+
+Each chart decides its own emptiness. The outcomes chart is empty only when the window has no
+runs at all. The index size and index changes charts can still be empty with runs in the
+window — a run whose comparison wasn't recorded, or that predates this window's own history,
+contributes no point to either.
+
+A website that has never been crawled shows a prompt to run one instead of an empty panel.
+That distinction comes from the site's run history, not from this endpoint: every field it
+returns is scoped to the selected window, so on its own it cannot tell "nothing in this
+window" apart from "nothing, ever."
+
+## Limits
+
+Every run executes inside a fixed set of caps, and two more apply per account. This is the
+complete list — [How a run works](/docs) and [Architecture](/docs/architecture) each keep
+only the numbers their own argument needs, and link back here for the rest.
+
+**Per run**
+
+<DocsTable>
+  <thead>
+    <tr>
+      <th>Cap</th>
+      <th>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Pages fetched</td>
+      <td>100</td>
+    </tr>
+    <tr>
+      <td>Total bytes downloaded</td>
+      <td>50 MiB (52,428,800 bytes) — discovery and fetching together</td>
+    </tr>
+    <tr>
+      <td>Wall clock</td>
+      <td>5 minutes (the job runner stops the job at 10)</td>
+    </tr>
+    <tr>
+      <td>Per-request timeout</td>
+      <td>10 seconds</td>
+    </tr>
+    <tr>
+      <td>Concurrent requests</td>
+      <td>5</td>
+    </tr>
+    <tr>
+      <td>Request spacing</td>
+      <td>
+        200 ms, or the site's own <code>Crawl-delay</code>, up to 10 seconds
+      </td>
+    </tr>
+    <tr>
+      <td>Attempts on a retryable failure</td>
+      <td>3</td>
+    </tr>
+    <tr>
+      <td>Retry backoff</td>
+      <td>10 seconds, then 60 seconds</td>
+    </tr>
+  </tbody>
+</DocsTable>
+
+Pages and bytes are budgets, not thresholds that abort the run. Reaching one ends the run with
+what it already has, so a large site yields a partial file and a `completed` run.
+
+Three cases fail a run outright instead: a seed page that cannot be fetched; a seed page over
+the byte cap, which reports "The site's response was too large."; a seed page the site's own
+`robots.txt` disallows, which reports "This site's robots.txt disallows crawling this URL."
+and is never fetched at all. A run stopped at 5 minutes is cut off mid-flight, not failed.
+
+Retries apply to a request timeout, a transport error, or a Storage upload failure. Every
+other failure is permanent — one attempt, then the run fails.
+
+**Per account**
+
+<DocsTable>
+  <thead>
+    <tr>
+      <th>Cap</th>
+      <th>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Concurrent manual runs</td>
+      <td>2 — a third waits for one of them to finish</td>
+    </tr>
+    <tr>
+      <td>Runs per rolling 24 hours</td>
+      <td>50, manual and scheduled together</td>
+    </tr>
+  </tbody>
+</DocsTable>
+
+Exceeding either cap answers immediately, naming the cap. The daily cap also says when it
+resets; the concurrent cap doesn't, because it clears the moment a run already in flight
+finishes. A busy schedule can spend the daily budget a manual run is then refused for —
+schedules keep firing regardless. Nothing is queued behind a cap, and nothing is silently
+dropped.
+
+## API
+
+llms-text is a FastAPI service. It publishes interactive OpenAPI documentation generated from
+the code that serves each endpoint.
+
+Every endpoint requires a Supabase JWT in an `Authorization: Bearer` header. Read endpoints
+are unscoped: a signed-in caller reads every website and every run. Write endpoints check
+ownership and answer `403` to anyone else.
+
+Two endpoints return a run's files as plain text:
+
+- `GET /runs/{id}/llms.txt`
+- `GET /runs/{id}/llms-full.txt`
+
+Each answers `404` while the run is pending, processing, or failed.
+
+{/* A hyperlink a reader clicks, not a request this application makes. ARCHITECTURE.md §8.1
+    ("the browser never calls Fly") is about how this app fetches data — which is always
+    same-origin, through app/api/[...path]/. Nothing on this page fetches anything. */}
+
+[Browse the API documentation](https://llms-text-justin-he.fly.dev/docs)
+
+Running the stack locally, the same document is at `http://localhost:8000/docs`.

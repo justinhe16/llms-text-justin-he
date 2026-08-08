@@ -53,14 +53,16 @@
  * Then the tab nav PER-192 added, and `/docs/architecture`, whose topology is wired to its
  * prose the same string-id way the pipeline is:
  *
- *  14. `/docs`'s tab nav renders two links, `aria-current="page"` on the active one and no
- *      value on the other, with no `role="tablist"` anywhere on the page. A `startsWith`
- *      regression in `DocsTabs` would light both tabs the moment `/docs/architecture`
+ *  14. `/docs`'s tab nav renders three links — Features, How a run works, Architecture, in
+ *      that display order — `aria-current="page"` on the active one and no value on the
+ *      other two, with no `role="tablist"` anywhere on the page. A `startsWith` regression in
+ *      `DocsTabs` would light more than one tab the moment a route nested under `/docs`
  *      existed, and this is the assertion that catches it from the `/docs` side.
  *  15. THE DEEP-LINK GATE: `/docs#fetch` — a published, external link — still lands on the
  *      Fetch heading after the route-group restructure that moved the run tab under
  *      `app/docs/(run)/`. `next build` has no opinion about a URL fragment; only a real
- *      browser navigation proves the anchor still resolves.
+ *      browser navigation proves the anchor still resolves. Also proves Features being drawn
+ *      *first* in the tab nav never made it the index route — `/docs` is still the run tab.
  *  16. `GET /docs/architecture` returns 200, and its diagram renders seven nodes and eight
  *      beams — a different count from the pipeline's seven nodes and six beams, because a
  *      topology is a graph and not every node has exactly one neighbour below it. Two of the
@@ -79,6 +81,20 @@
  *  20. Clicking each of the seven topology nodes scrolls to its section (several nodes share
  *      one — that is expected), the diagram is static under `prefers-reduced-motion:
  *      reduce`, and it renders with no horizontal overflow at 375px, beams still aligned.
+ *  21. The tab nav mirrors assertion 14 on this route: three links, `aria-current="page"` on
+ *      Architecture this time, no value on the other two, still no `role="tablist"`.
+ *
+ * Then `/docs/features`, PER-192's third tab — accepted scope creep the author approved,
+ * overriding the ticket's own "out of scope: a third tab" — a contents list rather than a
+ * diagram, since there is no graph to draw for "what things are":
+ *
+ *  22. `GET /docs/features` returns 200 and its headings render.
+ *  23. Every link in the contents list (`lib/docs/features.ts`'s ids, rendered by
+ *      `FeaturesContents`) resolves to a real `h2` on the page — the same anchor gate as
+ *      assertions 10 and 17, for the third file that can drift the same way, gated by
+ *      `data-features-link` rather than `data-docs-node`/`data-arch-node`.
+ *  24. The tab nav renders here too: three links, `aria-current="page"` on Features — the
+ *      leftmost position — no value on the other two, still no `role="tablist"`.
  *
  * USAGE
  *
@@ -487,7 +503,9 @@ async function checkDocs(page) {
     { name: "prefers-reduced-motion", value: "no-preference" },
   ]);
 
-  // 14. The tab nav is two links, aria-current on the active one, and no tablist anywhere.
+  // 14. The tab nav is three links — Features, How a run works, Architecture, in that
+  //     display order — aria-current on the active one (How a run works, index 1, since
+  //     `/docs` itself is not Features — see docs-tabs.tsx), and no tablist anywhere.
   const tabs = await page.evaluate(() =>
     [...document.querySelectorAll("[data-docs-tab]")].map((a) => ({
       tag: a.tagName,
@@ -499,12 +517,13 @@ async function checkDocs(page) {
     () => document.querySelector('[role="tablist"]') !== null,
   );
   check(
-    tabs.length === 2 &&
-      tabs[0]?.current === "page" &&
-      tabs[1]?.current === null &&
+    tabs.length === 3 &&
+      tabs[0]?.current === null &&
+      tabs[1]?.current === "page" &&
+      tabs[2]?.current === null &&
       tabs.every((tab) => tab.tag === "A") &&
       !hasTablist,
-    "/docs renders two tab links with aria-current on the active one and no role=tablist",
+    "/docs renders three tab links with aria-current on the active one and no role=tablist",
     JSON.stringify(tabs),
   );
 
@@ -672,8 +691,8 @@ async function checkArchitecture(page) {
     JSON.stringify(arch.beams.map((beam) => beam.dash)),
   );
 
-  // Tab nav on this route — mirror of checkDocs's assertion 14: aria-current="page" here,
-  // absent on /docs, and still no role=tablist.
+  // Tab nav on this route — mirror of checkDocs's assertion 14: three links, aria-current
+  // on Architecture (index 2) this time, absent on the other two, still no role=tablist.
   const tabs = await page.evaluate(() =>
     [...document.querySelectorAll("[data-docs-tab]")].map((a) => ({
       tag: a.tagName,
@@ -685,12 +704,13 @@ async function checkArchitecture(page) {
     () => document.querySelector('[role="tablist"]') !== null,
   );
   check(
-    tabs.length === 2 &&
+    tabs.length === 3 &&
       tabs[0]?.current === null &&
-      tabs[1]?.current === "page" &&
+      tabs[1]?.current === null &&
+      tabs[2]?.current === "page" &&
       tabs.every((tab) => tab.tag === "A") &&
       !hasTablist,
-    "/docs/architecture renders two tab links with aria-current on the active one and no role=tablist",
+    "/docs/architecture renders three tab links with aria-current on the active one and no role=tablist",
     JSON.stringify(tabs),
   );
 
@@ -795,6 +815,97 @@ async function checkArchitecture(page) {
     { name: "prefers-color-scheme", value: "light" },
     { name: "prefers-reduced-motion", value: "no-preference" },
   ]);
+}
+
+/** Every link in `/docs/features`'s in-page contents list, and whether its `href` resolves
+ *  to a real heading — the third instance of `probeDiagram`'s anchor-gate argument, shaped
+ *  for a plain list rather than a diagram: no nodes to measure, no beams, just `{id, href,
+ *  headingTag}` per link. `data-features-contents` / `data-features-link` mirror
+ *  `data-docs-diagram`/`data-docs-node` and `data-arch-diagram`/`data-arch-node`. */
+function probeFeaturesContents() {
+  const container = document.querySelector("[data-features-contents]");
+  if (!container) return { container: false, links: [] };
+
+  const links = [...container.querySelectorAll("[data-features-link]")].map((a) => {
+    const id = a.getAttribute("data-features-link");
+    const heading = document.getElementById(id ?? "");
+    return {
+      id,
+      href: a.getAttribute("href"),
+      name: (a.textContent ?? "").trim(),
+      headingTag: heading?.tagName ?? null,
+    };
+  });
+
+  return { container: true, links };
+}
+
+/** Assertions 22-24: `/docs/features`, PER-192's third tab. Run from `main()` immediately
+ *  after `checkArchitecture`, on the same `page`, so the console-error and bad-response
+ *  listeners set up in `main()` cover this route too. */
+async function checkFeatures(page) {
+  const response = await page.goto(`${BASE_URL}/docs/features`, { waitUntil: "load" });
+  check(
+    response?.status() === 200,
+    "GET /docs/features returns 200",
+    `got ${response?.status()}`,
+  );
+
+  await page.evaluate(() => document.fonts.ready);
+
+  const headingCount = await page.evaluate(() => document.querySelectorAll("h2").length);
+  check(headingCount > 0, "/docs/features renders headings", `got ${headingCount} h2 elements`);
+
+  // THE ANCHOR GATE — the same argument as assertions 10 and 17, for the third file that can
+  // drift the same way: lib/docs/features.ts names an id, rehype-slug derives the actual
+  // heading id from app/docs/features/page.mdx's text, and nothing type-checks the join.
+  const contents = await page.evaluate(probeFeaturesContents);
+  if (!contents.container) {
+    check(false, "the /docs/features contents list renders", "no [data-features-contents] in the document");
+  } else {
+    const dead = contents.links.filter((link) => link.headingTag !== "H2");
+    check(
+      dead.length === 0 && contents.links.length > 0,
+      "every contents-list link resolves to an h2 heading",
+      dead.length > 0
+        ? `no <h2 id> for: ${dead.map((link) => link.id).join(", ")} — a heading in ` +
+            "app/docs/features/page.mdx was renamed, or lib/docs/features.ts names an id " +
+            "rehype-slug never generated"
+        : "the contents list rendered no links at all",
+    );
+    check(
+      contents.links.length > 0 && contents.links.every((link) => (link.name ?? "").length > 0),
+      "every contents-list link has visible text",
+      contents.links
+        .filter((link) => !(link.name ?? "").length)
+        .map((link) => link.id)
+        .join(", "),
+    );
+  }
+
+  // Tab nav on this route — mirror of checkDocs's assertion 14: three links, aria-current on
+  // Features (index 0, the leftmost tab) this time, absent on the other two, still no
+  // role=tablist.
+  const tabs = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-docs-tab]")].map((a) => ({
+      tag: a.tagName,
+      href: a.getAttribute("data-docs-tab"),
+      current: a.getAttribute("aria-current"),
+    })),
+  );
+  const hasTablist = await page.evaluate(
+    () => document.querySelector('[role="tablist"]') !== null,
+  );
+  check(
+    tabs.length === 3 &&
+      tabs[0]?.current === "page" &&
+      tabs[1]?.current === null &&
+      tabs[2]?.current === null &&
+      tabs.every((tab) => tab.tag === "A") &&
+      !hasTablist,
+    "/docs/features renders three tab links with aria-current on the active one and no role=tablist",
+    JSON.stringify(tabs),
+  );
 }
 
 async function main() {
@@ -933,6 +1044,10 @@ async function main() {
 
     // `/docs/architecture` — the topology diagram PER-192 added, same page object again.
     await checkArchitecture(page);
+
+    // `/docs/features` — PER-192's third tab, the contents list rather than a diagram, same
+    // page object again.
+    await checkFeatures(page);
 
     check(consoleErrors.length === 0, "no console errors", consoleErrors.join(" | "));
     check(badResponses.length === 0, "every same-origin asset loads", badResponses.join(" | "));
