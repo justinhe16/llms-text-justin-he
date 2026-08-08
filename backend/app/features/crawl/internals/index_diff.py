@@ -52,20 +52,22 @@ from app.features.crawl.schemas import CrawledPage
 
 
 SAMPLE_LIMIT: Final = 10
-"""How many entries `added_sample`/`removed_sample`/`changed_sample` each carry, at most.
+"""How many entries `added_sample`/`removed_sample`/`metadata_changed_sample`/
+`content_changed_sample` each carry, at most.
 
 Sized against `MAX_SAMPLE_TITLE_CHARS` below for the byte budget `runs.stats["index_diff"]`
-adds to a row: three samples times ten entries times (~200 bytes of URL plus up to 120 bytes
-of title) is on the order of 10 KB worst case, 1-2 KB typical — a number worth stating in the
+adds to a row: four samples times ten entries times (~200 bytes of URL plus up to 120 bytes
+of title) is on the order of 13 KB worst case, 1-2 KB typical — a number worth stating in the
 constant it depends on so a future "let's show 50" has to argue against it explicitly, the
-same way `internals/llms_txt.py`'s `MAX_TEXT_CHARS` states what it protects. The true count
-(`pages_added`/`pages_removed`/`pages_changed`) is always recorded beside the sample, so the
-UI never has to say "and more" without a number to put after it."""
+same way `internals/llms_txt.py`'s `MAX_TEXT_CHARS` states what it protects. PER-194 added the
+fourth list; the budget grew with it rather than being quietly left at three. The true count
+(`pages_added`/`pages_removed`/`metadata_changed`/`content_changed`) is always recorded beside
+the sample, so the UI never has to say "and more" without a number to put after it."""
 
 MAX_SAMPLE_TITLE_CHARS: Final = 120
 """How long a sample's `title` may be before it is cut. Deliberately smaller than
 `internals/llms_txt.py`'s `MAX_TEXT_CHARS` (500): that cap bounds ONE title stored once, in
-`runs.llms_txt`; this one bounds up to 30 titles (three sample lists of up to ten) riding
+`runs.llms_txt`; this one bounds up to 40 titles (four sample lists of up to ten) riding
 `RunListItemResponse.stats` on every row of every page of `GET /websites/{id}/runs` — a much
 tighter budget for a much more repeated cost."""
 
