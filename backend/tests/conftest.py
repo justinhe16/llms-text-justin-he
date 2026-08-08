@@ -632,13 +632,26 @@ async def second_user_client(
 # -----------------------------------------------------------------------------------------
 
 
-async def seed_website(pool: Pool, user_id: UUID, origin: str, url: str | None = None) -> UUID:
-    """Insert a website directly, bypassing the API. See the section docstring above."""
+async def seed_website(
+    pool: Pool,
+    user_id: UUID,
+    origin: str,
+    url: str | None = None,
+    *,
+    enrich_with_llm: bool = False,
+) -> UUID:
+    """Insert a website directly, bypassing the API. See the section docstring above.
+
+    `enrich_with_llm` defaults to `False`, matching the column's own default
+    (`db/schema.prisma`), so no existing caller has to change (PER-194).
+    """
     website_id: UUID = await pool.fetchval(
-        "INSERT INTO websites (user_id, url, origin) VALUES ($1, $2, $3) RETURNING id",
+        "INSERT INTO websites (user_id, url, origin, enrich_with_llm) VALUES ($1, $2, $3, $4) "
+        "RETURNING id",
         user_id,
         url or f"{origin}/",
         origin,
+        enrich_with_llm,
     )
     return website_id
 

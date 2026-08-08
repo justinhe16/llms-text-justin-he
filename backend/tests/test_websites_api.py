@@ -80,6 +80,30 @@ async def test_creating_a_website_returns_201_with_the_normalized_origin(
     assert body["created_at"]
 
 
+async def test_creating_a_website_defaults_enrich_with_llm_to_false(
+    user_client: AsyncClient,
+) -> None:
+    """No `enrich_with_llm` in the body — a website's default intent is to NOT enrich, and an
+    existing caller's behaviour must not change (PER-194)."""
+    response = await user_client.post("/websites", json={"url": "https://no-opt-in.example"})
+
+    assert response.status_code == 201
+    assert response.json()["enrich_with_llm"] is False
+
+
+async def test_creating_a_website_with_enrichment_opted_in_stores_true(
+    user_client: AsyncClient,
+) -> None:
+    """The add-site form's checkbox, end to end: `enrich_with_llm: true` on the create body
+    is stored and echoed back."""
+    response = await user_client.post(
+        "/websites", json={"url": "https://opts-in.example", "enrich_with_llm": True}
+    )
+
+    assert response.status_code == 201
+    assert response.json()["enrich_with_llm"] is True
+
+
 async def test_creating_a_duplicate_origin_returns_409_carrying_the_existing_id(
     user_client: AsyncClient,
 ) -> None:
@@ -227,7 +251,7 @@ async def test_a_unique_violation_on_a_different_constraint_is_not_reported_as_a
     _make_the_pre_check_miss_once(monkeypatch)
 
     async def insert_violates_another_constraint(
-        self: WebsitesWriter, user_id: UUID, url: str, origin: str
+        self: WebsitesWriter, user_id: UUID, url: str, origin: str, *, enrich_with_llm: bool
     ) -> dict[str, Any]:
         # `constraint_name` is None here, which is precisely "not the origin index".
         raise UniqueViolationError("duplicate key value violates some other unique constraint")
@@ -322,6 +346,9 @@ async def test_include_latest_run_folds_in_the_newest_run_and_the_schedule(
     body = (await user_client.get("/websites", params={"include": "latest_run"})).json()
     item = next(entry for entry in body if entry["id"] == str(website_id))
 
+    # `enrich_with_llm` is field-by-field on `_to_list_item` — a forgotten `enrich_with_llm=`
+    # there is a runtime pydantic error on this exact endpoint, not a type-checker catch.
+    assert item["enrich_with_llm"] is False
     assert item["latest_run"]["id"] == str(newest)
     assert item["latest_run"]["status"] == "completed"
     assert item["latest_run"]["pages_crawled"] == 42
@@ -502,6 +529,103 @@ async def test_getting_a_malformed_id_returns_422(user_client: AsyncClient) -> N
     assert (await user_client.get("/websites/not-a-uuid")).status_code == 422
 
 
+async def test_a_non_owner_reads_enrich_with_llm_on_get(
+    user_client: AsyncClient, second_user_client: AsyncClient
+) -> None:
+    """Reads stay unscoped: a stranger sees the owner's `enrich_with_llm` intent exactly as
+    the owner does, the same rule `test_a_non_owner_can_read_a_website_by_id` proves for the
+    rest of the row (ARCHITECTURE.md §4.1)."""
+    created = (
+        await user_client.post(
+            "/websites", json={"url": "https://readable-intent.example", "enrich_with_llm": True}
+        )
+    ).json()
+
+    response = await second_user_client.get(f"/websites/{created['id']}")
+
+    assert response.status_code == 200
+    assert response.json()["enrich_with_llm"] is True
+
+
+# -----------------------------------------------------------------------------------------
+# PATCH /websites/{id}
+# -----------------------------------------------------------------------------------------
+
+
+async def test_patching_your_own_website_toggles_enrichment_and_returns_the_updated_row(
+    user_client: AsyncClient,
+) -> None:
+    """The owner's write path, end to end: `false` -> `true`, and the response is the whole
+    updated `WebsiteResponse`, not just the one field."""
+    created = (await user_client.post("/websites", json={"url": "https://toggle.example"})).json()
+    assert created["enrich_with_llm"] is False
+
+    response = await user_client.patch(f"/websites/{created['id']}", json={"enrich_with_llm": True})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enrich_with_llm"] is True
+    assert body["id"] == created["id"]
+    assert body["url"] == created["url"]
+    assert body["origin"] == created["origin"]
+
+
+async def test_patching_another_users_website_is_403_and_the_stored_value_is_unchanged(
+    user_client: AsyncClient, second_user_client: AsyncClient, websites_db: Pool
+) -> None:
+    """Writes are owner-only, and a refused write must not have written anything — the same
+    shape `test_deleting_another_users_website_is_403_and_the_row_survives` already proves
+    for `DELETE`."""
+    created = (
+        await user_client.post("/websites", json={"url": "https://protected-toggle.example"})
+    ).json()
+
+    response = await second_user_client.patch(
+        f"/websites/{created['id']}", json={"enrich_with_llm": True}
+    )
+
+    assert response.status_code == 403
+    stored = await websites_db.fetchval(
+        "SELECT enrich_with_llm FROM websites WHERE id = $1", UUID(created["id"])
+    )
+    assert stored is False
+
+
+async def test_patching_an_unknown_id_returns_404(user_client: AsyncClient) -> None:
+    response = await user_client.patch(f"/websites/{uuid4()}", json={"enrich_with_llm": True})
+    assert response.status_code == 404
+
+
+async def test_patching_with_no_body_is_422(user_client: AsyncClient) -> None:
+    """`enrich_with_llm` is required — there is no partial `PATCH` on this endpoint."""
+    created = (
+        await user_client.post("/websites", json={"url": "https://empty-patch.example"})
+    ).json()
+
+    response = await user_client.patch(f"/websites/{created['id']}", json={})
+
+    assert response.status_code == 422
+
+
+async def test_patching_does_not_create_a_run(user_client: AsyncClient, websites_db: Pool) -> None:
+    """Changing the toggle affects the next run only — it must not trigger one itself
+    (the `[UI — timing]` acceptance criterion's backend half)."""
+    created = (
+        await user_client.post("/websites", json={"url": "https://no-run-on-patch.example"})
+    ).json()
+    before = await websites_db.fetchval(
+        "SELECT count(*) FROM runs WHERE website_id = $1", UUID(created["id"])
+    )
+
+    response = await user_client.patch(f"/websites/{created['id']}", json={"enrich_with_llm": True})
+
+    assert response.status_code == 200
+    after = await websites_db.fetchval(
+        "SELECT count(*) FROM runs WHERE website_id = $1", UUID(created["id"])
+    )
+    assert after == before == 0
+
+
 # -----------------------------------------------------------------------------------------
 # DELETE /websites/{id}
 # -----------------------------------------------------------------------------------------
@@ -564,13 +688,23 @@ async def test_deleting_another_users_website_is_403_and_the_row_survives(
     assert (await second_user_client.get(f"/websites/{created['id']}")).status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("method", "body"),
+    [
+        pytest.param("DELETE", None, id="delete"),
+        pytest.param("PATCH", {"enrich_with_llm": True}, id="update"),
+    ],
+)
 async def test_the_403_body_does_not_name_the_owner(
-    user_client: AsyncClient, second_user_client: AsyncClient
+    user_client: AsyncClient,
+    second_user_client: AsyncClient,
+    method: str,
+    body: dict[str, Any] | None,
 ) -> None:
-    """A refusal says "not yours", never "it belongs to <user>"."""
+    """A refusal says "not yours", never "it belongs to <user>" — on every owner-only write."""
     created = (await user_client.post("/websites", json={"url": "https://quiet.example"})).json()
 
-    response = await second_user_client.delete(f"/websites/{created['id']}")
+    response = await second_user_client.request(method, f"/websites/{created['id']}", json=body)
 
     assert response.status_code == 403
     assert str(TEST_USER_A_ID) not in response.text
@@ -592,6 +726,7 @@ async def test_deleting_an_unknown_id_returns_404(user_client: AsyncClient) -> N
         pytest.param("POST", "/websites", {"url": "https://anon.example"}, id="create"),
         pytest.param("GET", "/websites", None, id="list"),
         pytest.param("GET", f"/websites/{uuid4()}", None, id="get"),
+        pytest.param("PATCH", f"/websites/{uuid4()}", {"enrich_with_llm": True}, id="update"),
         pytest.param("DELETE", f"/websites/{uuid4()}", None, id="delete"),
     ],
 )

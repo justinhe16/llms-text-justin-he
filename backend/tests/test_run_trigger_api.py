@@ -575,6 +575,7 @@ class _VanishingWebsiteService:
             url="https://vanished.example/",
             origin="https://vanished.example",
             title=None,
+            enrich_with_llm=False,
             created_at=_NOW,
         )
 

@@ -393,6 +393,20 @@ class PreviousCompletedIndex:
     is absent (a row that predates `RUN_STATS_VERSION` 4) or is not an `int`. Feeds
     `index_diff["urls_discovered_delta"]`, which is `None` under the same condition."""
 
+    enrich_applied: bool | None
+    """That run's `runs.stats["enrich_applied"]`, read defensively — `None` when the value
+    is absent (a row that predates `RUN_STATS_VERSION` 8) or is not a `bool` (PER-194). Feeds
+    `internals/index_diff.py`'s `build_index_diff`, via `PreviousIndex.enrich_applied` — see
+    that field's own docstring for why `None` here is treated as COMPARABLE rather than as
+    an unknown mode."""
+
+    content_hashes: dict[str, str] | None
+    """That run's `runs.stats["content_hashes"]`, read defensively — `None` when the value is
+    absent, is not a `dict`, or has a non-`str` key or value anywhere in it (PER-194). Feeds
+    `PreviousIndex.content_hashes`, which is `None` under the same condition and makes
+    `index_diff["content_changed"]` `None` rather than a count computed against hashes that
+    were never really there."""
+
 
 def _duration_ms(started_at: datetime, completed_at: datetime | None) -> int | None:
     """`None` while a run is still in flight; otherwise its elapsed time in whole ms.
@@ -445,7 +459,9 @@ def _shared_fields(row: dict[str, Any]) -> dict[str, Any]:
         "started_at": row["started_at"],
         "completed_at": row["completed_at"],
         "duration_ms": _duration_ms(row["started_at"], row["completed_at"]),
-        "stats": _parse_stats(row["stats"]),
+        # Filtered, not raw `_parse_stats` — see `_public_stats`'s own docstring for why
+        # `content_hashes` never reaches an API response.
+        "stats": _public_stats(row["stats"]),
         "error": row["error"],
     }
 
@@ -524,6 +540,51 @@ def _as_int(value: Any) -> int | None:
     nothing and matches the same defensiveness `_parse_stats` already applies to the dict
     itself."""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _as_bool(value: Any) -> bool | None:
+    """`value` if it is genuinely a `bool`, else `None` — the same defensive shape as
+    `_as_int` above, for `runs.stats["enrich_applied"]` (PER-194)."""
+    return value if isinstance(value, bool) else None
+
+
+def _as_content_hashes(value: Any) -> dict[str, str] | None:
+    """`value` if it is a `dict` whose every key and value is a `str`, else `None` — for
+    `runs.stats["content_hashes"]` (PER-194). A malformed map degrades the join
+    `internals/index_diff.py`'s `build_index_diff` performs to `content_changed: None`; it
+    never raises."""
+    if not isinstance(value, dict):
+        return None
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            return None
+    return value
+
+
+# The one key `runs.stats` carries that is never meant to reach an API response (PER-194):
+# `content_hashes` is a `{normalized_url: content_hash}` map, one entry per page with
+# extractable content, bounded by `Settings.crawl_max_pages` — on the order of 10-22 KB per
+# row (`internals/index_diff.py`'s `build_content_hashes` works the arithmetic). The Runs tab
+# polls `GET /websites/{id}/runs` every three seconds; riding that much extra JSON on every
+# row of every tick for a value no UI reads would be pure waste. `_to_latest` and
+# `get_previous_completed_index` below both read named keys off `_parse_stats`'s UNFILTERED
+# result directly — the first genuinely never touches this key, and the second is the one
+# consumer that needs it — so only `_shared_fields`, which becomes `RunListItemResponse.stats`
+# and `RunDetailResponse.stats`, goes through the filter below.
+_WORKER_ONLY_STATS_KEYS: Final = frozenset({"content_hashes"})
+
+
+def _public_stats(raw: Any) -> dict[str, Any] | None:
+    """`_parse_stats(raw)` with every key in `_WORKER_ONLY_STATS_KEYS` removed.
+
+    A second decode is not what "filtered" means here — `_parse_stats` already returns a
+    fresh `dict` per call (via `json.loads`), so building a new one with the worker-only keys
+    left out is the whole operation. `None` in, `None` out, matching `_parse_stats` itself.
+    """
+    parsed = _parse_stats(raw)
+    if parsed is None:
+        return None
+    return {key: value for key, value in parsed.items() if key not in _WORKER_ONLY_STATS_KEYS}
 
 
 def _to_stats(
@@ -1273,11 +1334,15 @@ class RunService:
             "first_run"` branch identically): there is no completed run before this one at
             all, or the nearest completed row has `llms_txt IS NULL` — a completed run with
             no index cannot be compared against, so it is treated the same as none existing.
-            Otherwise it carries that run's id, `completed_at`, `llms_txt`, and a defensively
-            parsed `urls_discovered` (`int` only; `None` for anything else, including a row
-            that predates `RUN_STATS_VERSION` 4 or has unparseable `stats`) — read through
-            `_parse_stats`, the same defensive decoder `_shared_fields` uses for every other
-            read of this column.
+            Otherwise it carries that run's id, `completed_at`, `llms_txt`, and three
+            defensively parsed `stats` fields — `urls_discovered` (`int` only), `enrich_applied`
+            (`bool` only, PER-194), and `content_hashes` (`dict[str, str]` only, PER-194) —
+            `None` for anything else, including a row that predates the `RUN_STATS_VERSION`
+            each one was added at or has unparseable `stats` — read through `_parse_stats`,
+            the same defensive decoder `_shared_fields` uses for every other read of this
+            column (unfiltered here, unlike `_shared_fields`'s own `_public_stats`: this is
+            the one legitimate consumer of `content_hashes` outside the worker path that
+            wrote it).
 
             `previous_run_completed` is a tri-state independent of `previous`: `None` when
             there is no earlier run of ANY status, `False` when the immediately preceding run
@@ -1307,6 +1372,8 @@ class RunService:
                 completed_at=row["completed_at"],
                 llms_txt=row["llms_txt"],
                 urls_discovered=urls_discovered,
+                enrich_applied=_as_bool(stats.get("enrich_applied")),
+                content_hashes=_as_content_hashes(stats.get("content_hashes")),
             ),
             previous_run_completed,
         )

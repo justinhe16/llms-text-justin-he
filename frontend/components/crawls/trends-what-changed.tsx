@@ -2,14 +2,16 @@
 
 import { Skeleton } from "@/components/ui/skeleton";
 import type { StatsIndexDiff, StatsIndexPageRef, StatsLatest } from "@/lib/api/runs";
+import { METADATA_NOT_COMPARABLE } from "@/lib/crawls/enrichment-copy";
 import { signedCount } from "@/lib/crawls/stats-display";
 
 import { EmptyCell } from "./empty-cell";
 import { RelativeTime } from "./relative-time";
 
 /**
- * "What changed in the latest run" — the added/removed/changed page lists for the newest
- * completed run in the selected window, and the secondary metrics beside them (PER-193).
+ * "What changed in the latest run" — the added/removed/content-changed/metadata-changed page
+ * lists for the newest completed run in the selected window, and the secondary metrics beside
+ * them (PER-193, retrofitted for enrichment modes by PER-194).
  *
  * *Mirrors* `ChartCard`'s card shell (`trends-charts.tsx`) for the section/heading/description
  * layout, and `OutputTab`'s "list with an explicit empty state" idiom (`output-tab.tsx`) —
@@ -28,9 +30,21 @@ import { RelativeTime } from "./relative-time";
  * | present | `"compared"` | `false` | the numbers, plus a note that the run before this one didn't complete |
  *
  * Never a zero check: a run that legitimately added, removed, and changed nothing still shows
- * three "No pages …" subsections rather than falling through to one of the messages above,
+ * four "No pages …" subsections rather than falling through to one of the messages above,
  * because that IS a real comparison, and collapsing "compared, nothing changed" into "nothing
  * to compare" would misreport an outcome as an absence of data.
+ *
+ * ## The fourth column, added by PER-194
+ *
+ * Inside the `"compared"` branch, "Titles & descriptions" (`diff.metadata_changed`) can
+ * itself be not-comparable — `null`, with `diff.metadata_not_comparable_reason` naming which
+ * direction an enrichment toggle flipped since the previous run — while "Content changed"
+ * (`diff.content_changed`) is independent of that and reports normally unless the previous
+ * run simply recorded no page fingerprints (`null` with no reason, the same "the previous row
+ * didn't record it" rule `urls_discovered_delta` in the footer already uses). Neither
+ * `null` is a zero: a `null` "Titles & descriptions" cell renders `METADATA_NOT_COMPARABLE`'s
+ * sentence for the direction that flipped, and a `null` "Content changed" cell renders the
+ * same `EmptyCell` treatment `urls_discovered_delta` gets below.
  */
 export function TrendsWhatChanged({ latest }: { latest: StatsLatest | null }) {
   return (
@@ -59,8 +73,8 @@ export function TrendsWhatChangedSkeleton() {
     <div aria-hidden="true" className="rounded-xl border border-border bg-card p-4">
       <Skeleton className="h-4 w-56" />
       <Skeleton className="mt-2 h-3 w-72" />
-      <div className="mt-4 grid gap-4 sm:grid-cols-3">
-        {Array.from({ length: 3 }, (_, index) => (
+      <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }, (_, index) => (
           <div key={index} className="space-y-2">
             <Skeleton className="h-3 w-16" />
             <Skeleton className="h-3 w-full" />
@@ -122,7 +136,7 @@ function ComparedBody({
         </p>
       )}
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <ChangeSection
           title="Added"
           count={diff.pages_added}
@@ -136,10 +150,27 @@ function ComparedBody({
           emptyLabel="No pages removed"
         />
         <ChangeSection
-          title="Changed"
-          count={diff.pages_changed}
-          sample={diff.changed_sample}
+          title="Content changed"
+          // `?? null`/`?? []`: `content_changed`/`content_changed_sample` carry Python-side
+          // defaults (for version-7 row compatibility — `RunIndexDiff`'s own docstring), which
+          // makes openapi-typescript mark them optional even though a live response always
+          // includes them; this is the same defensive read `latest_run`'s own `?? null`
+          // callers already use for a field in the identical shape.
+          count={diff.content_changed ?? null}
+          sample={diff.content_changed_sample ?? []}
           emptyLabel="No pages changed"
+          nullContent={<EmptyCell label="the previous run recorded no page fingerprints" />}
+        />
+        <ChangeSection
+          title="Titles & descriptions"
+          count={diff.metadata_changed}
+          sample={diff.metadata_changed_sample}
+          emptyLabel="No pages changed"
+          nullContent={
+            !diff.metadata_not_comparable_reason
+              ? null
+              : METADATA_NOT_COMPARABLE[diff.metadata_not_comparable_reason]
+          }
         />
       </div>
 
@@ -148,18 +179,39 @@ function ComparedBody({
   );
 }
 
-/** One of the three Added / Removed / Changed lists. */
+/**
+ * One of the four Added / Removed / Content changed / Titles & descriptions lists.
+ *
+ * `count === null` (PER-194: `content_changed`/`metadata_changed` only — `pages_added`/
+ * `pages_removed` are never null) renders `nullContent` in place of both the number in the
+ * heading and the list, which is why it is checked before the `count === 0` empty state: a
+ * `null` count is "not comparable", a `0` count is "compared, and nothing changed" — two
+ * different facts that must never render the same way.
+ */
 function ChangeSection({
   title,
   count,
   sample,
   emptyLabel,
+  nullContent,
 }: {
   title: string;
-  count: number;
+  count: number | null;
   sample: StatsIndexPageRef[];
   emptyLabel: string;
+  /** What to render in place of the count and the list when `count` is `null`. Omitted for
+   * the two fields that are never null. */
+  nullContent?: React.ReactNode;
 }) {
+  if (count === null) {
+    return (
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-foreground">{title}</p>
+        <p className="mt-1 text-xs text-muted-foreground">{nullContent}</p>
+      </div>
+    );
+  }
+
   return (
     <div className="min-w-0">
       <p className="text-xs font-medium text-foreground">

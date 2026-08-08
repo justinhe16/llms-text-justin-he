@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils";
 import { CrawlsError } from "./crawls-error";
 import { EmptyCell } from "./empty-cell";
 import { RelativeTime } from "./relative-time";
+import { RunEnrichmentBadge } from "./run-enrichment-badge";
 import { RunStatusIndicator } from "./run-status-indicator";
 
 /** The five columns, in order. `numeric` right-aligns a column and renders it in tabular
@@ -277,7 +278,10 @@ function RunRow({
         </TableCell>
 
         <TableCell>
-          <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
+          <span className="inline-flex items-center gap-2">
+            <RunStatusIndicator status={rowStatusFromRunStatus(run.status)} />
+            <RunEnrichmentBadge run={run} />
+          </span>
         </TableCell>
 
         <TableCell className="text-right font-mono text-xs tabular-nums">

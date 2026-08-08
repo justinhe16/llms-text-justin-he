@@ -6,11 +6,11 @@ file, and there should never be — the moment a handler needs one of those, the
 in `WebsiteService`.
 
 **Authentication vs. authorization, visible in the signatures.** Every handler takes
-`CurrentUserId`, so every endpoint is `401` without a valid token. Only `delete_website`
-passes that id on to the service, because only writes care who is asking (ARCHITECTURE.md
-§4). `list_websites` and `get_website` take the dependency purely to require a token and
-then deliberately ignore it — reads are authenticated and unscoped, and a `user_id` argument
-threaded into a read service method is how that rule gets broken.
+`CurrentUserId`, so every endpoint is `401` without a valid token. `delete_website` and, as
+of PER-194, `update_website` pass that id on to the service, because only writes care who is
+asking (ARCHITECTURE.md §4). `list_websites` and `get_website` take the dependency purely to
+require a token and then deliberately ignore it — reads are authenticated and unscoped, and
+a `user_id` argument threaded into a read service method is how that rule gets broken.
 """
 
 from typing import Annotated
@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Query, status
 from app.api.deps import CurrentUserId, DbPool
 from app.features.websites.schemas import (
     CreateWebsiteRequest,
+    UpdateWebsiteRequest,
     WebsiteAlreadyExistsResponse,
     WebsiteInclude,
     WebsiteListItemResponse,
@@ -119,6 +120,23 @@ async def get_website(
     the accepted cost of the route contract — nothing here calls `id()`.
     """
     return await service.get_website(id)
+
+
+@router.patch("/websites/{id}", response_model=WebsiteResponse)
+async def update_website(
+    id: UUID,
+    body: UpdateWebsiteRequest,
+    user_id: CurrentUserId,
+    service: WebsiteServiceDep,
+) -> WebsiteResponse:
+    """Change a website the caller owns — today, only `enrich_with_llm`.
+
+    `PATCH`, not `PUT`: this endpoint accepts one field of six, and a `PUT` claims to
+    replace the whole resource (see `UpdateWebsiteRequest`'s own docstring). `403`, not
+    `404`, for a non-owner — the identical reasoning `delete_website` below gives, since
+    `GET /websites/{id}` already returns this row to every signed-in user.
+    """
+    return await service.update_website(id, body, user_id)
 
 
 @router.delete("/websites/{id}", status_code=status.HTTP_204_NO_CONTENT)

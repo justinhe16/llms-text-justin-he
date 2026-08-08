@@ -39,6 +39,22 @@ one way or another, a bad or unreachable model call degrades silently to the det
 artifact `internals/llms_txt.py` has always produced. See `execute_run`'s own comment at the
 call site for exactly where it sits and why nowhere else would do.
 
+**PER-194 turned that flag-gate into a TWO-LEVEL one, and taught this method to say why an
+enrichment request went unfulfilled.** `Settings.crawl_enrich_with_llm` used to be the whole
+gate; now it is one of two conditions `execute_run` reads, the other being the run's own
+website's `enrich_with_llm` column — a run enriches only when BOTH are true. The gate is
+still `if enrich_requested:` first, so a website that never opted in still runs the identical
+no-op branch it always did, and the deployment flag being off is still what keeps this
+codebase's test suite and CI from ever needing a live `ANTHROPIC_API_KEY`, exactly as before.
+What is new is that a website CAN ask for enrichment and not get it — the deployment flag is
+off, no `AsyncAnthropic` client was built at worker boot, or the pass ran and produced nothing
+usable — and every one of those three cases still completes the run, falls back to extracted
+metadata, and records ONE of `"deployment_disabled"` / `"no_api_key"` / `"api_error"` in
+`runs.stats["enrich_unavailable_reason"]`, alongside `enrich_requested`/`enrich_applied`
+(`internals/run_stats.py`'s version-8 paragraph has the full decision table). Deciding the
+reason is entirely this method's job — `internals/enrich.py` itself gets zero edits for this
+ticket, which is the concrete meaning of "do not widen it".
+
 **PER-191: `robots.txt` is obeyed, and this method owns the one shared `PolitenessGate`
 (`internals/fetcher.py`) both discovery and the crawl loop wait on.** `execute_run` builds one
 gate BEFORE calling `discover_sitemap_urls` — at `Settings.crawl_politeness_delay_ms`, the
@@ -61,6 +77,20 @@ index and strictly before the Storage upload. Like enrichment, it CANNOT fail th
 `_build_index_diff` catches every `Exception` the read raises and degrades to `index_diff =
 None`, on the same reasoning enrichment's own belt-and-braces catch gives — a diff is derived
 bookkeeping, and the artifact is the product.
+
+**PER-194 retrofits that diff onto a world where the artifact's title and description can be
+rewritten independently of the URLs it lists.** `index_diff`'s `pages_changed`/`changed_sample`
+are renamed to `metadata_changed`/`metadata_changed_sample`, because title and description are
+the only thing enrichment ever touches, and this method now also computes a body-fingerprint
+side-channel — `internals/index_diff.py`'s `build_content_hashes(result.pages)`, called
+`content_hashes` here, HASHED FROM `result.pages`, NEVER `artifact_pages` — and passes both it
+and this run's own `enrich_applied` into `_build_index_diff`, which threads the previous run's
+own two fields (read alongside `urls_discovered` out of the same `runs.stats` `_build_
+index_diff` already fetches) into `internals/index_diff.py`'s `build_index_diff`. When an
+enrichment mode change is detected, only `metadata_changed` is marked not-comparable; every
+other signal — added, removed, `urls_discovered_delta`, the new `content_changed`,
+`sections_delta`, `selection_churn` — is unaffected and reports normally, because none of them
+depends on what a bullet's title or description says.
 """
 
 import asyncio
@@ -88,7 +118,11 @@ from app.features.crawl.internals.fetcher import (
     FetchError,
     PolitenessGate,
 )
-from app.features.crawl.internals.index_diff import PreviousIndex, build_index_diff
+from app.features.crawl.internals.index_diff import (
+    PreviousIndex,
+    build_content_hashes,
+    build_index_diff,
+)
 from app.features.crawl.internals.links import extract_links
 from app.features.crawl.internals.llms_txt import (
     count_full_txt_truncations,
@@ -442,6 +476,15 @@ class CrawlService:
         # run got, and that now includes whether it got as far as diffing its own index.
         llms_txt_bytes = 0
         index_diff: dict[str, Any] | None = None
+        # PER-194's own hoisted locals, same reasoning: `enrich_requested` is set the moment
+        # the website is fetched (below) and stays whatever it was on every later path;
+        # `enrich_applied` and `enrich_unavailable_reason` stay at their "never asked, never
+        # ran, nothing to report" defaults on every path that never reached the enrichment
+        # gate; `content_hashes` stays `{}` on every path that never fetched a page.
+        enrich_requested = False
+        enrich_applied = False
+        enrich_unavailable_reason: str | None = None
+        content_hashes: dict[str, str] = {}
         outcome: CrawlOutcome | None = None
         # Same hoisting reasoning as the three locals above: a seed failure never reaches the
         # `discover_sitemap_urls`/`select_urls` call below, so `build_run_stats` in that path
@@ -468,6 +511,11 @@ class CrawlService:
         pending_retry: TransientCrawlError | None = None
         try:
             website = await self._websites.get_website(run.website_id)
+            # THE OWNER'S INTENT, read the moment it is known. `enrich_requested` never
+            # changes again after this line, on any path — a run's gate decision is a fact
+            # about the website AT THE START of this attempt, not something that could shift
+            # underneath it if an owner toggled the setting mid-run (PER-194).
+            enrich_requested = website.enrich_with_llm
 
             # Hoisted so the "crawl starting" line below and the `crawl_site` call right
             # after it are guaranteed to describe the same caps — building `CrawlLimits`
@@ -620,6 +668,10 @@ class CrawlService:
                         enrich_output_tokens=enrich_output_tokens,
                         llms_txt_bytes=llms_txt_bytes,
                         index_diff=index_diff,
+                        enrich_requested=enrich_requested,
+                        enrich_applied=enrich_applied,
+                        enrich_unavailable_reason=enrich_unavailable_reason,
+                        content_hashes=content_hashes,
                     ),
                 )
             else:
@@ -635,44 +687,74 @@ class CrawlService:
                 # may be opened around it (ARCHITECTURE.md §5.1) — this call sits in the same
                 # network-calls-outside-every-transaction window the Storage upload already
                 # occupies, between the atomic claim and `RunService.record_success`.
+                #
+                # THE TWO-LEVEL GATE (PER-194). `enrich_requested` alone used to be enough to
+                # decide whether to call the model — now it is only the OWNER'S half of the
+                # question, and `if enrich_requested:` is what makes the deployment flag off
+                # (or the website never having opted in) byte-identical to today: with
+                # `enrich_requested` `False`, nothing below this line runs, `artifact_pages`
+                # stays `result.pages`, and every counter below stays at its hoisted default —
+                # the identical no-op this branch was before this ticket existed. Only once a
+                # website HAS asked does this branch look at whether the deployment can
+                # actually provide it, and record which of the three reasons it could not, if
+                # any.
                 artifact_pages = result.pages
-                if self._settings.crawl_enrich_with_llm and self._anthropic is not None:
-                    try:
-                        enrichment = await enrich_pages(
-                            self._anthropic, result.pages, settings=self._settings
-                        )
-                    except Exception:
-                        # BELT-AND-BRACES. `enrich_pages` itself never raises for an API
-                        # reason (its own module docstring), so reaching this branch means a
-                        # bug in `internals/enrich.py` rather than an ordinary model failure —
-                        # and this codebase's rule is still "a model can never fail a run"
-                        # (ARCHITECTURE.md §11), so that has to be true structurally, not
-                        # merely true as long as that module stays bug-free. `artifact_pages`
-                        # is left at `result.pages`, exactly the fallback a per-page failure
-                        # inside `enrich_pages` already produces, so this branch and that one
-                        # are indistinguishable to everything downstream of it.
-                        #
-                        # `asyncio.CancelledError` is a `BaseException`, not an `Exception`,
-                        # and is therefore DELIBERATELY NOT caught by this clause — arq's job
-                        # timeout and a deploy's SIGTERM still reach this method's own
-                        # `except asyncio.CancelledError` handler unchanged, exactly as they
-                        # would if this call were not here at all.
-                        logger.error("crawl: enrichment failed unexpectedly", exc_info=True)
+                if enrich_requested:
+                    if not self._settings.crawl_enrich_with_llm:
+                        enrich_unavailable_reason = "deployment_disabled"
+                    elif self._anthropic is None:
+                        enrich_unavailable_reason = "no_api_key"
                     else:
-                        artifact_pages = apply_summaries(result.pages, enrichment.summaries)
-                        pages_enriched = len(enrichment.summaries)
-                        enrich_failures = enrichment.failures
-                        enrich_input_tokens = enrichment.input_tokens
-                        enrich_output_tokens = enrichment.output_tokens
-                        logger.info(
-                            "crawl: enrichment complete",
-                            extra={
-                                "pages_enriched": pages_enriched,
-                                "enrich_failures": enrich_failures,
-                                "enrich_input_tokens": enrich_input_tokens,
-                                "enrich_output_tokens": enrich_output_tokens,
-                            },
-                        )
+                        try:
+                            enrichment = await enrich_pages(
+                                self._anthropic, result.pages, settings=self._settings
+                            )
+                        except Exception:
+                            # BELT-AND-BRACES. `enrich_pages` itself never raises for an API
+                            # reason (its own module docstring), so reaching this branch means
+                            # a bug in `internals/enrich.py` rather than an ordinary model
+                            # failure — and this codebase's rule is still "a model can never
+                            # fail a run" (ARCHITECTURE.md §11), so that has to be true
+                            # structurally, not merely true as long as that module stays
+                            # bug-free. `artifact_pages` is left at `result.pages`, exactly the
+                            # fallback a per-page failure inside `enrich_pages` already
+                            # produces, so this branch and that one are indistinguishable to
+                            # everything downstream of it.
+                            #
+                            # `asyncio.CancelledError` is a `BaseException`, not an
+                            # `Exception`, and is therefore DELIBERATELY NOT caught by this
+                            # clause — arq's job timeout and a deploy's SIGTERM still reach
+                            # this method's own `except asyncio.CancelledError` handler
+                            # unchanged, exactly as they would if this call were not here at
+                            # all.
+                            logger.error("crawl: enrichment failed unexpectedly", exc_info=True)
+                            enrich_unavailable_reason = "api_error"
+                        else:
+                            artifact_pages = apply_summaries(result.pages, enrichment.summaries)
+                            pages_enriched = len(enrichment.summaries)
+                            enrich_failures = enrichment.failures
+                            enrich_input_tokens = enrichment.input_tokens
+                            enrich_output_tokens = enrichment.output_tokens
+                            enrich_applied = pages_enriched > 0
+                            # A run that requested enrichment, ran the pass cleanly, and had
+                            # NOTHING to send — every page's markdown was empty after
+                            # truncation — is `enrich_applied=False, reason=None`: nothing
+                            # failed, there was simply nothing to summarize. Only a request
+                            # that was attempted and produced no usable summary earns
+                            # `"api_error"` here.
+                            if not enrich_applied and enrich_failures > 0:
+                                enrich_unavailable_reason = "api_error"
+                            logger.info(
+                                "crawl: enrichment complete",
+                                extra={
+                                    "pages_enriched": pages_enriched,
+                                    "enrich_failures": enrich_failures,
+                                    "enrich_input_tokens": enrich_input_tokens,
+                                    "enrich_output_tokens": enrich_output_tokens,
+                                    "enrich_applied": enrich_applied,
+                                    "enrich_unavailable_reason": enrich_unavailable_reason,
+                                },
+                            )
 
                 # All four calls are pure and none touches the network, so generating the
                 # artifacts here — before the upload, and long before any transaction — costs
@@ -693,7 +775,21 @@ class CrawlService:
                 # `llms_txt` and `urls_discovered`, both already in hand, so there is no
                 # reason to delay it behind work it does not depend on.
                 llms_txt_bytes = len(llms_txt.encode())
-                index_diff = await self._build_index_diff(run, run_id, llms_txt, urls_discovered)
+                # `result.pages`, never `artifact_pages` — enrichment rewrites title and
+                # description and never markdown, so the two produce identical hashes here,
+                # but reading the original, pre-enrichment list is what makes "the body
+                # fingerprint is mode-independent" a property of this code rather than a
+                # coincidence a future refactor could quietly break (`build_content_hashes`'s
+                # own docstring makes the same point from the other side).
+                content_hashes = build_content_hashes(result.pages)
+                index_diff = await self._build_index_diff(
+                    run,
+                    run_id,
+                    llms_txt,
+                    urls_discovered,
+                    content_hashes=content_hashes,
+                    enrich_applied=enrich_applied,
+                )
 
                 llms_full_txt = generate_llms_full_txt(artifact_pages)
                 links_emitted = count_indexed_pages(artifact_pages)
@@ -742,6 +838,10 @@ class CrawlService:
                     enrich_output_tokens=enrich_output_tokens,
                     llms_txt_bytes=llms_txt_bytes,
                     index_diff=index_diff,
+                    enrich_requested=enrich_requested,
+                    enrich_applied=enrich_applied,
+                    enrich_unavailable_reason=enrich_unavailable_reason,
+                    content_hashes=content_hashes,
                 )
                 await self._runs.record_success(
                     run_id,
@@ -796,6 +896,10 @@ class CrawlService:
                     enrich_output_tokens=enrich_output_tokens,
                     llms_txt_bytes=llms_txt_bytes,
                     index_diff=index_diff,
+                    enrich_requested=enrich_requested,
+                    enrich_applied=enrich_applied,
+                    enrich_unavailable_reason=enrich_unavailable_reason,
+                    content_hashes=content_hashes,
                 )
                 if result is not None
                 else None
@@ -809,7 +913,14 @@ class CrawlService:
         return outcome
 
     async def _build_index_diff(
-        self, run: RunDetailResponse, run_id: UUID, llms_txt: str, urls_discovered: int
+        self,
+        run: RunDetailResponse,
+        run_id: UUID,
+        llms_txt: str,
+        urls_discovered: int,
+        *,
+        content_hashes: dict[str, str],
+        enrich_applied: bool,
     ) -> dict[str, Any] | None:
         """This run's `index_diff` block, or `None` if computing it failed.
 
@@ -839,6 +950,11 @@ class CrawlService:
                 `get_previous_completed_index` compares against.
             llms_txt: This run's own freshly generated index.
             urls_discovered: This run's own `runs.stats["urls_discovered"]` value.
+            content_hashes: This run's own `build_content_hashes(result.pages)` (PER-194) —
+                fed to `build_index_diff` as `current_content_hashes`.
+            enrich_applied: This run's own `enrich_applied` (PER-194) — fed to
+                `build_index_diff` as `current_enrich_applied`, to decide whether this
+                comparison spans an enrichment mode change.
 
         Returns:
             `build_index_diff`'s result, or `None` on any exception from the read.
@@ -865,11 +981,15 @@ class CrawlService:
                 ),
                 llms_txt=previous.llms_txt,
                 urls_discovered=previous.urls_discovered,
+                enrich_applied=previous.enrich_applied,
+                content_hashes=previous.content_hashes,
             )
         )
         return build_index_diff(
             current_llms_txt=llms_txt,
             current_urls_discovered=urls_discovered,
+            current_enrich_applied=enrich_applied,
+            current_content_hashes=content_hashes,
             previous=previous_index,
             previous_run_completed=previous_run_completed,
         )

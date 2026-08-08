@@ -1,9 +1,9 @@
 // Named, feature-level wrappers around `api` (lib/api/fetcher.ts) for `/websites`. Every
 // call site in the app — a page, a component, a React Query hook in `lib/query/` — should
-// import from here rather than reaching for `api.get`/`api.post`/`api.delete` directly, so
-// the endpoint list in this file, together with `lib/api/runs.ts`, `lib/api/schedules.ts`,
-// and `lib/api/health.ts`, is the entire inventory of what the frontend can ask the backend
-// for.
+// import from here rather than reaching for `api.get`/`api.post`/`api.patch`/`api.delete`
+// directly, so the endpoint list in this file, together with `lib/api/runs.ts`,
+// `lib/api/schedules.ts`, and `lib/api/health.ts`, is the entire inventory of what the
+// frontend can ask the backend for.
 //
 // Read helpers for `GET /websites/{id}/runs` and `GET /runs/{id}` live in `lib/api/runs.ts`,
 // and `GET`/`PUT /websites/{id}/schedule` live in `lib/api/schedules.ts` — not here. Each
@@ -11,8 +11,9 @@
 // friends. `POST /websites/{id}/runs` (PER-160) and `GET /websites/{id}/stats` (PER-156)
 // both live in `lib/api/runs.ts` as `triggerRun` and `getStats`, despite their `/websites/…`
 // paths — they are a run and run statistics respectively, and the backend files them on its
-// own runs router for that same reason. Nothing on the `/websites` surface is absent from
-// this file today.
+// own runs router for that same reason. `PATCH /websites/{id}` (PER-194) is the second write
+// on this router, alongside `DELETE` — `updateWebsite` below. Nothing on the `/websites`
+// surface is absent from this file today.
 
 import type { components } from "./schema";
 import { api } from "./fetcher";
@@ -57,9 +58,28 @@ export function getWebsite(id: string): Promise<Website> {
  * `POST /websites`. A `409` means the caller already has this origin registered — see
  * `lib/api/errors.ts`'s `isWebsiteAlreadyExists` for how a caller turns that into a
  * navigation instead of a dead-end error.
+ *
+ * `enrichWithLlm` is the add-site form's checkbox — whether this website's runs should ask
+ * for model-assisted summarization. It defaults to `false` server-side
+ * (`CreateWebsiteRequest.enrich_with_llm`) if the caller omits it, but every call site in
+ * this app supplies it explicitly (PER-194).
  */
-export function createWebsite(url: string): Promise<Website> {
-  return api.post("/websites", { body: { url } });
+export function createWebsite(url: string, enrichWithLlm: boolean): Promise<Website> {
+  return api.post("/websites", { body: { url, enrich_with_llm: enrichWithLlm } });
+}
+
+/**
+ * `PATCH /websites/{id}`. `403` if the caller is not the owner (ARCHITECTURE.md §4).
+ *
+ * The one field this endpoint accepts today — `enrich_with_llm` — is required on the wire
+ * (`UpdateWebsiteRequest`), so this helper's own signature requires it too rather than
+ * making it optional and silently sending nothing.
+ */
+export function updateWebsite(id: string, enrichWithLlm: boolean): Promise<Website> {
+  return api.patch("/websites/{id}", {
+    params: { id },
+    body: { enrich_with_llm: enrichWithLlm },
+  });
 }
 
 /** `DELETE /websites/{id}`. `403` if the caller is not the owner (ARCHITECTURE.md §4). */

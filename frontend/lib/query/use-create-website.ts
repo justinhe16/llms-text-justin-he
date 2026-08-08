@@ -8,6 +8,18 @@ import { createWebsite, type Website } from "@/lib/api/websites";
 import { queryKeys } from "./query-keys";
 
 /**
+ * The one call this mutation accepts: the URL to add, and the add-site form's enrichment
+ * checkbox. Bundled into a single object, mirroring `PutScheduleInput`
+ * (lib/query/use-put-schedule.ts), rather than the bare `string` this hook took before
+ * PER-194 — a second piece of per-call data means `mutate()`'s single variables argument has
+ * to carry both.
+ */
+export type CreateWebsiteInput = {
+  url: string;
+  enrichWithLlm: boolean;
+};
+
+/**
  * `POST /websites`. Every call invalidates `queryKeys.websites.all` on success — every
  * website list currently mounted (with or without `?include=latest_run`) refetches to
  * pick up the new row — and surfaces a failure as a `sonner` toast built from
@@ -28,7 +40,10 @@ import { queryKeys } from "./query-keys";
  * optional in the same way — it is correctness, not presentation.
  */
 export function useCreateWebsite(
-  options?: Pick<UseMutationOptions<Website, Error, string>, "onSuccess" | "onError"> & {
+  options?: Pick<
+    UseMutationOptions<Website, Error, CreateWebsiteInput>,
+    "onSuccess" | "onError"
+  > & {
     toastOnError?: boolean;
   }
 ) {
@@ -36,7 +51,7 @@ export function useCreateWebsite(
   const toastOnError = options?.toastOnError ?? true;
 
   return useMutation({
-    mutationFn: (url: string) => createWebsite(url),
+    mutationFn: (input: CreateWebsiteInput) => createWebsite(input.url, input.enrichWithLlm),
     onSuccess: (data, variables, onMutateResult, context) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.websites.all });
       options?.onSuccess?.(data, variables, onMutateResult, context);

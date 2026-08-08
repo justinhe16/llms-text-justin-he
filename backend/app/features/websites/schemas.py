@@ -41,6 +41,19 @@ from app.features.websites.internals.url_normalize import MAX_URL_LENGTH, normal
 WebsiteInclude = Literal["latest_run"]
 
 
+_ENRICH_WITH_LLM_DESCRIPTION = (
+    "Whether this website's runs ask for model-assisted summarization — a written title "
+    "and description per page, in place of what is extracted from the page's own markup. "
+    "This records INTENT, not capability: a run actually enriches only when this is true "
+    "AND model-assisted summarization is enabled for this deployment (an operator-level "
+    "setting this API never exposes — see ARCHITECTURE.md §11). A run that asked for "
+    "enrichment and could not get it still completes, using extracted titles and "
+    "descriptions, and records why in that run's stats. Mechanism and cost: one Claude "
+    "Haiku 4.5 call per page, on the first 4,000 characters of its extracted text — on the "
+    "order of cents for a 100-page run."
+)
+
+
 class CreateWebsiteRequest(BaseModel):
     """Body of `POST /websites`."""
 
@@ -58,6 +71,8 @@ class CreateWebsiteRequest(BaseModel):
         examples=["https://example.com/docs"],
     )
 
+    enrich_with_llm: bool = Field(default=False, description=_ENRICH_WITH_LLM_DESCRIPTION)
+
     @field_validator("url")
     @classmethod
     def _url_must_be_an_absolute_http_url(cls, value: str) -> str:
@@ -68,6 +83,22 @@ class CreateWebsiteRequest(BaseModel):
         docstring for why the normalized result is deliberately discarded here.
         """
         return normalize_url(value).url
+
+
+class UpdateWebsiteRequest(BaseModel):
+    """Body of `PATCH /websites/{id}`.
+
+    `enrich_with_llm` is required, not optional, because it is currently the ONLY mutable
+    field this endpoint accepts — five of `websites`' six columns are not settable by anyone
+    (`id`, `user_id`, `url`, `origin`, and `title`, which only a crawl writes). A `PUT` would
+    misrepresent what this endpoint actually replaces; `PATCH` reusing `WebsiteResponse` is
+    the design this ticket (PER-194) settled on over a schedule-shaped sub-resource, because
+    this is a column on `websites`, not an entity with a lifecycle of its own. When a second
+    mutable field lands, THAT ticket decides whether both become optional — do not
+    preemptively widen this model to guess at that shape now.
+    """
+
+    enrich_with_llm: bool = Field(..., description=_ENRICH_WITH_LLM_DESCRIPTION)
 
 
 class WebsiteResponse(BaseModel):
@@ -85,6 +116,7 @@ class WebsiteResponse(BaseModel):
     url: str
     origin: str
     title: str | None
+    enrich_with_llm: bool
     created_at: datetime
 
 

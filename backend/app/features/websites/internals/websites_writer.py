@@ -39,9 +39,9 @@ from app.infrastructure.db.base_repository import Writer
 # defaults (`gen_random_uuid()`, `CURRENT_TIMESTAMP`), so the returned row is the only place
 # their values exist — reconstructing the response from the request would be a guess.
 _INSERT: Final = """
-    INSERT INTO websites (user_id, url, origin)
-    VALUES ($1, $2, $3)
-    RETURNING id, user_id, url, origin, title, created_at
+    INSERT INTO websites (user_id, url, origin, enrich_with_llm)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id, user_id, url, origin, title, enrich_with_llm, created_at
 """
 
 # No `user_id` predicate — see the module docstring. `schedules` and `runs` disappear with
@@ -49,17 +49,34 @@ _INSERT: Final = """
 # so the cascade is the database's job and needs no second statement here.
 _DELETE: Final = "DELETE FROM websites WHERE id = $1"
 
+# `PATCH /websites/{id}`'s one statement (PER-194). No `user_id` predicate, for the same
+# reason `_DELETE` above has none — the service has already fetched the row and called
+# `require_owner` by the time this runs, and a second, silently-diverging enforcement point
+# here would answer "0 rows updated" where the contract says `403`. `RETURNING` the same
+# column list `_INSERT` does, so the service can build a `WebsiteResponse` from either write
+# with the same helper.
+_UPDATE: Final = """
+    UPDATE websites SET enrich_with_llm = $2
+    WHERE id = $1
+    RETURNING id, user_id, url, origin, title, enrich_with_llm, created_at
+"""
+
 
 class WebsitesWriter(Writer):
     """Writes for the websites feature. Private to it — only `WebsiteService` calls this."""
 
-    async def insert(self, user_id: UUID, url: str, origin: str) -> dict[str, Any]:
+    async def insert(
+        self, user_id: UUID, url: str, origin: str, *, enrich_with_llm: bool
+    ) -> dict[str, Any]:
         """Insert one website owned by `user_id` and return the row that was created.
 
         Args:
             user_id: The authenticated caller, who becomes the owner.
             url: The URL as submitted, trimmed.
             origin: The normalized origin, half of the `UNIQUE (user_id, origin)` key.
+            enrich_with_llm: The owner's initial choice of whether this site's runs ask for
+                model-assisted summarization (PER-194) — `CreateWebsiteRequest.enrich_with_llm`,
+                threaded straight through by the service.
 
         Returns:
             The inserted row, including the database-generated `id` and `created_at`.
@@ -72,13 +89,28 @@ class WebsitesWriter(Writer):
             RuntimeError: If `RETURNING` somehow produced no row, which would mean an
                 `INSERT` that reported success without inserting.
         """
-        row = await self.fetch_one(_INSERT, user_id, url, origin)
+        row = await self.fetch_one(_INSERT, user_id, url, origin, enrich_with_llm)
         if row is None:
             # Unreachable: an INSERT ... RETURNING either raises or returns its row. Asserted
             # rather than `assert`ed so it survives `python -O`, and so the impossible case
             # cannot silently become `None` flowing into a response model.
             raise RuntimeError("INSERT INTO websites ... RETURNING produced no row")
         return row
+
+    async def update(self, website_id: UUID, *, enrich_with_llm: bool) -> dict[str, Any] | None:
+        """Set `enrich_with_llm` on one website and return the updated row.
+
+        No `user_id` predicate — see the module docstring and `_UPDATE`'s own comment. The
+        caller (`WebsiteService.update_website`) has already fetched the row and called
+        `require_owner` before this runs.
+
+        Returns:
+            The updated row, or `None` if `website_id` no longer names a row — the website
+            was deleted in the window between the service's fetch and this write. The
+            service converts that into the same `404` a never-existing id would produce,
+            rather than treating a zero-row `UPDATE` as success.
+        """
+        return await self.fetch_one(_UPDATE, website_id, enrich_with_llm)
 
     async def delete(self, website_id: UUID) -> str:
         """Delete one website by id, cascading to its schedule and runs.
